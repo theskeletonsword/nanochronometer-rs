@@ -1,5 +1,5 @@
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="./assets/nanochronometer_logo_dark.svg">
+  <source media="(prefers-color-scheme: dark)" srcset="./assets/nanochronometer_logo.svg">
   <img alt="NanoChronometer" src="./assets/nanochronometer_logo.svg">
 </picture>
 
