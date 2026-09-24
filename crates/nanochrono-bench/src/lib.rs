@@ -14,6 +14,7 @@
 //! | [`BenchMode::CpuIsa`] | Inline-asm ISA kernels | What can this core's datapath do? |
 //! | [`BenchMode::Crypto`] | rustls/`ring` primitives over real buffers | What does a byte of AEAD or hash cost? |
 //! | [`BenchMode::TlsHandshake`] | End-to-end rustls handshakes | What does establishing a session cost? |
+//! | [`BenchMode::CryptoRaw`] | Bare crypto instructions (AES round, SHA-256 round, carry-less multiply, VAES, VPCLMULQDQ) | How fast is the silicon, with no cipher around it? |
 //!
 //! # Why three passes
 //!
@@ -27,7 +28,8 @@
 use std::fmt::Write as _;
 
 use nanochrono_core::{
-    arch, dispatch::Dispatcher, format, Backend, Chronometer, CpuFeatures, SimdFamily,
+    arch, dispatch::Dispatcher, format, Backend, Chronometer, CpuFeatures, CryptoKernel,
+    SimdFamily,
 };
 use nanochrono_crypto::{tls, AeadKey, Algorithm, NONCE_LEN};
 
@@ -63,6 +65,17 @@ pub enum BenchMode {
     /// itself unavailable when the module is not loaded rather than failing,
     /// because not having built a kernel module is the ordinary case.
     KernelCryptoRing0,
+    /// The crypto *instructions* alone, in the project's own inline-asm
+    /// kernels: `AESENC`, `SHA256RNDS2`, `PCLMULQDQ`, their YMM forms, and
+    /// the ARMv8 equivalents.
+    ///
+    /// Speed only. There is no key schedule, no mode of operation, no
+    /// authentication and no constant-time contract to keep — the chains
+    /// are built to keep the unit busy, not to encrypt anything. Mode 2 is
+    /// the number for real, secure crypto; this one is how fast the silicon
+    /// is underneath it, and the gap between the two is the price of doing
+    /// it properly.
+    CryptoRaw,
 }
 
 impl BenchMode {
@@ -73,6 +86,7 @@ impl BenchMode {
             BenchMode::TlsHandshake => "TLS handshake (rustls)",
             BenchMode::KernelCrypto => "Linux crypto API (AF_ALG, ring 3)",
             BenchMode::KernelCryptoRing0 => "Linux crypto API (kernel module, ring 0)",
+            BenchMode::CryptoRaw => "Crypto RAW speed (instructions only)",
         }
     }
 
@@ -84,6 +98,12 @@ impl BenchMode {
             BenchMode::TlsHandshake => "Mode 3: TLS handshake (rustls)",
             BenchMode::KernelCrypto => "Mode 4: Linux crypto API (ring 3)",
             BenchMode::KernelCryptoRing0 => "Mode 5: Linux crypto API (ring 0)",
+            // Last in the list, so its number is the list's length: 6 on
+            // Linux, 4 where the two Linux-only modes are not offered.
+            #[cfg(target_os = "linux")]
+            BenchMode::CryptoRaw => "Mode 6: Crypto RAW speed",
+            #[cfg(not(target_os = "linux"))]
+            BenchMode::CryptoRaw => "Mode 4: Crypto RAW speed",
         }
     }
 
@@ -109,6 +129,9 @@ impl BenchMode {
             // the module has to be built and inserted. Absent is the ordinary
             // case, so it is reported rather than treated as a fault.
             BenchMode::KernelCryptoRing0 => nanochrono_core::kcrypto::Ring0::read().is_some(),
+            // Offered whenever at least one instruction kernel can run; a
+            // CPU with none of them has nothing for the mode to show.
+            BenchMode::CryptoRaw => CryptoKernel::ALL.iter().any(|k| k.is_available()),
         }
     }
 
@@ -127,6 +150,7 @@ impl BenchMode {
         BenchMode::TlsHandshake,
         BenchMode::KernelCrypto,
         BenchMode::KernelCryptoRing0,
+        BenchMode::CryptoRaw,
     ];
 
     /// The three portable modes. See the Linux list above for what is missing
@@ -136,6 +160,7 @@ impl BenchMode {
         BenchMode::CpuIsa,
         BenchMode::Crypto,
         BenchMode::TlsHandshake,
+        BenchMode::CryptoRaw,
     ];
 
     /// Whether this mode exists on this operating system at all.
@@ -146,7 +171,7 @@ impl BenchMode {
     /// place, and the answer never changes at run time.
     pub const fn applies_to_this_platform(self) -> bool {
         match self {
-            BenchMode::CpuIsa | BenchMode::Crypto | BenchMode::TlsHandshake => true,
+            BenchMode::CpuIsa | BenchMode::Crypto | BenchMode::TlsHandshake | BenchMode::CryptoRaw => true,
             BenchMode::KernelCrypto | BenchMode::KernelCryptoRing0 => {
                 cfg!(target_os = "linux")
             }
@@ -169,6 +194,8 @@ pub enum BenchKernel {
     Kernel(KernelAlgorithm),
     /// The same algorithm, measured inside the kernel by the module.
     Ring0(KernelAlgorithm),
+    /// One bare crypto instruction chain (Mode "Crypto RAW").
+    CryptoRaw(CryptoKernel),
 }
 
 /// The algorithms this asks the kernel for, by the kernel's own names.
@@ -278,6 +305,7 @@ impl BenchKernel {
             BenchKernel::Tls => "TLS 1.3 handshake".to_string(),
             BenchKernel::Kernel(a) => format!("{} (ring 3)", a.name()),
             BenchKernel::Ring0(a) => format!("{} (ring 0)", a.name()),
+            BenchKernel::CryptoRaw(k) => format!("{} (raw)", k.name().to_uppercase()),
         }
     }
 
@@ -286,6 +314,7 @@ impl BenchKernel {
         match self {
             BenchKernel::Scalar | BenchKernel::Crypto(_) | BenchKernel::Tls => true,
             BenchKernel::Isa(b) => b.is_available(),
+            BenchKernel::CryptoRaw(k) => k.is_available(),
             // Available means the kernel offers this algorithm *and* the
             // socket family can be opened. A kernel without `sha512` in its
             // config is an ordinary kernel, not a broken one.
@@ -306,6 +335,7 @@ impl BenchKernel {
             BenchKernel::Tls => BenchMode::TlsHandshake,
             BenchKernel::Kernel(_) => BenchMode::KernelCrypto,
             BenchKernel::Ring0(_) => BenchMode::KernelCryptoRing0,
+            BenchKernel::CryptoRaw(_) => BenchMode::CryptoRaw,
         }
     }
 
@@ -332,6 +362,11 @@ impl BenchKernel {
                 .copied()
                 .map(BenchKernel::Ring0)
                 .collect(),
+            BenchMode::CryptoRaw => CryptoKernel::ALL
+                .iter()
+                .copied()
+                .map(BenchKernel::CryptoRaw)
+                .collect(),
         }
     }
 }
@@ -352,6 +387,15 @@ pub struct BenchProfile {
     pub repeats: [u32; 3],
 }
 
+/// What decides whether an ISA kernel may run, on this architecture.
+const FEATURE_GATE: &str = if cfg!(any(target_arch = "x86", target_arch = "x86_64")) {
+    "CPUID + XGETBV"
+} else if cfg!(target_arch = "aarch64") {
+    "the OS's HWCAP report (the ID registers trap at EL0)"
+} else {
+    "the OS's CPU feature report"
+};
+
 impl BenchProfile {
     /// Schedule for `kernel`, sized so each pass runs long enough to dominate
     /// counter overhead but stays under a second.
@@ -359,12 +403,30 @@ impl BenchProfile {
         match kernel {
             BenchKernel::Scalar | BenchKernel::Isa(_) => BenchProfile {
                 title: kernel.name(),
-                description: "inline-asm ISA microbenchmark; dispatch is gated by CPUID + XGETBV \
-                              before the kernel is reached"
-                    .to_string(),
+                description: format!(
+                    "inline-asm ISA microbenchmark; dispatch is gated by {} before the kernel \
+                     is reached",
+                    FEATURE_GATE
+                ),
                 unit: "1 op = 1 kernel iteration".to_string(),
                 ops_per_loop: 1.0,
                 bytes_per_op: 8.0,
+                loops: [300_000, 600_000, 900_000],
+                repeats: [1, 2, 3],
+            },
+            BenchKernel::CryptoRaw(k) => BenchProfile {
+                title: kernel.name(),
+                description: format!(
+                    "raw {} instruction chain, SPEED ONLY: no key schedule, no mode, no \
+                     authentication, not a cipher — see Mode 2 for real crypto; gated by {}",
+                    k.name(),
+                    FEATURE_GATE
+                ),
+                unit: "1 op = 1 kernel iteration (one chain step per lane)".to_string(),
+                ops_per_loop: 1.0,
+                // No bytes: nothing is encrypted, so a MiB/s figure would be
+                // a number about a cipher that is not there.
+                bytes_per_op: 0.0,
                 loops: [300_000, 600_000, 900_000],
                 repeats: [1, 2, 3],
             },
@@ -715,7 +777,9 @@ enum Workload {
 impl Workload {
     fn new(kernel: BenchKernel) -> Result<Workload, String> {
         match kernel {
-            BenchKernel::Scalar | BenchKernel::Isa(_) => Ok(Workload::Isa(kernel)),
+            BenchKernel::Scalar | BenchKernel::Isa(_) | BenchKernel::CryptoRaw(_) => {
+                Ok(Workload::Isa(kernel))
+            }
             BenchKernel::Crypto(Algorithm::Sha256) => Ok(Workload::Hash {
                 payload: payload(),
                 hmac: false,
@@ -773,6 +837,9 @@ impl Workload {
             Workload::Isa(BenchKernel::Scalar) => scalar_kernel(loops),
             Workload::Isa(BenchKernel::Isa(backend)) => {
                 dispatcher.run_kernel_for(*backend, loops).unwrap_or(0)
+            }
+            Workload::Isa(BenchKernel::CryptoRaw(k)) => {
+                dispatcher.run_crypto_kernel(*k, loops).unwrap_or(0)
             }
             Workload::Isa(_) => 0,
             Workload::Hash { payload, hmac } => {
@@ -868,7 +935,28 @@ fn scalar_kernel(loops: usize) -> u64 {
     {
         arch::aarch64::kernel_scalar(loops)
     }
-    #[cfg(not(any(target_arch = "x86_64", target_arch = "x86", target_arch = "aarch64")))]
+    #[cfg(any(target_arch = "powerpc", target_arch = "powerpc64"))]
+    {
+        arch::powerpc::kernel_scalar(loops)
+    }
+    #[cfg(any(target_arch = "riscv32", target_arch = "riscv64"))]
+    {
+        arch::riscv::kernel_scalar(loops)
+    }
+    #[cfg(target_arch = "arm")]
+    {
+        arch::arm32::kernel_scalar(loops)
+    }
+    #[cfg(not(any(
+        target_arch = "x86_64",
+        target_arch = "x86",
+        target_arch = "aarch64",
+        target_arch = "powerpc",
+        target_arch = "powerpc64",
+        target_arch = "riscv32",
+        target_arch = "riscv64",
+        target_arch = "arm"
+    )))]
     {
         arch::generic::kernel_scalar(loops)
     }
@@ -1141,6 +1229,9 @@ fn write_header(log: &mut String, chrono: &Chronometer, config: &BenchConfig) {
 
     // `AF_ALG` costs.
 
+    // The ring-0 module is a Linux kernel module; elsewhere there is nothing
+    // to be loaded or not, and saying "not loaded" would suggest otherwise.
+    #[cfg(target_os = "linux")]
     if let Some(ring0) = nanochrono_core::kcrypto::Ring0::read() {
         let _ = writeln!(
             log,
@@ -1160,18 +1251,41 @@ fn write_header(log: &mut String, chrono: &Chronometer, config: &BenchConfig) {
         );
     }
     let _ = writeln!(log, "crypto provider: {}", nanochrono_crypto::PROVIDER);
-    let _ = writeln!(
-        log,
-        "cpu flags: AES={} SHA={} VAES={} PCLMUL={} AVX={} AVX2={} AVX-VNNI={} AVX512F={}\n",
-        features.aesni as u8,
-        features.shani as u8,
-        features.vaes as u8,
-        features.pclmulqdq as u8,
-        features.avx as u8,
-        features.avx2 as u8,
-        features.avx_vnni as u8,
-        features.avx512f as u8,
-    );
+    let _ = writeln!(log, "cpu flags: {}\n", cpu_flags(&features));
+}
+
+/// The crypto and vector flags that matter here, in this architecture's
+/// names: x86 flags on an ARM phone read as a CPU without AES, which it has.
+fn cpu_flags(f: &nanochrono_core::CpuFeatures) -> String {
+    let b = |v: bool| v as u8;
+    if cfg!(any(target_arch = "aarch64", target_arch = "arm")) {
+        format!(
+            "AES={} SHA2={} PMULL={} NEON={} SVE={} SVE2={} SME={}",
+            b(f.arm_aes),
+            b(f.arm_sha2),
+            b(f.pclmulqdq),
+            b(f.neon),
+            b(f.sve),
+            b(f.sve2),
+            b(f.sme)
+        )
+    } else if cfg!(any(target_arch = "powerpc", target_arch = "powerpc64")) {
+        format!("ALTIVEC={} VSX={}", b(f.altivec), b(f.vsx))
+    } else if cfg!(any(target_arch = "riscv32", target_arch = "riscv64")) {
+        format!("RVV={}", b(f.rvv))
+    } else {
+        format!(
+            "AES={} SHA={} VAES={} PCLMUL={} AVX={} AVX2={} AVX-VNNI={} AVX512F={}",
+            b(f.aesni),
+            b(f.shani),
+            b(f.vaes),
+            b(f.pclmulqdq),
+            b(f.avx),
+            b(f.avx2),
+            b(f.avx_vnni),
+            b(f.avx512f)
+        )
+    }
 }
 
 fn write_pass(log: &mut String, profile: &BenchProfile, r: &PassResult) {
@@ -1374,6 +1488,7 @@ mod platform_tests {
             BenchMode::TlsHandshake,
             BenchMode::KernelCrypto,
             BenchMode::KernelCryptoRing0,
+            BenchMode::CryptoRaw,
         ]
         .iter()
         .filter(|mode| mode.applies_to_this_platform())
@@ -1384,10 +1499,20 @@ mod platform_tests {
         );
     }
 
+    /// The number in each label is the mode's place in the list, which is
+    /// also the digit key that selects it in the GUI.
+    #[test]
+    fn mode_labels_are_numbered_by_position() {
+        for (i, mode) in BenchMode::ALL.iter().enumerate() {
+            let prefix = format!("Mode {}:", i + 1);
+            assert!(mode.label().starts_with(&prefix), "{} is not {prefix}", mode.label());
+        }
+    }
+
     /// And the count is what each platform should see.
     #[test]
     fn the_platform_offers_the_expected_number_of_modes() {
-        let expected = if cfg!(target_os = "linux") { 5 } else { 3 };
+        let expected = if cfg!(target_os = "linux") { 6 } else { 4 };
         assert_eq!(
             BenchMode::ALL.len(),
             expected,

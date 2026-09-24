@@ -437,6 +437,15 @@ pub struct KernelProbe {
     /// AArch64 guest — reporting them verbatim lets a human identify the
     /// hypervisor without this code guessing.
     pub hvc_vendor_uid: Option<[u32; 4]>,
+    /// How many times the module has run its exit-inducing probes since it
+    /// loaded (1 = only the load-time probe). Format version 4 on.
+    pub hypercall_probes: Option<u32>,
+    /// Milliseconds since that last probe, as of the read.
+    pub hypercall_age_ms: Option<u64>,
+    /// The module's re-probe cooldown in seconds; 0 = disabled.
+    pub hypercall_cooldown_s: Option<u32>,
+    /// Milliseconds until the module accepts a re-probe.
+    pub hypercall_next_ms: Option<u64>,
 }
 
 impl KernelProbe {
@@ -488,9 +497,7 @@ pub struct HypervisorReport {
 /// which is the whole point, and why the module declares the procfs ABI itself
 /// rather than using the debugfs abstraction the kernel's Rust crate offers
 /// (debugfs is mode 0700).
-///
-/// The 2.x path is still tried so an older module keeps working.
-pub const KERNEL_MODULE_PATHS: &[&str] = &["/proc/nanochrono", "/proc/nanochrono_hv"];
+pub const KERNEL_MODULE_PATHS: &[&str] = &["/proc/nanochrono"];
 
 /// The process-wide detection, run once.
 ///
@@ -498,10 +505,102 @@ pub const KERNEL_MODULE_PATHS: &[&str] = &["/proc/nanochrono", "/proc/nanochrono
 /// probe, and the answer cannot change while the process runs — so callers
 /// that annotate every measurement should come through here rather than
 /// re-detecting.
+///
+/// It is also the anti-DoS rule of [`crate::reprobe`]: the exit-cost probe
+/// makes a guest exit 128 times, and a process that did that on every panel
+/// refresh would look like an attack to a cloud host. Everything reads this
+/// cache; only [`reprobe`] probes again, behind the cooldown.
 pub fn cached() -> &'static HypervisorReport {
     use std::sync::OnceLock;
     static CACHE: OnceLock<HypervisorReport> = OnceLock::new();
-    CACHE.get_or_init(HypervisorReport::detect)
+    CACHE.get_or_init(|| {
+        let report = HypervisorReport::detect();
+        let now = crate::platform::monotonic_ns();
+        // The load-time probe counts as the first: a re-probe waits the
+        // cooldown from here.
+        let _ = reprobe_gate().try_begin(now);
+        report
+    })
+}
+
+fn reprobe_gate() -> std::sync::MutexGuard<'static, crate::reprobe::Gate> {
+    static GATE: std::sync::Mutex<crate::reprobe::Gate> =
+        std::sync::Mutex::new(crate::reprobe::Gate::new());
+    GATE.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+fn latest_slot() -> std::sync::MutexGuard<'static, Option<HypervisorReport>> {
+    static LATEST: std::sync::Mutex<Option<HypervisorReport>> = std::sync::Mutex::new(None);
+    LATEST.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+/// The most recent detection: the last successful [`reprobe`], else
+/// [`cached`]. Never probes.
+pub fn latest() -> HypervisorReport {
+    if let Some(report) = latest_slot().as_ref() {
+        return report.clone();
+    }
+    cached().clone()
+}
+
+/// Seconds until [`reprobe`] is allowed (0 = now).
+pub fn reprobe_wait_s() -> u32 {
+    let _ = cached();
+    reprobe_gate().remaining_s(crate::platform::monotonic_ns())
+}
+
+/// Whether this process enforces the re-probe cooldown.
+pub fn reprobe_cooldown_enabled() -> bool {
+    reprobe_gate().cooldown_enabled()
+}
+
+/// Turns this process's re-probe cooldown on (10 s) or off. Off is the
+/// user's risk: see [`crate::reprobe::COOLDOWN_OFF_WARNING`].
+pub fn set_reprobe_cooldown_enabled(on: bool) {
+    reprobe_gate().set_cooldown_enabled(on);
+}
+
+/// How [`reprobe`] went.
+#[derive(Debug)]
+pub enum ReprobeError {
+    /// This process's cooldown: try again in this many seconds.
+    CoolingDown { wait_s: u32 },
+}
+
+impl std::fmt::Display for ReprobeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ReprobeError::CoolingDown { wait_s } => {
+                write!(f, "re-probe cooling down: wait {wait_s} s (anti-abuse limit for cloud hosts)")
+            }
+        }
+    }
+}
+
+/// Probes the hypervisor again — the button, not the refresh.
+///
+/// Refused while this process's cooldown runs. When the ring-0 module is
+/// loaded it is asked to re-probe too; the module has its own cooldown and
+/// may refuse (or the caller may not be root), in which case its cached
+/// report is merged as it is. The second value carries that outcome.
+pub fn reprobe() -> Result<(HypervisorReport, Option<std::io::Error>), ReprobeError> {
+    let _ = cached();
+    let now = crate::platform::monotonic_ns();
+    if let Err(crate::reprobe::Refused::CoolingDown { remaining_ns }) =
+        reprobe_gate().try_begin(now)
+    {
+        return Err(ReprobeError::CoolingDown {
+            wait_s: remaining_ns.div_ceil(1_000_000_000) as u32,
+        });
+    }
+    let module = if std::path::Path::new(KERNEL_MODULE_PATH).exists() {
+        kernel_module_reprobe().err()
+    } else {
+        None
+    };
+    let report = HypervisorReport::detect();
+    *latest_slot() = Some(report.clone());
+    Ok((report, module))
 }
 
 impl HypervisorReport {
@@ -1047,6 +1146,15 @@ impl HypervisorReport {
                 if let Some(el) = k.current_el {
                     let _ = writeln!(out, "  current_el={el}");
                 }
+                if let Some(n) = k.hypercall_probes {
+                    let age = k.hypercall_age_ms.map(|ms| ms / 1000).unwrap_or(0);
+                    let limit = match k.hypercall_cooldown_s {
+                        Some(0) => "cooldown OFF (the user assumes the provider's reaction)".to_string(),
+                        Some(s) => format!("re-probe every {s} s at most"),
+                        None => "cooldown unknown".to_string(),
+                    };
+                    let _ = writeln!(out, "  probes run={n} (last {age} s ago), {limit}");
+                }
             }
             None => {
                 let _ = writeln!(
@@ -1399,9 +1507,51 @@ fn read_trimmed(path: impl AsRef<Path>) -> Option<String> {
 /// module, and a malformed value leaves its field `None` rather than failing
 /// the whole parse — the module is a complement, and a broken one must not
 /// take the userspace detection down with it.
+/// Where the ring-0 module publishes and takes commands.
+pub const KERNEL_MODULE_PATH: &str = "/proc/nanochrono";
+
+/// Asks the ring-0 module to run its hypervisor probes again.
+///
+/// The module probes once at load and serves a cache; this is the only way
+/// to repeat the probe, and the module itself refuses it (`WouldBlock`)
+/// until its cooldown — 10 s by default — has passed. Needs root.
+pub fn kernel_module_reprobe() -> std::io::Result<()> {
+    std::fs::write(KERNEL_MODULE_PATH, "reprobe")
+}
+
+/// Sets the module's re-probe cooldown; `0` disables it. Needs root.
+///
+/// Disabling it is the user's decision and the user's risk: see
+/// [`crate::reprobe::COOLDOWN_OFF_WARNING`].
+pub fn kernel_module_set_cooldown(seconds: u32) -> std::io::Result<()> {
+    std::fs::write(KERNEL_MODULE_PATH, format!("cooldown={seconds}"))
+}
+
+/// The module's report as it stands, without asking it to probe again.
+pub fn kernel_module_probe() -> Option<KernelProbe> {
+    read_kernel_module(KERNEL_MODULE_PATH)
+}
+
 fn read_kernel_module(path: impl AsRef<Path>) -> Option<KernelProbe> {
     let text = std::fs::read_to_string(path).ok()?;
-    Some(parse_kernel_report(&text))
+    // The old standalone perf module (`source=perf`) published at the same
+    // path with no hypervisor section. Its report is not an (empty)
+    // hypervisor probe, so skip it and let the caller try the next path. The
+    // current single module carries both sections (`perf_*` keys).
+    if text.lines().any(|l| l.trim() == "source=perf") {
+        return None;
+    }
+    let probe = parse_kernel_report(&text);
+    // A file with no hypervisor keys at all is not this module either.
+    if probe.version == 0
+        && probe.vmcall_ok.is_none()
+        && probe.vmmcall_ok.is_none()
+        && probe.hvc_ok.is_none()
+        && probe.exit_cycles.is_none()
+    {
+        return None;
+    }
+    Some(probe)
 }
 
 /// Parses the module's `key=value` report.
@@ -1433,6 +1583,10 @@ fn parse_kernel_report(text: &str) -> KernelProbe {
             "current_el" => probe.current_el = value.parse().ok(),
             "exit_cycles" => probe.exit_cycles = value.parse().ok(),
             "cpu_family" => probe.cpu_family = Some(value.to_string()),
+            "hypercall_probes" => probe.hypercall_probes = value.parse().ok(),
+            "hypercall_age_ms" => probe.hypercall_age_ms = value.parse().ok(),
+            "hypercall_cooldown_s" => probe.hypercall_cooldown_s = value.parse().ok(),
+            "hypercall_next_ms" => probe.hypercall_next_ms = value.parse().ok(),
             "centaur_max_leaf" => {
                 probe.centaur_max_leaf = value
                     .strip_prefix("0x")
@@ -1733,6 +1887,41 @@ hvc_vendor_uid=b66fb428 e911c52e 564bcaa9 743a004d
     }
 
     #[test]
+    fn merged_module_report_is_a_hypervisor_probe() {
+        let dir = std::env::temp_dir().join(format!("nc-hv-merged-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("probe");
+        std::fs::write(
+            &path,
+            "version=4\narch=x86\nvmcall_ok=1\nexit_cycles=900\n\
+             hypercall_probes=1\nhypercall_age_ms=2500\nhypercall_cooldown_s=10\n\
+             hypercall_next_ms=7500\nperf_event=cycles\nperf_npmu=8\n",
+        )
+        .unwrap();
+        let probe = read_kernel_module(&path).expect("merged report");
+        assert_eq!(probe.vmcall_ok, Some(true));
+        assert_eq!(probe.hypercall_probes, Some(1));
+        assert_eq!(probe.hypercall_cooldown_s, Some(10));
+        assert_eq!(probe.hypercall_next_ms, Some(7500));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn perf_module_report_is_not_a_hypervisor_probe() {
+        let dir = std::env::temp_dir().join(format!("nc-hv-perf-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("probe");
+        std::fs::write(
+            &path,
+            "source=perf\nevent=cycles\nenabled=1\nnpmu=8\nraw=1\n\
+             enabled_ns=2\nrunning_ns=2\nscaled=1\n",
+        )
+        .unwrap();
+        assert!(read_kernel_module(&path).is_none());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn dmi_matching_prefers_the_specific_product() {
         let hints = DmiHints {
             sys_vendor: Some("QEMU".into()),
@@ -1749,6 +1938,9 @@ hvc_vendor_uid=b66fb428 e911c52e 564bcaa9 743a004d
         assert_eq!(bare.identify(), None);
     }
 
+    // x86 only, as the name says: the AArch64 probe documents that a coarse
+    // counter floors both sides at zero, which is a valid answer there.
+    #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
     #[test]
     fn trap_probe_returns_a_usable_ratio_on_x86() {
         let Some(cost) = measure_trap_cost() else {

@@ -10,13 +10,26 @@
 #[cfg(target_arch = "aarch64")]
 pub use nanochrono_core::arch::aarch64;
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(x86_any)]
 pub mod x86;
 
 #[cfg(target_arch = "aarch64")]
 pub mod arm;
 
-use core::sync::atomic::{AtomicU8, Ordering};
+#[cfg(any(target_arch = "powerpc", target_arch = "powerpc64"))]
+pub use nanochrono_core::arch::powerpc;
+
+#[cfg(any(target_arch = "powerpc", target_arch = "powerpc64"))]
+pub mod ppc;
+
+#[cfg(any(target_arch = "riscv32", target_arch = "riscv64"))]
+pub use nanochrono_core::arch::riscv as rv;
+
+/// The kernel side of RISC-V (entry, traps, SBI). Named `riscv` in this
+/// crate; the shared counter layer is re-exported as [`rv`].
+#[cfg(any(target_arch = "riscv32", target_arch = "riscv64"))]
+pub mod riscv;
+
 
 /// Orders the instruction stream around a measurement.
 ///
@@ -25,16 +38,20 @@ use core::sync::atomic::{AtomicU8, Ordering};
 /// asked for.
 #[inline(always)]
 pub fn serialize() {
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(x86_any)]
     // SAFETY: `LFENCE` has no operands and no memory effects beyond ordering.
     unsafe {
         core::arch::asm!("lfence", options(nostack, preserves_flags));
     }
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(any(target_arch = "aarch64", target_arch = "arm"))]
     // SAFETY: `ISB` has no operands and no memory effects beyond ordering.
     unsafe {
         core::arch::asm!("isb", options(nostack, preserves_flags));
     }
+    #[cfg(any(target_arch = "powerpc", target_arch = "powerpc64"))]
+    powerpc::isync();
+    #[cfg(any(target_arch = "riscv32", target_arch = "riscv64"))]
+    rv::fence();
 }
 
 /// Which AArch64 counter [`counter_ordered`] reads, and why it is a choice.
@@ -80,27 +97,51 @@ impl CounterSource {
             CounterSource::Physical => "cntpct_el0",
         }
     }
+
+    /// The counter this architecture actually reads under this setting.
+    pub const fn name_here(self) -> &'static str {
+        if cfg!(target_arch = "aarch64") {
+            self.name()
+        } else if cfg!(target_arch = "arm") {
+            "cntvct"
+        } else if cfg!(x86_any) {
+            "tsc"
+        } else if cfg!(any(target_arch = "riscv32", target_arch = "riscv64")) {
+            "time (rdtime)"
+        } else {
+            "time base (mftb)"
+        }
+    }
 }
 
-/// The selected counter source, as a `u8` in the encoding of
-/// [`CounterSource::as_u8`].
-static COUNTER_SOURCE: AtomicU8 = AtomicU8::new(CounterSource::Virtual.as_u8());
+impl CounterSource {
+    const fn to_core(self) -> nanochrono_core::arch::CounterSource {
+        match self {
+            CounterSource::Virtual => nanochrono_core::arch::CounterSource::Virtual,
+            CounterSource::Physical => nanochrono_core::arch::CounterSource::Physical,
+        }
+    }
+}
 
-/// Selects which AArch64 counter the freestanding kernel reads.
+/// Selects which AArch64 counter every read uses — this kernel's and the
+/// shared crate's alike, since the state lives in `nanochrono_core::arch`.
 ///
-/// This is the backing store for the interface's *Enable Physical Counter*
-/// toggle. It only means something on AArch64; on x86-64 there is one counter
-/// and no choice to make, so the call is a no-op.
-///
-/// The default is [`CounterSource::Virtual`], which is safe under a
-/// hypervisor. Set [`CounterSource::Physical`] for bare metal only.
-pub fn set_counter_source(source: CounterSource) {
-    COUNTER_SOURCE.store(source.as_u8(), Ordering::Relaxed);
+/// This is the backing store for the *Enable Physical Counter* setting.
+/// At EL1 and above the physical counter is always readable, so the only
+/// refusal is an architecture without one (x86-64, RISC-V, PowerPC), where
+/// the call returns `false` and nothing changes. Inside a VM it is allowed —
+/// the hypervisor may trap every read, which is what the setting's warning
+/// says — and on real hardware it costs the same as the virtual one.
+pub fn set_counter_source(source: CounterSource) -> bool {
+    nanochrono_core::arch::set_counter_source(source.to_core()).is_ok()
 }
 
 /// Which counter source is currently selected.
 pub fn counter_source() -> CounterSource {
-    CounterSource::from_u8(COUNTER_SOURCE.load(Ordering::Relaxed))
+    match nanochrono_core::arch::counter_source() {
+        nanochrono_core::arch::CounterSource::Physical => CounterSource::Physical,
+        nanochrono_core::arch::CounterSource::Virtual => CounterSource::Virtual,
+    }
 }
 
 /// The counter a freestanding kernel should read.
@@ -136,7 +177,7 @@ pub fn counter_ordered() -> u64 {
 /// falling off the end would execute whatever bytes follow.
 pub fn halt() -> ! {
     loop {
-        #[cfg(target_arch = "x86_64")]
+        #[cfg(x86_any)]
         // SAFETY: `cli` masks interrupts and `hlt` waits for one; with
         // interrupts masked this never wakes, which is the intent.
         unsafe {
@@ -147,6 +188,26 @@ pub fn halt() -> ! {
         // arrive.
         unsafe {
             core::arch::asm!("msr daifset, #0xf", "wfi", options(nomem, nostack));
+        }
+        #[cfg(target_arch = "arm")]
+        // SAFETY: as above, in the AArch32 spelling.
+        unsafe {
+            core::arch::asm!("cpsid if", "wfi", options(nomem, nostack));
+        }
+        // External interrupts are never enabled (`MSR[EE]` stays clear), and
+        // there is no wait instruction common to Book3S and Book E that is
+        // safe without platform setup, so the core spins at the lowest SMT
+        // priority (`or 1,1,1`) instead.
+        #[cfg(any(target_arch = "powerpc", target_arch = "powerpc64"))]
+        // SAFETY: a priority hint; no architectural state changes.
+        unsafe {
+            core::arch::asm!("or 1, 1, 1", options(nomem, nostack, preserves_flags));
+        }
+        // Supervisor interrupts off, then wait for one that cannot be taken.
+        #[cfg(any(target_arch = "riscv32", target_arch = "riscv64"))]
+        // SAFETY: clears sstatus.SIE and waits; nothing else changes.
+        unsafe {
+            core::arch::asm!("csrci sstatus, 2", "wfi", options(nomem, nostack));
         }
     }
 }

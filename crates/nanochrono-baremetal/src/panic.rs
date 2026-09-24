@@ -47,7 +47,7 @@ fn panic(info: &core::panic::PanicInfo<'_>) -> ! {
     // The stop screen needs a framebuffer and a keyboard, both of which are
     // PC firmware. An AArch64 board has already had the reason over serial,
     // and stopping there is the same outcome without the drawing.
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(x86_any)]
     {
         // SAFETY: written once before anything can panic, on a single core
         // with interrupts masked.
@@ -55,7 +55,7 @@ fn panic(info: &core::panic::PanicInfo<'_>) -> ! {
         // SAFETY: a panic is only reachable from kernel code, at CPL 0.
         unsafe { crate::panic_screen::show(fb.as_ref(), reason.as_str()) }
     }
-    #[cfg(not(target_arch = "x86_64"))]
+    #[cfg(not(x86_any))]
     {
         crate::println!("stopped; not restarting");
         crate::arch::halt()
@@ -76,7 +76,7 @@ impl ReasonBuffer {
         }
     }
 
-    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+    #[cfg_attr(not(x86_any), allow(dead_code))]
     fn as_str(&self) -> &str {
         // Truncation can land mid-character, so the longest valid prefix is
         // taken rather than risking a panic inside the panic handler.

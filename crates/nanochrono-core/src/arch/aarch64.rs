@@ -125,6 +125,211 @@ pub fn cntpct_ordered() -> u64 {
     v
 }
 
+/// `ISB` + `CNTPCT_EL0`: the interval-boundary read of the physical counter.
+#[inline(always)]
+pub fn cntpct_isb() -> u64 {
+    let v: u64;
+    // SAFETY: only reached once the physical counter was selected, which
+    // requires `physical_permitted()` (or EL1+, freestanding).
+    unsafe {
+        asm!(
+            "isb",
+            "mrs {v}, cntpct_el0",
+            v = out(reg) v,
+            options(nomem, nostack, preserves_flags),
+        );
+    }
+    v
+}
+
+// ---------------------------------------------------------------------------
+// Virtual or physical: the "Enable Physical Counter" setting
+// ---------------------------------------------------------------------------
+//
+// Every architectural read in this crate goes through `counter_raw` and
+// `counter_isb` below, so the choice made here reaches the stopwatch, the
+// calibration and the probes alike. Virtual is the default: it is what every
+// OS hands user space, and a hypervisor never needs to trap it. Physical is
+// what the hardware ticks — equal on bare metal, but inside a VM the
+// hypervisor may trap every read, and under nested virtualization that trap
+// is forwarded through a second hypervisor, which makes it slow and unstable.
+
+static PHYSICAL: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Whether reads use `CNTPCT_EL0`.
+#[inline(always)]
+pub fn physical_selected() -> bool {
+    PHYSICAL.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// Selects the counter. Enabling it is only sound once
+/// [`physical_permitted`] has said yes; `arch::set_counter_source` checks.
+pub(crate) fn select_physical(on: bool) {
+    PHYSICAL.store(on, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// The selected counter, unordered.
+#[inline(always)]
+pub fn counter_raw() -> u64 {
+    if physical_selected() {
+        cntpct_raw()
+    } else {
+        cntvct_raw()
+    }
+}
+
+/// The selected counter, `ISB`-ordered.
+#[inline(always)]
+pub fn counter_isb() -> u64 {
+    if physical_selected() {
+        cntpct_isb()
+    } else {
+        cntvct_isb()
+    }
+}
+
+/// Whether this process may read `CNTPCT_EL0` at all.
+///
+/// Freestanding (EL1 and above) it always may. From user space it depends on
+/// the kernel: `CNTKCTL_EL1.EL0PCTEN` decides whether the read executes,
+/// traps to the kernel for emulation, or is undefined — and undefined is
+/// `SIGILL`, not an error return. So it is tried once where a failure cannot
+/// hurt: a forked child on Unix, a vectored exception handler on Windows.
+#[cfg(not(feature = "std"))]
+pub fn physical_permitted() -> bool {
+    true
+}
+
+#[cfg(all(feature = "std", unix))]
+pub fn physical_permitted() -> bool {
+    use std::sync::OnceLock;
+    static PERMITTED: OnceLock<bool> = OnceLock::new();
+    *PERMITTED.get_or_init(|| {
+        // SAFETY: the child runs only async-signal-safe code: a system call,
+        // one register read and `_exit`.
+        let pid = unsafe { libc::fork() };
+        if pid < 0 {
+            return false;
+        }
+        if pid == 0 {
+            // A SIGILL is the expected "no" and must not leave a core file.
+            let no_core = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+            // SAFETY: a plain system call on a valid struct.
+            unsafe { libc::setrlimit(libc::RLIMIT_CORE, &no_core) };
+            // The child inherits the parent's signal handlers. In an Android
+            // app that is debuggerd's, and in any app with a crash reporter
+            // (Crashpad, Breakpad) it is the reporter's: the "no" below would
+            // be written up as a crash — a tombstone per probe — instead of
+            // quietly ending the child. `signal` is async-signal-safe.
+            // SAFETY: resets one disposition in a single-threaded child.
+            unsafe { libc::signal(libc::SIGILL, libc::SIG_DFL) };
+            core::hint::black_box(cntpct_raw());
+            // SAFETY: never returns, runs no destructors.
+            unsafe { libc::_exit(0) };
+        }
+        let mut status = 0;
+        loop {
+            // SAFETY: `pid` is our child; `status` is a valid out-pointer.
+            let r = unsafe { libc::waitpid(pid, &mut status, 0) };
+            if r == pid {
+                break;
+            }
+            if r < 0 && std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+                return false;
+            }
+        }
+        libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0
+    })
+}
+
+#[cfg(all(feature = "std", windows))]
+pub fn physical_permitted() -> bool {
+    use std::sync::OnceLock;
+    static PERMITTED: OnceLock<bool> = OnceLock::new();
+    *PERMITTED.get_or_init(windows_probe::run)
+}
+
+/// Windows has no `fork`, so the probe runs in-process under a vectored
+/// exception handler that recognises exactly one faulting address — the
+/// probe's own `mrs` — steps over it and records the fault. Any other
+/// exception is passed on untouched.
+#[cfg(all(feature = "std", windows))]
+mod windows_probe {
+    use core::sync::atomic::{AtomicBool, Ordering};
+    use windows_sys::Win32::System::Diagnostics::Debug::{
+        AddVectoredExceptionHandler, RemoveVectoredExceptionHandler, EXCEPTION_POINTERS,
+    };
+
+    core::arch::global_asm!(
+        ".global nc_cntpct_probe",
+        ".global nc_cntpct_probe_site",
+        "nc_cntpct_probe:",
+        "nc_cntpct_probe_site:",
+        "    mrs x0, cntpct_el0",
+        "    ret",
+    );
+
+    extern "C" {
+        fn nc_cntpct_probe() -> u64;
+        static nc_cntpct_probe_site: u8;
+    }
+
+    static FAULTED: AtomicBool = AtomicBool::new(false);
+
+    /// `STATUS_ILLEGAL_INSTRUCTION`.
+    const ILLEGAL_INSTRUCTION: i32 = 0xC000_001Du32 as i32;
+    const CONTINUE_EXECUTION: i32 = -1;
+    const CONTINUE_SEARCH: i32 = 0;
+
+    unsafe extern "system" fn handler(info: *mut EXCEPTION_POINTERS) -> i32 {
+        // SAFETY: Windows passes valid exception and context records.
+        unsafe {
+            let record = &*(*info).ExceptionRecord;
+            let site = &raw const nc_cntpct_probe_site as usize;
+            if record.ExceptionCode == ILLEGAL_INSTRUCTION && record.ExceptionAddress as usize == site {
+                FAULTED.store(true, Ordering::Relaxed);
+                (*(*info).ContextRecord).Pc += 4;
+                return CONTINUE_EXECUTION;
+            }
+        }
+        CONTINUE_SEARCH
+    }
+
+    pub(super) fn run() -> bool {
+        FAULTED.store(false, Ordering::Relaxed);
+        // SAFETY: the handler is 'static and removed before returning.
+        unsafe {
+            let cookie = AddVectoredExceptionHandler(1, Some(handler));
+            if cookie.is_null() {
+                return false;
+            }
+            core::hint::black_box(nc_cntpct_probe());
+            RemoveVectoredExceptionHandler(cookie);
+        }
+        !FAULTED.load(Ordering::Relaxed)
+    }
+}
+
+/// Nanoseconds per read of `read`: the best of several batches, timed with
+/// the virtual counter, which no hypervisor traps.
+pub fn read_cost_ns(read: fn() -> u64) -> u64 {
+    const BATCH: u64 = 64;
+    let hz = cntfrq();
+    if hz == 0 {
+        return 0;
+    }
+    let mut best = u64::MAX;
+    for _ in 0..16 {
+        let a = cntvct_isb();
+        for _ in 0..BATCH {
+            core::hint::black_box(read());
+        }
+        let b = cntvct_isb();
+        best = best.min(b.wrapping_sub(a));
+    }
+    best.saturating_mul(1_000_000_000) / hz / BATCH
+}
+
 /// `CNTFRQ_EL0` — the counter's tick rate in Hz.
 #[inline]
 pub fn cntfrq() -> u64 {
@@ -543,15 +748,20 @@ pub unsafe fn kernel_neon(loops: usize) -> u64 {
 pub unsafe fn kernel_aes(loops: usize) -> u64 {
     let mut acc: u64 = 0x0F1E_2D3C_4B5A_6978;
     for _ in 0..loops {
+        // The round key is a constant, not the accumulator: `AESE` begins
+        // with state XOR key, and with both equal to `x` that is zero on
+        // every iteration — a constant output, a chain that no longer
+        // depends on its input, and a checksum that stopped changing.
         unsafe {
             asm!(
                 "dup v0.2d, {x}",
-                "dup v1.2d, {x}",
+                "dup v1.2d, {k}",
                 "aese v0.16b, v1.16b",
                 "aesmc v0.16b, v0.16b",
                 "umov {x}, v0.d[0]",
                 "add {x}, {x}, #1",
                 x = inout(reg) acc,
+                k = in(reg) 0x6A09_E667_F3BC_C908u64,
                 out("v0") _, out("v1") _,
                 options(nomem, nostack, preserves_flags),
             );

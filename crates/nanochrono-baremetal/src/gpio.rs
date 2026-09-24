@@ -301,7 +301,10 @@ impl Controller {
         let mut communities = [Community { base: 0, pads_at: 0, capacity: 0 }; MAX_COMMUNITIES];
         let mut count = 0usize;
         for region in regions.iter().take(found) {
-            let base = region.base as usize;
+            // Above what a pointer reaches (i386): not a window this can read.
+            let Ok(base) = usize::try_from(region.base) else {
+                continue;
+            };
             // `PADBAR` is the first thing read, and it doubles as a presence
             // check: a window that is not decoded reads back all-ones, and a
             // pad pointer past the end of the window is nonsense either way.

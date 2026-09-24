@@ -1,16 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
-//! The interface, dispatched per architecture.
+//! The interface.
 //!
-//! The x86 build boots a multiboot loader that hands over a linear framebuffer
-//! and a memory map; its interface lives in [`gui_x86_64`]. The AArch64 side
-//! has neither a multiboot loader nor a free VGA, and its port — plus the
-//! hardware its framebuffer and console live behind — is [`gui_arm64`].
-//!
-//! This module exists so the rest of the crate can call `gui::run` without
-//! branching on the target; it re-exports whichever side compiles for the
-//! machine at hand. See each module for why the two interfaces differ.
+//! One implementation, [`gui_frame`](crate::gui_frame), for every
+//! architecture. What differs between machines — where keys come from (the
+//! 8042 and USB on x86, the serial console elsewhere), how the machine is
+//! turned off (ACPI, PSCI, SBI, OPAL), which clocks the counter is checked
+//! against — is chosen inside it by `cfg`, so the screen, the stopwatch and
+//! every rule about them are the same code on all of them.
 
-#[cfg(target_arch = "x86_64")]
-pub use crate::gui_x86_64::*;
-#[cfg(target_arch = "aarch64")]
-pub use crate::gui_arm64::*;
+pub use crate::gui_frame::*;

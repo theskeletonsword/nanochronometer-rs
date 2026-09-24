@@ -251,31 +251,35 @@ scratch and never `#include`s a DDK header.
 
 Flow (Linux): `certs/make-test-cert.sh` → commits **only**
 `certs/nanochrono-test.crt` (DER) while `certs-private/` (key/pem/pfx) is
-gitignored. `sign.sh` signs `build/*.sys` into `build/signed/` with
-`osslsigncode`, then `verify -CAfile` the self-signed pair. `sign.bat` is the
-Windows equivalent (osslsigncode.exe, else WDK `signtool`).
+gitignored. `sign.sh` signs `build/{x64,arm64}/nanochrono.sys` into
+`build/signed/{x64,arm64}/` with `osslsigncode`, then `verify -CAfile` the
+self-signed pair. On Windows, `autosign.bat` does the whole job: it reuses that
+PFX or creates a self-signed code-signing certificate with PowerShell, signs
+with `osslsigncode.exe` (WDK `signtool` as fallback), and optionally trusts the
+certificate (`/trust`) and turns test signing on (`/testsigning`). `sign.bat`
+calls it.
 
 Test-signed driver lifecycle on the target:
 
 ```
-bcdedit /set testsigning on          # then reboot
-sc create nanochrono type= kernel binPath= C:\nanochrono_x64.sys
+autosign.bat /testsigning            # Administrator; then reboot
+sc create nanochrono type= kernel binPath= C:\...\build\signed\x64\nanochrono.sys
 sc start  nanochrono
 python tools\query.py --wait         # prints the key=value report
 sc stop   nanochrono && sc delete nanochrono
 ```
 
-ARM64 Surface devices (Surfaces Pro X / Pro 9 World Edition use the ARM64
-`sc create ... binPath= C:\nanochrono_arm64.sys`), and the ARM64 image is
-signed by the same `osslsigncode`/`signtool` flow — `signtool` from the WDK
-handles ARM64 natively.
+There is one driver and one name, `nanochrono.sys`; the directory
+(`x64\` or `arm64\`) says the architecture. ARM64 Surface devices (Pro X /
+Pro 9 World Edition) take `build\signed\arm64\nanochrono.sys`, signed by the
+same flow.
 
 ---
 
 ## 7. Reproducing the verification (source of truth)
 
 - `make all` — offset checks (C), dlltool import libs, two `.sys` images.
-- `file build/*.sys` → `PE32+ … native, x86-64` / `native, ARM64`.
+- `file build/*/nanochrono.sys` → `PE32+ … native, x86-64` / `native, ARM64`.
 - `objdump -p` → `Subsystem: NT native`, `DLL Name: ntoskrnl.exe` only.
 - `objdump -d` → `vmcall`/`vmmcall`/`cpuid` present on x64,
   `hvc #0` + `mrs …, CurrentEL` present on arm64.

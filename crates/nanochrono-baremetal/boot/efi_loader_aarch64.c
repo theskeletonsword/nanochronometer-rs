@@ -8,11 +8,11 @@
  * `chainloader`, which transfers control to a PE/COFF EFI application. That
  * is what this is.
  *
- * The kernel is an ordinary ELF64 executable linked at 0x40000000 (the start
- * of the `virt` machine's RAM).  It sets
+ * The kernel is an ordinary ELF64 executable linked at 0x40200000 (2 MiB into
+ * the `virt` machine's RAM, clear of the devicetree QEMU puts at its start).  It sets
  * up its own stack and zeroes its own .bss in `_start`, but it is not fully
  * relocatable: data (Rust vtables, statics) keeps absolute addresses that
- * assume the linked base, so the image must be loaded at exactly 0x40000000.
+ * assume the linked base, so the image must be loaded at exactly 0x40200000.
  * The loader therefore:
  *
  *   1. allocates the needed pages at that exact address (AllocateAddress);
@@ -185,11 +185,11 @@ typedef struct {
 #define EFI_SIZE_TO_PAGES(a) (((a) >> 12) + (((a) & 0xfff) ? 1 : 0))
 
 /* The kernel is an ordinary aarch64 bare-metal image linked at a fixed
- * virtual base (0x40000000, the start of the `virt` machine's RAM).  It uses
+ * virtual base (0x40200000, 2 MiB into the `virt` machine's RAM).  It uses
  * PC-relative code for control flow but keeps absolute addresses (Rust
  * vtables, statics) that assume it runs at its linked base, so it must be
  * loaded at exactly that address. */
-#define KERNEL_BASE 0x40000000ull
+#define KERNEL_BASE 0x40200000ull
 
 /* The kernel ELF image, embedded as a raw blob. */
 extern const unsigned char kernel_image[];

@@ -76,6 +76,52 @@ rustflags = [
     "-C", "link-arg=-Tboot/aarch64.ld",
 ]
 
+# PowerPC. Custom specs, like `x86_64-nanochrono-none`: Rust ships no
+# freestanding PowerPC target. See targets/powerpc*-nanochrono-none.json and
+# src/arch/ppc.rs. `disable-redzone` is set in each spec (ELFv2 permits a
+# 288-byte protected zone below r1, which an interrupt would overwrite); the
+# flag is repeated here for the same reason as above.
+[target.powerpc64-nanochrono-none]
+rustflags = [
+    "-Z", "unstable-options",
+    "-C", "no-redzone=yes",
+    "-C", "relocation-model=static",
+    "-C", "link-arg=-Tboot/powerpc64.ld",
+]
+
+[target.powerpc64le-nanochrono-none]
+rustflags = [
+    "-Z", "unstable-options",
+    "-C", "no-redzone=yes",
+    "-C", "relocation-model=static",
+    "-C", "link-arg=-Tboot/powerpc64.ld",
+]
+
+[target.powerpc-nanochrono-none]
+rustflags = [
+    "-Z", "unstable-options",
+    "-C", "no-redzone=yes",
+    "-C", "relocation-model=static",
+    "-C", "link-arg=-Tboot/powerpc.ld",
+]
+
+# RISC-V: Rust's own freestanding targets. RV64 is `gc` (hard-float lp64d,
+# so the boot stub enables sstatus.FS); RV32 is `imac` (soft-float). The
+# psABI has no red zone; the flag is kept for uniformity.
+[target.riscv64gc-unknown-none-elf]
+rustflags = [
+    "-C", "no-redzone=yes",
+    "-C", "relocation-model=static",
+    "-C", "link-arg=-Tboot/riscv64.ld",
+]
+
+[target.riscv32imac-unknown-none-elf]
+rustflags = [
+    "-C", "no-redzone=yes",
+    "-C", "relocation-model=static",
+    "-C", "link-arg=-Tboot/riscv32.ld",
+]
+
 # Where the custom target spec lives. Relative to this file, so a checkout
 # works from any directory.
 [env]
@@ -88,3 +134,31 @@ build-std-features = ["compiler-builtins-mem"]
 
 [build]
 target = "x86_64-nanochrono-none"
+
+# i386: 32-bit protected mode, entered by boot/boot_i386.S. A custom spec for
+# the same reason as x86_64's: SSE2 on (pentium4), no OS.
+[target.i686-nanochrono-none]
+rustflags = [
+    "-Z", "unstable-options",
+    # The spec already sets `disable-redzone`; repeated for the same reason as
+    # every other target here: an interrupt or exception pushing onto a stack
+    # a leaf function is still using below its pointer is silent corruption.
+    "-C", "no-redzone=yes",
+    "-C", "relocation-model=static",
+]
+
+# 32-bit ARM: ARMv7-A with hard-float VFP/NEON, entered by the stub in
+# main.rs. Rust's own freestanding target; its `core` is built from source
+# like the others (build-std above).
+[target.armv7a-none-eabihf]
+rustflags = [
+    # Rust's built-in spec does not set `disable-redzone` for this target.
+    # AAPCS defines no red zone and LLVM does not use one on ARM today, but a
+    # kernel must not depend on that staying true.
+    "-C", "no-redzone=yes",
+    "-C", "relocation-model=static",
+    # strict-align: the MMU is off, so all memory is Strongly-ordered and an
+    # unaligned access faults whatever SCTLR.A says.
+    "-C", "target-feature=+neon,+v7,+vfp3,+strict-align",
+    "-C", "link-arg=-Tboot/arm32.ld",
+]

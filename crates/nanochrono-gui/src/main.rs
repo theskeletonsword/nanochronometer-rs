@@ -26,7 +26,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use iced::widget::{
-    button, canvas, column, container, horizontal_rule, row, scrollable, text, text_input, Space,
+    button, canvas, column, container, horizontal_rule, image as picture, row, scrollable, text,
+    text_input, Space,
 };
 use iced::{keyboard, window, Alignment, Element, Font, Length, Subscription, Task, Theme};
 
@@ -76,6 +77,11 @@ fn window_settings() -> window::Settings {
 /// macOS wants it converted to an `.icns` at packaging time, and Linux needs
 /// both a PNG in the icon theme and this, decoded, for the window itself.
 pub const ICON_ICO: &[u8] = include_bytes!("../../../assets/nanochrono.ico");
+
+/// The wordmark shown in the header: the stopwatch, green "Nano", white
+/// "Chronometer", for the black theme. Rendered by `tools/gen-icons.py` at
+/// 80 px tall and drawn at half that, so it stays sharp on 2x displays.
+const WORDMARK_PNG: &[u8] = include_bytes!("../../../assets/nanochronometer_wordmark_dark.png");
 
 /// Decodes the bundled application icon.
 ///
@@ -139,6 +145,8 @@ enum Panel {
     Bench,
     /// Hypervisor and emulation detection.
     Hypervisor,
+    /// Settings: the counter source.
+    Settings,
 }
 
 /// Which clock face the CLOCK view renders.
@@ -193,6 +201,16 @@ struct NanoChrono {
 
     dispatch_line: String,
     notice: String,
+
+    /// What the last physical-counter check measured, if it could run.
+    counter_check: Option<nanochrono_core::arch::PhysicalCounterCheck>,
+    /// Why the physical counter could not be enabled, if it could not.
+    counter_error: Option<String>,
+    /// The hypervisor report on screen: the start-up probe, or the last
+    /// re-probe. Rendering never probes (see `nanochrono_core::reprobe`).
+    hv_report: nanochrono_core::hypervisor::HypervisorReport,
+    /// The outcome of the last RE-PROBE or cooldown change.
+    reprobe_status: Option<(bool, String)>,
 }
 
 #[derive(Debug, Clone)]
@@ -215,6 +233,10 @@ enum Message {
 
     Recalibrate,
     CalibrationFinished(Box<StableClockState>),
+
+    SetPhysicalCounter(bool),
+    Reprobe,
+    SetReprobeCooldown(bool),
 
     TimerPresetChanged(String),
     StopwatchToggle,
@@ -264,6 +286,10 @@ impl NanoChrono {
             } else {
                 String::new()
             },
+            counter_check: None,
+            counter_error: None,
+            hv_report: nanochrono_core::hypervisor::cached().clone(),
+            reprobe_status: None,
             chrono,
         };
 
@@ -336,6 +362,9 @@ impl NanoChrono {
             }
 
             Message::SelectBenchMode(mode) => {
+                // Also reached from the digit keys, which should land on the
+                // panel that shows the mode they picked.
+                self.panel = Panel::Bench;
                 self.bench_mode = mode;
                 self.bench_rows = BenchKernel::rows_for(mode);
                 self.bench_selected = None;
@@ -405,6 +434,74 @@ impl NanoChrono {
                 };
             }
 
+            Message::Reprobe => {
+                use nanochrono_core::hypervisor;
+                self.reprobe_status = Some(match hypervisor::reprobe() {
+                    Ok((report, module_error)) => {
+                        self.hv_report = report;
+                        match module_error {
+                            None => (true, "re-probed".to_string()),
+                            Some(e) if e.kind() == std::io::ErrorKind::WouldBlock => (
+                                false,
+                                "re-probed in userspace; the kernel module is still cooling down \
+                                 and kept its cached probe"
+                                    .to_string(),
+                            ),
+                            Some(e) => (
+                                false,
+                                format!("re-probed in userspace; the kernel module was not asked again: {e}"),
+                            ),
+                        }
+                    }
+                    Err(e) => (false, e.to_string()),
+                });
+            }
+
+            Message::SetReprobeCooldown(on) => {
+                use nanochrono_core::hypervisor;
+                hypervisor::set_reprobe_cooldown_enabled(on);
+                let seconds = if on { nanochrono_core::reprobe::DEFAULT_COOLDOWN_S } else { 0 };
+                // The module keeps its own limit, enforced in the kernel; it
+                // follows this switch when the GUI may write to it (root).
+                self.reprobe_status = Some(if self.hv_report.kernel.is_some() {
+                    match hypervisor::kernel_module_set_cooldown(seconds) {
+                        Ok(()) => (true, format!("cooldown {seconds} s (GUI and kernel module)")),
+                        Err(e) => (
+                            false,
+                            format!(
+                                "cooldown {seconds} s in the GUI; the kernel module keeps its own \
+                                 ({e}; writing /proc/nanochrono needs root)"
+                            ),
+                        ),
+                    }
+                } else {
+                    (true, format!("cooldown {seconds} s"))
+                });
+            }
+
+            Message::SetPhysicalCounter(on) => {
+                use nanochrono_core::arch::{self, CounterSource};
+                let source = if on { CounterSource::Physical } else { CounterSource::Virtual };
+                match arch::set_counter_source(source) {
+                    Ok(()) => {
+                        self.counter_error = None;
+                        self.counter_check = arch::physical_counter_check();
+                        // In a VM the two counters differ by CNTVOFF_EL2: a run
+                        // started on one and stopped on the other measures that
+                        // offset, not time. So the stopwatch starts over.
+                        self.stopwatch.reset();
+                        self.notice = format!(
+                            "counter: {} — stopwatch reset{}",
+                            source.name(),
+                            if on && hypervisor_present() { "; virtualized system, see the warning" } else { "" }
+                        );
+                    }
+                    Err(e) => {
+                        self.counter_error = Some(e.to_string());
+                        self.notice = format!("physical counter unavailable: {e}");
+                    }
+                }
+            }
             Message::TimerPresetChanged(value) => {
                 if value.chars().all(|c| c.is_ascii_digit()) && value.len() <= 6 {
                     self.timer_preset = value;
@@ -439,9 +536,18 @@ impl NanoChrono {
                 keyboard::Key::Character("l") => Some(Message::StopwatchLap),
                 keyboard::Key::Character("b") => Some(Message::ShowPanel(Panel::Bench)),
                 keyboard::Key::Character("h") => Some(Message::ShowPanel(Panel::Hypervisor)),
+                keyboard::Key::Character("g") => Some(Message::ShowPanel(Panel::Settings)),
                 keyboard::Key::Character("c") => Some(Message::ToggleDesign),
                 keyboard::Key::Character("m") => Some(Message::SetDetail(DetailMode::Simple)),
                 keyboard::Key::Character("n") => Some(Message::SetDetail(DetailMode::Nano)),
+                // Digits pick a benchmark mode by its number in the list:
+                // 6 is Crypto RAW on Linux, 4 elsewhere (see `BenchMode::ALL`).
+                keyboard::Key::Character(d) => d
+                    .parse::<usize>()
+                    .ok()
+                    .and_then(|n| n.checked_sub(1))
+                    .and_then(|i| BenchMode::ALL.get(i).copied())
+                    .map(Message::SelectBenchMode),
                 _ => None,
             }
         });
@@ -453,6 +559,7 @@ impl NanoChrono {
             Panel::Clock => self.clock_panel(),
             Panel::Bench => self.bench_panel(),
             Panel::Hypervisor => self.hypervisor_panel(),
+            Panel::Settings => self.settings_panel(),
         };
 
         let layout = column![
@@ -473,6 +580,8 @@ impl NanoChrono {
 
     fn header(&self) -> Element<'_, Message> {
         let title_line = row![
+            picture(picture::Handle::from_bytes(WORDMARK_PNG)).height(Length::Fixed(40.0)),
+            Space::with_width(Length::Fixed(18.0)),
             text(format::format_unix_utc(self.snapshot.unix_time_ns))
                 .font(MONO)
                 .size(13)
@@ -544,6 +653,11 @@ impl NanoChrono {
                 "HYPERVISOR",
                 self.panel == Panel::Hypervisor,
                 Message::ShowPanel(Panel::Hypervisor)
+            ),
+            self.tab(
+                "SETTINGS",
+                self.panel == Panel::Settings,
+                Message::ShowPanel(Panel::Settings)
             ),
         ]
         .spacing(6)
@@ -698,9 +812,18 @@ impl NanoChrono {
                 "perf cycles",
                 &match self.snapshot.perf_cycles {
                     Some(cycles) => {
-                        format!("{cycles} ({} PMU)", self.snapshot.perf_pmu_count)
+                        format!("{cycles} ({} PMU, ring3 per-thread)", self.snapshot.perf_pmu_count)
                     }
-                    None => "unavailable".to_string(),
+                    None => "unavailable (ring3)".to_string(),
+                }
+            ),
+            readout(
+                "perf ring0",
+                &match nanochrono_core::ring0_perf::Ring0Perf::read() {
+                    Some(p) => {
+                        format!("{} {} ({} CPU, system-wide)", p.scaled, p.event.name(), p.npmu)
+                    }
+                    None => "unavailable (module not loaded)".to_string(),
                 }
             ),
             readout(
@@ -955,7 +1078,10 @@ impl NanoChrono {
                 "Select a mode, then click a feature row.\n\n\
                  Mode 1 runs inline-asm ISA kernels gated by CPUID + XGETBV.\n\
                  Mode 2 runs real AEAD and hash calls through the rustls crypto provider.\n\
-                 Mode 3 performs full rustls TLS 1.3 handshakes and splits the cost by phase.",
+                 Mode 3 performs full rustls TLS 1.3 handshakes and splits the cost by phase.\n\
+                 Crypto RAW times the bare crypto instructions (AES round, SHA-256 round,\n\
+                 carry-less multiply, VAES, VPCLMULQDQ): speed only, no cipher, no security.\n\n\
+                 Keys 1-9 pick a mode by its number.",
             );
 
         let log = container(
@@ -1014,10 +1140,174 @@ impl NanoChrono {
     /// This is the panel a reader should visit *before* trusting a nanosecond
     /// figure, so the verdict and its consequence sit at the top and the
     /// evidence underneath.
+    fn settings_panel(&self) -> Element<'_, Message> {
+        use nanochrono_core::arch::{self, CounterSource};
+
+        let available = arch::has_physical_counter();
+        let enabled = arch::counter_source() == CounterSource::Physical;
+        let virtualized = hypervisor_present();
+
+        let switch = button(
+            text(if enabled { "ON" } else { "OFF" })
+                .font(MONO)
+                .size(13),
+        )
+        .padding([6, 18])
+        .style(style::tab(enabled));
+        let switch = if available {
+            switch.on_press(Message::SetPhysicalCounter(!enabled))
+        } else {
+            switch
+        };
+
+        let mut section = column![
+            panel_title("COUNTER"),
+            row![
+                text("Enable Physical Counter").font(MONO).size(14).color(style::VALUE),
+                Space::with_width(Length::Fill),
+                switch,
+            ]
+            .align_y(Alignment::Center),
+            text(format!(
+                "in use: {}  ·  default: {}",
+                arch::counter_source().name(),
+                CounterSource::Virtual.name()
+            ))
+            .font(MONO)
+            .size(12)
+            .color(style::INFO),
+        ]
+        .spacing(8);
+
+        if !available {
+            section = section.push(
+                text(
+                    "Not applicable on this architecture: only AArch64 has a separate \
+                     physical counter (CNTPCT_EL0). x86 has one TSC; RISC-V and PowerPC \
+                     have one user-visible timebase.",
+                )
+                .font(MONO)
+                .size(12)
+                .color(style::MUTED),
+            );
+        } else {
+            // The warning is always visible, not only once enabled: it is
+            // the information needed to decide whether to enable it.
+            section = section.push(
+                container(
+                    text(arch::PHYSICAL_COUNTER_WARNING)
+                        .font(MONO)
+                        .size(12)
+                        .color(if virtualized { style::ALERT } else { style::PAUSED }),
+                )
+                .style(style::inset)
+                .padding(12)
+                .width(Length::Fill),
+            );
+            if virtualized {
+                section = section.push(
+                    text(format!(
+                        "This system is virtualized ({}). The counter can still be enabled; \
+                         expect trapped, jittery reads — worse under nested virtualization.",
+                        nanochrono_core::hypervisor::cached().hypervisor
+                    ))
+                    .font(MONO)
+                    .size(12)
+                    .color(style::ALERT),
+                );
+            }
+            if let Some(check) = &self.counter_check {
+                section = section.push(
+                    text(format!(
+                        "one read: {} ns physical vs {} ns virtual{}",
+                        check.physical_read_ns,
+                        check.virtual_read_ns,
+                        if check.trapped { "  —  the physical read is being trapped" } else { "" }
+                    ))
+                    .font(MONO)
+                    .size(12)
+                    .color(if check.trapped { style::ALERT } else { style::OK }),
+                );
+            }
+            if let Some(error) = &self.counter_error {
+                section = section.push(
+                    text(format!("could not enable: {error}"))
+                        .font(MONO)
+                        .size(12)
+                        .color(style::ALERT),
+                );
+            }
+            section = section.push(
+                text("Switching counters resets the stopwatch: in a VM the two differ by an offset.")
+                    .font(MONO)
+                    .size(11)
+                    .color(style::MUTED),
+            );
+        }
+
+        let cooldown_on = nanochrono_core::hypervisor::reprobe_cooldown_enabled();
+        let cooldown_switch = button(
+            text(if cooldown_on { "ON" } else { "OFF" }).font(MONO).size(13),
+        )
+        .padding([6, 18])
+        .style(style::tab(cooldown_on))
+        .on_press(Message::SetReprobeCooldown(!cooldown_on));
+        let mut reprobe = column![
+            panel_title("HYPERVISOR RE-PROBE"),
+            row![
+                text(format!(
+                    "Re-probe cooldown ({} s)",
+                    nanochrono_core::reprobe::DEFAULT_COOLDOWN_S
+                ))
+                .font(MONO)
+                .size(14)
+                .color(style::VALUE),
+                Space::with_width(Length::Fill),
+                cooldown_switch,
+            ]
+            .align_y(Alignment::Center),
+            text(nanochrono_core::reprobe::COOLDOWN_NOTE)
+                .font(MONO)
+                .size(12)
+                .color(style::INFO),
+        ]
+        .spacing(8);
+        // The warning shows whether or not the wait is off: it is what the
+        // user needs to read before turning it off.
+        reprobe = reprobe.push(
+            container(
+                text(nanochrono_core::reprobe::COOLDOWN_OFF_WARNING)
+                    .font(MONO)
+                    .size(12)
+                    .color(if cooldown_on { style::PAUSED } else { style::ALERT }),
+            )
+            .style(style::inset)
+            .padding(12)
+            .width(Length::Fill),
+        );
+        if let Some((ok, message)) = &self.reprobe_status {
+            reprobe = reprobe.push(
+                text(message.as_str())
+                    .font(MONO)
+                    .size(12)
+                    .color(if *ok { style::OK } else { style::ALERT }),
+            );
+        }
+
+        scrollable(
+            column![
+                container(section).style(style::panel).padding(18).width(Length::Fill),
+                container(reprobe).style(style::panel).padding(18).width(Length::Fill),
+            ]
+            .spacing(12),
+        )
+        .into()
+    }
+
     fn hypervisor_panel(&self) -> Element<'_, Message> {
         use nanochrono_core::hypervisor::{self, Confidence, TimingImpact};
 
-        let report = hypervisor::cached();
+        let report = &self.hv_report;
 
         let verdict_colour = match report.timing_impact {
             TimingImpact::Native => style::OK,
@@ -1129,11 +1419,11 @@ impl NanoChrono {
             }
         }
 
-        // --- ring 0 evidence, or an explanation of what is missing
+        // --- ring 0 evidence, or an explanation of what is missing.
         let mut ring0 = column![panel_title("RING 0 — optional kernel module")].spacing(4);
         match &report.kernel {
             Some(k) => {
-                ring0 = ring0.push(readout("module", &format!("loaded (v{})", k.version)));
+                ring0 = ring0.push(readout("module", &format!("nanochrono.ko (v{})", k.version)));
                 let flag = |v: Option<bool>| match v {
                     Some(true) => "accepted".to_string(),
                     Some(false) => "faulted".to_string(),
@@ -1151,16 +1441,52 @@ impl NanoChrono {
                 if let Some(el) = k.current_el {
                     ring0 = ring0.push(readout("current el", &el.to_string()));
                 }
+                if let Some(n) = k.hypercall_probes {
+                    ring0 = ring0.push(readout(
+                        "probes run",
+                        &format!(
+                            "{n} (cooldown {})",
+                            match k.hypercall_cooldown_s {
+                                Some(0) => "OFF".to_string(),
+                                Some(s) => format!("{s} s"),
+                                None => "?".to_string(),
+                            }
+                        ),
+                    ));
+                }
+                // Reading the perf keys re-runs no probe: the module serves
+                // its cached hypervisor report and live PMU sums.
+                match nanochrono_core::ring0_perf::Ring0Perf::read() {
+                    Some(p) => {
+                        ring0 = ring0.push(readout(
+                            "perf ring0",
+                            &format!("{} over {} CPU events", p.event.name(), p.npmu),
+                        ));
+                        ring0 = ring0.push(readout(
+                            "scaled",
+                            &format!("{} (raw {})", p.scaled, p.raw),
+                        ));
+                        ring0 = ring0.push(readout(
+                            "scheduled",
+                            &format!("{} / {} ns", p.running_ns, p.enabled_ns),
+                        ));
+                    }
+                    None => {
+                        ring0 = ring0.push(readout("perf ring0", "no PMU events available"));
+                    }
+                }
             }
             None => {
                 ring0 = ring0.push(
                     text(
                         "Not loaded — and not required. Detection above works without it.\n\n\
-                         The module adds one thing ring 3 cannot do at all: VMCALL, VMMCALL and \
-                         HVC need CPL 0 / EL1, so from userspace they fault whether or not a \
+                         The module adds what ring 3 cannot do at all: VMCALL, VMMCALL and HVC \
+                         need CPL 0 / EL1, so from userspace they fault whether or not a \
                          hypervisor is present. A hypercall that returns is proof, and it holds \
-                         even against a hypervisor that clears its CPUID bit.\n\n\
-                         cd kernel/linux && make && sudo insmod nanochrono_hv.ko",
+                         even against a hypervisor that clears its CPUID bit. It probes once \
+                         when it loads, and also publishes system-wide PMU counters beside the \
+                         per-thread ring-3 ones.\n\n\
+                         cd kernel/linux && sudo make load",
                     )
                     .font(MONO)
                     .size(11)
@@ -1168,6 +1494,47 @@ impl NanoChrono {
                 );
             }
         }
+
+        // --- re-probe: once at start, then the button, behind the cooldown.
+        let wait = hypervisor::reprobe_wait_s();
+        let label = if wait > 0 {
+            format!("RE-PROBE ({wait} s)")
+        } else {
+            "RE-PROBE".to_string()
+        };
+        let reprobe_button = button(text(label).font(MONO).size(13))
+            .padding([6, 18])
+            .style(style::tab(wait == 0));
+        let reprobe_button = if wait == 0 {
+            reprobe_button.on_press(Message::Reprobe)
+        } else {
+            reprobe_button
+        };
+        let mut reprobe = column![
+            row![
+                text(if hypervisor::reprobe_cooldown_enabled() {
+                    nanochrono_core::reprobe::COOLDOWN_NOTE
+                } else {
+                    "Re-probe cooldown is OFF (Settings) — the provider-ban risk is yours."
+                })
+                .font(MONO)
+                .size(11)
+                .color(if hypervisor::reprobe_cooldown_enabled() { style::MUTED } else { style::ALERT }),
+                Space::with_width(Length::Fill),
+                reprobe_button,
+            ]
+            .spacing(12)
+            .align_y(Alignment::Center),
+        ];
+        if let Some((ok, message)) = &self.reprobe_status {
+            reprobe = reprobe.push(
+                text(message.as_str())
+                    .font(MONO)
+                    .size(11)
+                    .color(if *ok { style::OK } else { style::ALERT }),
+            );
+        }
+        ring0 = ring0.push(reprobe);
 
         // --- where the evidence came from
         let sources = if report.sources.is_empty() {
@@ -1193,10 +1560,12 @@ impl NanoChrono {
             }
         );
 
-        // --- how the PMU is being read, which the same panel should answer
+        // --- how the PMU is being read, which the same panel should answer.
+        // Ring 3 is per-thread (this process); ring 0 is system-wide per-CPU
+        // sums from the perf module, when it owns /proc/nanochrono.
         let pmu = nanochrono_core::pmu::backend();
-        let pmu_line = format!(
-            "PMU via {} ({}), {} event(s)",
+        let mut pmu_line = format!(
+            "PMU ring3 via {} ({}), {} event(s)",
             pmu.name(),
             if pmu.is_hardware_counter() {
                 "hardware counter"
@@ -1205,6 +1574,16 @@ impl NanoChrono {
             },
             nanochrono_core::pmu::pmu_count(),
         );
+        if let Some(p) = nanochrono_core::ring0_perf::Ring0Perf::read() {
+            pmu_line.push_str(&format!(
+                "   ·   ring0 {} scaled={} (raw {}, {} CPU events{})",
+                p.event.name(),
+                p.scaled,
+                p.raw,
+                p.npmu,
+                if p.enabled { "" } else { ", disabled" },
+            ));
+        }
 
         column![
             verdict,
@@ -1263,6 +1642,7 @@ impl NanoChrono {
                 "[B] clock   [H] hypervisor   [C] clock design   click a feature row to run it   [ESC] exit"
             }
             Panel::Hypervisor => "[H] clock   [B] bench   [ESC] exit",
+            Panel::Settings => "[G] clock   [H] hypervisor   [B] bench   [ESC] exit",
             Panel::Clock => match self.stopwatch.state() {
                 StopwatchState::Running => {
                     "[SPACE/P] pause   [S] stop   [L] lap   [R] reset   [B] bench   [H] hypervisor"
@@ -1503,4 +1883,9 @@ mod icon_tests {
             "the icon is {width}px; desktops ask for 256 and macOS for 512"
         );
     }
+}
+
+/// Whether a hypervisor or emulator was detected (cached; cheap).
+fn hypervisor_present() -> bool {
+    nanochrono_core::hypervisor::cached().is_virtualized()
 }

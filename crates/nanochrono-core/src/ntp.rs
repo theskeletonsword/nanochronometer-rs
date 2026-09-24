@@ -166,23 +166,44 @@ pub fn query(
     }
 
     // LI = 0 (no warning), VN = 4, Mode = 3 (client).
-    let mut packet = [0u8; PACKET_LEN];
-    packet[0] = 0x23;
-
     let mut last_error = None;
     for addr in &addresses {
+        // A fresh request per address: the buffer is reused for the reply,
+        // and resending a previous server's reply as a request is not a
+        // request. The transmit timestamp carries a random nonce, which a
+        // server copies into the reply's originate field (RFC 5905 §8) — the
+        // check that a reply answers *this* request and was not injected by
+        // someone who merely guessed the source port.
+        let nonce = request_nonce();
+        let mut packet = [0u8; PACKET_LEN];
+        packet[0] = 0x23; // LI 0, version 4, mode 3 (client)
+        packet[40..48].copy_from_slice(&nonce.to_be_bytes());
+
         sample.local_send_unix_ns = platform::unix_time_ns();
         let sr0 = route.read_raw(chrono);
 
         let exchange = socket
             .send_to(&packet, addr)
             .and_then(|_| socket.recv_from(&mut packet));
+        // Only the address the request went to may answer it.
+        let exchange = match exchange {
+            Ok((_, from)) if from != *addr => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "reply came from an address the request was not sent to",
+            )),
+            other => other,
+        };
 
         let sr1 = route.read_raw(chrono);
         sample.local_recv_unix_ns = platform::unix_time_ns();
         sample.send_recv_units = sr1.saturating_sub(sr0);
 
         match exchange {
+            Ok((len, _)) if len >= PACKET_LEN && packet[24..32] != nonce.to_be_bytes() => {
+                last_error = Some(NtpError::BadResponse(
+                    "reply does not answer this request (originate timestamp mismatch)",
+                ));
+            }
             Ok((len, _)) if len >= PACKET_LEN => {
                 finish(&mut sample, &packet)?;
                 sample.cpu_after = platform::current_cpu();
@@ -229,6 +250,11 @@ fn finish(sample: &mut NtpSample, packet: &[u8; PACKET_LEN]) -> Result<(), NtpEr
     if sample.stratum == 0 {
         return Err(NtpError::BadResponse("server returned a kiss-of-death"));
     }
+    // Stratum 16 means unsynchronised, as does leap indicator 3 ("alarm");
+    // either way the server's clock is not a reference.
+    if sample.stratum >= 16 || sample.leap_indicator == 3 {
+        return Err(NtpError::BadResponse("server is not synchronised"));
+    }
 
     sample.ntp_transmit_unix_ns = ntp_timestamp_to_unix_ns(&packet[40..48]);
     if sample.ntp_transmit_unix_ns == 0 {
@@ -261,12 +287,35 @@ fn ntp_timestamp_to_unix_ns(bytes: &[u8]) -> u64 {
     }
     let seconds = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as u64;
     let fraction = u32::from_be_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]) as u64;
-    if seconds < NTP_UNIX_DELTA {
+    // All zeros is how NTP spells "not set".
+    if seconds == 0 && fraction == 0 {
         return 0;
     }
+    // NTP seconds are 32 bits and wrap on 2036-02-07 (era 1). A value below
+    // the Unix epoch's is read as era 1 rather than refused: this client has
+    // no use for dates before 1970, and refusing them would stop it working
+    // in 2036.
+    let unix_seconds = if seconds >= NTP_UNIX_DELTA {
+        seconds - NTP_UNIX_DELTA
+    } else {
+        seconds + (1u64 << 32) - NTP_UNIX_DELTA
+    };
     // fraction / 2^32 seconds, scaled to nanoseconds without losing precision.
     let ns_fraction = (fraction * 1_000_000_000) >> 32;
-    (seconds - NTP_UNIX_DELTA) * 1_000_000_000 + ns_fraction
+    unix_seconds * 1_000_000_000 + ns_fraction
+}
+
+/// 64 unpredictable bits for the request's transmit timestamp.
+///
+/// `RandomState` is keyed from the operating system's random source once per
+/// process and perturbed per instance, which is enough for a nonce whose job
+/// is to be unguessable by an off-path sender; it is not used as key material.
+fn request_nonce() -> u64 {
+    use std::hash::{BuildHasher, Hasher};
+    let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+    h.write_u64(platform::monotonic_ns());
+    // Never zero: a zero transmit timestamp is how "not set" is spelled.
+    h.finish() | 1
 }
 
 #[cfg(test)]
@@ -289,9 +338,39 @@ mod tests {
     }
 
     #[test]
-    fn pre_epoch_and_short_input_are_rejected() {
+    fn unset_and_short_input_are_rejected() {
         assert_eq!(ntp_timestamp_to_unix_ns(&[0u8; 8]), 0);
         assert_eq!(ntp_timestamp_to_unix_ns(&[0u8; 4]), 0);
+    }
+
+    /// After 2036-02-07 the 32-bit seconds field wraps; era 1 must decode
+    /// forward, not as "before 1970".
+    #[test]
+    fn era_one_decodes_after_2036() {
+        let mut bytes = [0u8; 8];
+        bytes[..4].copy_from_slice(&1u32.to_be_bytes());
+        let expected = ((1u64 << 32) + 1 - NTP_UNIX_DELTA) * 1_000_000_000;
+        assert_eq!(ntp_timestamp_to_unix_ns(&bytes), expected);
+    }
+
+    #[test]
+    fn unsynchronised_server_is_rejected() {
+        let mut sample = NtpSample::default();
+        let mut packet = [0u8; PACKET_LEN];
+        packet[0] = 0xE4; // LI 3 (alarm), mode 4
+        packet[1] = 2;
+        assert!(finish(&mut sample, &packet).is_err());
+        packet[0] = 0x24;
+        packet[1] = 16; // stratum 16: unsynchronised
+        assert!(finish(&mut sample, &packet).is_err());
+    }
+
+    #[test]
+    fn nonces_differ_and_are_never_zero() {
+        let a = request_nonce();
+        let b = request_nonce();
+        assert_ne!(a, 0);
+        assert_ne!(a, b);
     }
 
     #[test]

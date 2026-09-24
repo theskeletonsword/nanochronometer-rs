@@ -87,10 +87,19 @@ impl Field {
         if index >= self.count || self.bit_size == 0 || self.bit_size > 32 {
             return 0;
         }
-        let start = self.bit_offset + index * self.bit_size;
+        // Checked: the offsets come from a descriptor the device wrote, and a
+        // hostile one (BadUSB) can declare sizes whose products wrap.
+        let Some(start) = index
+            .checked_mul(self.bit_size)
+            .and_then(|skip| self.bit_offset.checked_add(skip))
+        else {
+            return 0;
+        };
         let mut raw = 0u32;
         for bit in 0..self.bit_size {
-            let at = start + bit;
+            let Some(at) = start.checked_add(bit) else {
+                return 0;
+            };
             let Some(byte) = body.get(at / 8) else {
                 return 0;
             };
@@ -423,7 +432,11 @@ fn parse(descriptor: &[u8]) -> Option<[Option<Candidate>; MAX_REPORTS]> {
                         candidate.digitizer = true;
                     }
 
-                    let field_bits = globals.report_size * globals.report_count;
+                    // Saturating: both factors are 32-bit values straight out
+                    // of the descriptor. A device claiming 2^32 fields of
+                    // 2^32 bits must not wrap the running offset back to a
+                    // plausible one (or panic a build with overflow checks).
+                    let field_bits = globals.report_size.saturating_mul(globals.report_count);
                     // Arrays are recorded too, not only variables: a
                     // keyboard's held keys *are* an array, and skipping
                     // non-variable items is why an earlier version could find
@@ -431,7 +444,7 @@ fn parse(descriptor: &[u8]) -> Option<[Option<Candidate>; MAX_REPORTS]> {
                     if !constant {
                         record(candidate, &globals, &locals, relative, variable);
                     }
-                    candidate.bits += field_bits;
+                    candidate.bits = candidate.bits.saturating_add(field_bits);
                     locals = Locals::default();
                 }
                 // Output and Feature: they consume the local state but
@@ -549,7 +562,9 @@ fn record(
     variable: bool,
 ) {
     let field = |index: usize| Field {
-        bit_offset: candidate.bits + index * globals.report_size,
+        bit_offset: candidate
+            .bits
+            .saturating_add(index.saturating_mul(globals.report_size)),
         bit_size: globals.report_size,
         count: 1,
         signed: globals.logical_minimum < 0,
@@ -588,7 +603,8 @@ fn record(
         page::BUTTON if variable => {
             // Buttons come as a usage range rather than one usage each.
             let count = match (locals.minimum, locals.maximum) {
-                (Some(low), Some(high)) if high >= low => (high - low + 1) as usize,
+                // `high - low + 1` overflows for the range 0..=u32::MAX.
+                (Some(low), Some(high)) if high >= low => ((high - low) as usize).saturating_add(1),
                 _ => locals.count,
             };
             if count == 0 {
@@ -838,6 +854,51 @@ mod tests {
         for cut in 0..ELAN.len() {
             let _ = find_pointer(&ELAN[..cut]);
         }
+    }
+
+    /// A BadUSB-style descriptor: every size at its 32-bit maximum, a button
+    /// range spanning all of `u32`, repeated so the running offset would
+    /// wrap. It must parse to *something* or nothing, never panic (the host
+    /// test build has overflow checks on), and decoding any report against
+    /// what it yields must stay in bounds.
+    #[test]
+    fn a_hostile_descriptor_cannot_overflow_the_parser() {
+        #[rustfmt::skip]
+        let hostile: &[u8] = &[
+            0x05, 0x09,                         // Usage Page (Button)
+            0x1B, 0x00, 0x00, 0x00, 0x00,       // Usage Minimum (0)
+            0x2B, 0xFF, 0xFF, 0xFF, 0xFF,       // Usage Maximum (u32::MAX)
+            0x77, 0xFF, 0xFF, 0xFF, 0xFF,       // Report Size (u32::MAX)
+            0x97, 0xFF, 0xFF, 0xFF, 0xFF,       // Report Count (u32::MAX)
+            0x81, 0x02,                         // Input (Data, Variable)
+            0x05, 0x01,                         // Usage Page (Generic Desktop)
+            0x09, 0x30, 0x09, 0x31,             // Usage (X), Usage (Y)
+            0x81, 0x06,                         // Input (Data, Variable, Relative)
+            0x81, 0x06,
+            0x81, 0x06,
+        ];
+        let _ = find_keyboard(hostile);
+        if let Some(layout) = find_pointer(hostile) {
+            let _ = layout.decode(&[0xFF; 64]);
+            let _ = layout.decode(&[]);
+        }
+        // And every prefix of it.
+        for cut in 0..hostile.len() {
+            let _ = find_pointer(&hostile[..cut]);
+        }
+    }
+
+    #[test]
+    fn a_field_whose_offset_wraps_reads_zero() {
+        let field = Field {
+            bit_offset: usize::MAX - 3,
+            bit_size: 8,
+            count: 4,
+            signed: false,
+            relative: true,
+        };
+        assert_eq!(field.value(&[0xFF; 8], 3), 0);
+        assert_eq!(field.value(&[0xFF; 8], 0), 0);
     }
 
     #[test]

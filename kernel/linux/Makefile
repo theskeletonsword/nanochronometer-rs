@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: (GPL-2.0-only OR MIT)
+# One module, one name: nanochrono.ko (hypervisor probe, counters, perf).
 obj-m += nanochrono.o
 
 KDIR ?= /lib/modules/$(shell uname -r)/build

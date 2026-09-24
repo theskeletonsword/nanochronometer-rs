@@ -40,3 +40,14 @@ desktop.ini
 *.pfx
 *.p12
 /kernel/windows/certs-private/
+
+# Per-machine notes for Claude (paths on the maintainer's PC)
+/CLAUDE.local.md
+
+# Android release signing: the keystore and its passwords never leave this machine
+/packaging/android/keystore/
+*.jks
+*.keystore
+
+# Release output (packaging/release/build-all.sh); binaries, not source
+/build/

@@ -28,5 +28,8 @@ tokio = { version = "1.53.1", features = ["rt"] }
 # not from anything at run time: without this the .exe shows the generic
 # application icon in Explorer, the task bar and Alt-Tab however good the
 # icon the window sets. Build-time only — nothing is linked from this crate.
-[target.'cfg(windows)'.build-dependencies]
+# Not `[target.'cfg(windows)'.build-dependencies]`: that condition is the
+# *host's*, so a Windows build cross-compiled from Linux would lose the icon.
+# build.rs asks for the target instead.
+[build-dependencies]
 winresource = "0.1"

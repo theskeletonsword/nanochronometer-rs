@@ -18,6 +18,14 @@ const TAG_END: u32 = 0;
 /// programmed first.
 const FRAMEBUFFER_TYPE_RGB: u8 = 1;
 
+/// How far a physical address can reach: the 512 GiB boot32.S identity-maps
+/// on x86_64; on i386, with paging off, the 4 GiB a 32-bit pointer names.
+/// A framebuffer beyond it would be written through a truncated pointer.
+#[cfg(target_pointer_width = "64")]
+const ADDRESSABLE: u64 = 512 << 30;
+#[cfg(target_pointer_width = "32")]
+const ADDRESSABLE: u64 = 1 << 32;
+
 /// Finds the framebuffer the loader set up, if it set one up.
 ///
 /// # Safety
@@ -46,7 +54,9 @@ pub unsafe fn framebuffer(info: u64) -> Option<Framebuffer> {
                 core::ptr::read_volatile((base + offset + 4) as *const u32) as usize,
             )
         };
-        if kind == TAG_END || size < 8 {
+        // A tag that claims to run past the structure is corrupt, and
+        // reading its body would read past what the loader handed over.
+        if kind == TAG_END || size < 8 || offset + size > total {
             break;
         }
         if kind == TAG_FRAMEBUFFER && size >= 32 {
@@ -68,12 +78,17 @@ pub unsafe fn framebuffer(info: u64) -> Option<Framebuffer> {
                 // space, and a UEFI machine routinely puts one above 4 GiB.
                 // Anything beyond the map would fault on the first store, so
                 // it is refused rather than written to.
-                if address == 0 || address >= (512u64 << 30) {
+                if address == 0 || address >= ADDRESSABLE {
                     return None;
                 }
                 Framebuffer::new(address as *mut u8, width, height, pitch, bpp)
             };
-            return fb.is_usable().then_some(fb);
+            // The whole surface, not just its first byte, has to sit inside
+            // the identity map the boot stub built.
+            let fits = (fb.base_address() as u64)
+                .checked_add(fb.size_bytes())
+                .is_some_and(|end| end <= ADDRESSABLE);
+            return (fb.is_usable() && fits).then_some(fb);
         }
         // Tags are padded to an 8-byte boundary.
         offset += size.div_ceil(8) * 8;
@@ -138,7 +153,9 @@ pub unsafe fn memory(info: u64) -> Memory {
                 core::ptr::read_volatile((base + offset + 4) as *const u32) as usize,
             )
         };
-        if kind == TAG_END || size < 8 {
+        // A tag that claims to run past the structure is corrupt, and
+        // reading its body would read past what the loader handed over.
+        if kind == TAG_END || size < 8 || offset + size > total_size {
             break;
         }
 
@@ -191,6 +208,34 @@ pub unsafe fn memory(info: u64) -> Memory {
         offset += size.div_ceil(8) * 8;
     }
     out
+}
+
+/// Memory size from a *multiboot1* information structure (QEMU's `-kernel`
+/// loader): `mem_lower`/`mem_upper` in KiB, valid when `flags` bit 0 is set.
+///
+/// # Safety
+/// `info` must be the pointer a multiboot1 loader passed with its magic.
+pub unsafe fn memory_v1(info: u64) -> Memory {
+    if info == 0 || info % 4 != 0 {
+        return Memory::default();
+    }
+    let base = info as usize;
+    // SAFETY: the caller guarantees a multiboot1 structure, whose first
+    // twelve bytes are flags, mem_lower and mem_upper.
+    let (flags, lower, upper) = unsafe {
+        (
+            core::ptr::read_volatile(base as *const u32),
+            core::ptr::read_volatile((base + 4) as *const u32) as u64,
+            core::ptr::read_volatile((base + 8) as *const u32) as u64,
+        )
+    };
+    if flags & 1 == 0 {
+        return Memory::default();
+    }
+    Memory {
+        total: (lower + upper) * 1024,
+        regions: 0,
+    }
 }
 
 extern "C" {
@@ -283,7 +328,9 @@ pub unsafe fn acpi_rsdp(info: u64) -> Option<Rsdp> {
                 core::ptr::read_volatile((base + offset + 4) as *const u32) as usize,
             )
         };
-        if kind == TAG_END || size < 8 {
+        // A tag that claims to run past the structure is corrupt, and
+        // reading its body would read past what the loader handed over.
+        if kind == TAG_END || size < 8 || offset + size > total {
             break;
         }
 

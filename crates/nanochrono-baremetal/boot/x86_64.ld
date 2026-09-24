@@ -50,6 +50,9 @@ SECTIONS {
     }
 
     __kernel_end = .;
+    /* The stack guard re-maps only the first gigabyte at 4 KiB granularity;
+       see install_stack_guard in boot32.S. */
+    ASSERT(__kernel_end <= 0x40000000, "the kernel image must fit in the first GiB")
 
     /* Rust emits these for a target with no unwinder; there is nothing to
      * unwind into, and keeping them would only inflate the image. */

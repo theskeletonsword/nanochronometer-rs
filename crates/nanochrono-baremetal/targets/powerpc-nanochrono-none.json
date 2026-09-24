@@ -1,0 +1,30 @@
+{
+  "abi": "",
+  "arch": "powerpc",
+  "cpu": "ppc",
+  "crt-static-default": false,
+  "crt-static-respected": false,
+  "data-layout": "E-m:e-p:32:32-Fn32-i64:64-n32",
+  "disable-redzone": true,
+  "dynamic-linking": false,
+  "env": "",
+  "exe-suffix": "",
+  "executables": true,
+  "features": "-altivec",
+  "has-thread-local": false,
+  "linker": "rust-lld",
+  "linker-flavor": "ld.lld",
+  "llvm-target": "powerpc-unknown-unknown",
+  "max-atomic-width": 32,
+  "os": "none",
+  "panic-strategy": "abort",
+  "position-independent-executables": false,
+  "relocation-model": "static",
+  "stack-probes": {
+    "kind": "inline"
+  },
+  "target-c-int-width": 32,
+  "target-endian": "big",
+  "target-pointer-width": 32,
+  "vendor": "unknown"
+}

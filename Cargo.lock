@@ -2126,6 +2126,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "nanochrono-android"
+version = "3.0.0"
+dependencies = [
+ "libc",
+ "nanochrono-bench",
+ "nanochrono-core",
+]
+
+[[package]]
 name = "nanochrono-bench"
 version = "3.0.0"
 dependencies = [
@@ -2142,6 +2151,7 @@ dependencies = [
  "nanochrono-bench",
  "nanochrono-core",
  "nanochrono-crypto",
+ "winresource",
 ]
 
 [[package]]

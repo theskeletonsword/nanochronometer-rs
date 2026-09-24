@@ -9,12 +9,13 @@
 ;
 ; or manually (recommended):
 ;
-;   sc create nanochrono type= kernel binPath= "<abs>\nanochrono_x64.sys"
+;   sc create nanochrono type= kernel binPath= "<abs>\nanochrono.sys"
 ;   bcdedit /set testsigning on   (test-signed drivers)
 ;   sc start nanochrono
 ;   sc stop nanochrono && sc delete nanochrono
 ;
-; On ARM64 devices use nanochrono_arm64.sys. Surface Pro X / Surface Pro 9 5G
+; Take nanochrono.sys from build\x64\ or build\arm64\ to match the machine
+; (the name is the same; only the directory differs). Surface Pro X / Surface Pro 9 5G
 ; and friends run ARM64 Windows; test-signing works there too.
 
 [Version]

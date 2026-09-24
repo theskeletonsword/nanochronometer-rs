@@ -11,7 +11,11 @@ description = "Freestanding NanoChronometer: counters and PMU with no operating 
 default = []
 # The SIMD probes. Needs a target whose ABI allows vector registers — the
 # custom `x86_64-nanochrono-none`, not the stable `x86_64-unknown-none`.
-simd = ["nanochrono-core/simd"]
+simd = ["nanochrono-core/simd", "crypto"]
+# The crypto benchmarks: RustCrypto, no_std and allocation-free. With `simd`
+# because AES-NI (and the SHA and PMULL paths) need the vector ABI; the
+# soft-float stable target leaves them out.
+crypto = ["dep:sha2", "dep:hmac", "dep:aes-gcm", "dep:chacha20poly1305", "dep:cpufeatures"]
 # Test-only: skip the 8042 so the USB stack is exercised on a machine
 # whose emulated PS/2 controller always answers. Not for release.
 force-usb = []
@@ -21,6 +25,17 @@ force-usb = []
 # off. The inline assembly is shared rather than reimplemented, which is the
 # whole point: a bare-metal kernel executes the same instruction sequences.
 nanochrono-core = { path = "../nanochrono-core", default-features = false }
+# RustCrypto, for the benchmark tab. Pure Rust, no_std, no allocator; each
+# picks its hardware path (AES-NI, ARMv8 crypto, SHA-NI) at run time where
+# the CPU has one and falls back to portable code where it does not.
+sha2 = { version = "0.10", default-features = false, optional = true }
+hmac = { version = "0.12", default-features = false, optional = true }
+aes-gcm = { version = "0.10", default-features = false, features = ["aes"], optional = true }
+chacha20poly1305 = { version = "0.10", default-features = false, optional = true }
+# Asked directly, with the crates' own feature tokens, so the benchmark says
+# which path they took. Only where the crates use it (x86, AArch64).
+[target.'cfg(any(target_arch = "x86_64", target_arch = "x86", target_arch = "aarch64"))'.dependencies]
+cpufeatures = { version = "0.2", optional = true }
 
 [lib]
 name = "nanochrono_baremetal"
@@ -40,3 +55,13 @@ bench = false
 # A freestanding binary has no unwinder and no runtime to unwind into.
 [profile.release]
 panic = "abort"
+
+# RustCrypto picks its hardware paths (AES-NI, SHA-NI, PCLMUL, ARMv8 crypto)
+# through `cpufeatures`, which upstream refuses to run on `target_os = "none"`
+# and so always answers "no" here. The vendored copy detects at run time
+# instead — CPUID on x86, the ID registers at EL1 on AArch64 — which is sound
+# for this kernel because its boot stub enables the state those paths need.
+# Each crypto crate then uses hardware where the CPU has it and its portable
+# code where it does not: no #UD on older parts. See vendor/cpufeatures.
+[patch.crates-io]
+cpufeatures = { path = "vendor/cpufeatures" }

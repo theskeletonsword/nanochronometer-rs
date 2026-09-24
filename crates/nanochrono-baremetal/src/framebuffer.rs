@@ -140,12 +140,34 @@ impl Framebuffer {
     }
 
     /// Whether this describes a usable surface.
+    ///
+    /// Also the only check between a loader's numbers and pixel writes that
+    /// index memory by them, so the geometry has to be *consistent*, not just
+    /// non-zero: a row must fit in its pitch (otherwise the last pixels of
+    /// the last row land past the end of the framebuffer), and
+    /// `pitch * height` must fit in 32 bits (every offset is computed as
+    /// `y * pitch + x * bpp` in `u32`, and a wrapped product would point
+    /// back into the middle of memory rather than off the end).
     pub fn is_usable(&self) -> bool {
+        let row_bytes = self.width.checked_mul(self.bytes_per_pixel);
+        let size = self.pitch.checked_mul(self.height);
         !self.base.is_null()
             && self.width > 0
             && self.height > 0
             && self.bytes_per_pixel >= 2
             && self.bytes_per_pixel <= 4
+            && matches!(row_bytes, Some(row) if row <= self.pitch)
+            && size.is_some()
+    }
+
+    /// Where the device surface starts.
+    pub fn base_address(&self) -> *mut u8 {
+        self.base
+    }
+
+    /// Bytes the device surface spans, `pitch * height`.
+    pub fn size_bytes(&self) -> u64 {
+        self.pitch as u64 * self.height as u64
     }
 
     /// Writes one pixel, ignoring anything outside the surface.

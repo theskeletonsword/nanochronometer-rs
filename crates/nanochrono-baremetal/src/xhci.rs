@@ -235,10 +235,18 @@ static mut ERST: Erst = Erst {
 #[repr(C, align(64))]
 struct Context([u8; 2048]);
 
+/// The input context is one context *longer* than a device context: the
+/// input control context, the slot context and all 31 endpoint contexts —
+/// 33 × 64 = 2112 bytes at the 64-byte context size. A 2048-byte input
+/// context puts endpoint 15 IN one past its end.
+#[repr(C, align(64))]
+struct InputContext([u8; INPUT_CONTEXT_BYTES]);
+const INPUT_CONTEXT_BYTES: usize = 33 * 64;
+
 /// The input context is shared: it is written only while a device is being
 /// enumerated, and enumeration is serial. The device contexts are not — the
 /// controller keeps writing them for as long as the device is addressed.
-static mut INPUT_CONTEXT: Context = Context([0; 2048]);
+static mut INPUT_CONTEXT: InputContext = InputContext([0; INPUT_CONTEXT_BYTES]);
 static mut DEVICE_CONTEXTS: [Context; MAX_DEVICES] = [Context([0; 2048]), Context([0; 2048])];
 
 /// Where descriptors and reports are read into.
@@ -338,8 +346,12 @@ impl DeviceSlot {
 /// # Safety
 /// Reads MMIO; requires ring 0 and an identity map covering the BAR.
 pub unsafe fn survey(device: &Device) -> (usize, bool) {
-    let base = device.bar0 as usize;
-    if base == 0 {
+    let Some(base) = device.bar0_addr() else {
+        return (0, false);
+    };
+    // SAFETY: forwarded from this function's own contract.
+    let bar_len = unsafe { device.bar0_size() } as usize;
+    if base == 0 || bar_len < MIN_BAR {
         return (0, false);
     }
     // SAFETY: forwarded from this function's own contract.
@@ -354,7 +366,7 @@ pub unsafe fn survey(device: &Device) -> (usize, bool) {
     let mut offset = ((hcc1 >> 16) & 0xFFFF) as usize * 4;
     let mut firmware_owned = false;
     for _ in 0..64 {
-        if offset == 0 {
+        if offset == 0 || !xecp_in_bar(offset, bar_len) {
             break;
         }
         // SAFETY: as above.
@@ -376,6 +388,30 @@ pub unsafe fn survey(device: &Device) -> (usize, bool) {
     (scratchpad, firmware_owned)
 }
 
+/// The smallest BAR an xHCI can have: the capability, operational and
+/// runtime blocks plus one port. Real controllers decode 64 KiB.
+const MIN_BAR: usize = 0x1000;
+
+/// Whether an extended capability at `offset` (header and the legacy
+/// semaphores, 8 bytes) lies inside the BAR.
+fn xecp_in_bar(offset: usize, bar_len: usize) -> bool {
+    offset.checked_add(8).is_some_and(|end| end <= bar_len)
+}
+
+/// Whether the register blocks the capability registers place all lie
+/// inside a BAR of `bar_len` bytes: the operational block and its port
+/// array, a doorbell for every slot the controller could number (256), and
+/// the runtime block through interrupter 0.
+fn layout_fits(bar_len: usize, caplength: usize, dboff: usize, rtsoff: usize, max_ports: u8) -> bool {
+    let operational_end = caplength + XHCI_PORTSC + max_ports as usize * 0x10;
+    let doorbell_end = dboff.checked_add(256 * 4);
+    let runtime_end = rtsoff.checked_add(0x20 + 0x20);
+    caplength >= 0x20
+        && operational_end <= bar_len
+        && doorbell_end.is_some_and(|end| dboff >= caplength && end <= bar_len)
+        && runtime_end.is_some_and(|end| rtsoff >= caplength && end <= bar_len)
+}
+
 /// A brought-up controller and the devices addressed on it.
 pub struct Xhci {
     /// The BAR, kept because every other offset is derived from it and a
@@ -385,6 +421,9 @@ pub struct Xhci {
     operational: usize,
     doorbell: usize,
     runtime: usize,
+    /// How many bytes the BAR decodes; every offset the controller supplies
+    /// is checked against it.
+    bar_len: usize,
     /// 64-byte contexts rather than 32, from `HCCPARAMS1.CSZ`. Getting this
     /// wrong puts every field at half its correct offset.
     context_size: usize,
@@ -411,10 +450,17 @@ impl Xhci {
         if device.bar0 == 0 {
             return None;
         }
+        // Sized before decoding is turned on: the handshake switches it off
+        // and restores whatever was there.
+        // SAFETY: forwarded from this function's own contract.
+        let bar_len = unsafe { device.bar0_size() } as usize;
+        if bar_len < MIN_BAR {
+            return None;
+        }
         // SAFETY: forwarded from this function's own contract.
         unsafe { device.enable() };
 
-        let base = device.bar0 as usize;
+        let base = device.bar0_addr()?;
         // SAFETY: the BAR is inside the identity map, checked by the caller.
         let (caplength, hcs1, hcc1, dboff, rtsoff) = unsafe {
             (
@@ -425,6 +471,12 @@ impl Xhci {
                 read32(base + XHCI_RTSOFF) as usize & !0x1F,
             )
         };
+        // Every register block below is placed by the controller's own
+        // words. A controller that places one outside its BAR is not driven:
+        // following it would read — and write — another device's registers.
+        if !layout_fits(bar_len, caplength, dboff, rtsoff, (hcs1 >> 24) as u8) {
+            return None;
+        }
 
         let mut xhci = Xhci {
             base,
@@ -441,6 +493,7 @@ impl Xhci {
             devices: [DeviceSlot::new(); MAX_DEVICES],
             device_count: 0,
             scratchpad: 0,
+            bar_len,
         };
 
         // **Before the reset, not after.** Until the handshake below the
@@ -489,7 +542,7 @@ impl Xhci {
         // controller with a corrupt or circular one must not be followed
         // forever.
         for _ in 0..64 {
-            if offset == 0 {
+            if offset == 0 || !xecp_in_bar(offset, self.bar_len) {
                 return;
             }
             // SAFETY: forwarded from this function's own contract; the
@@ -1133,7 +1186,7 @@ impl Xhci {
         // SAFETY: forwarded from this function's own contract.
         unsafe {
             let input = &raw mut INPUT_CONTEXT as *mut u8;
-            core::ptr::write_bytes(input, 0, 2048);
+            core::ptr::write_bytes(input, 0, INPUT_CONTEXT_BYTES);
 
             // Input Control Context: add the slot and EP0.
             write_ctx(input, 1, 0b11); // add flags: A0 | A1
@@ -1167,7 +1220,8 @@ impl Xhci {
             // The slot number comes from the controller. Bounds-checked
             // rather than trusted: an index past the array is a panic in a
             // kernel with nowhere to report one.
-            if slot as usize > MAX_SLOTS {
+            // Slot 0 is not a slot: DCBAA[0] is the scratchpad array pointer.
+            if slot == 0 || slot as usize > MAX_SLOTS {
                 return None;
             }
             DCBAA.0[slot as usize] = device;
@@ -1189,7 +1243,14 @@ impl Xhci {
         max_packet: u16,
     ) -> Option<()> {
         // Endpoint context index: 2 * number, plus one for an IN endpoint.
+        //
+        // `address` is the device's own bEndpointAddress, so it is checked:
+        // number 0 is the control endpoint (context 1), which this would
+        // silently reprogram as an interrupt endpoint.
         let number = (address & 0x0F) as usize;
+        if number == 0 {
+            return None;
+        }
         let index = number * 2 + 1;
         let cs = self.context_size;
         let slot = self.devices[device].slot;
@@ -1197,7 +1258,7 @@ impl Xhci {
         // SAFETY: forwarded from this function's own contract.
         unsafe {
             let input = &raw mut INPUT_CONTEXT as *mut u8;
-            core::ptr::write_bytes(input, 0, 2048);
+            core::ptr::write_bytes(input, 0, INPUT_CONTEXT_BYTES);
             // Add the slot and this endpoint.
             write_ctx(input, 1, 1 | (1 << index));
 

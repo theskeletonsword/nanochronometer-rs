@@ -162,6 +162,13 @@ impl std::error::Error for PerfError {}
 #[derive(Debug)]
 pub struct PerfCycleCounter {
     events: Vec<Event>,
+    /// The largest total handed out so far. A multiplexed event's count is
+    /// an estimate — raw × enabled / running — and two estimates taken a
+    /// moment apart can go *down*: the second window ran a larger share of
+    /// the time and extrapolates less. A cycle counter that runs backwards
+    /// turns every interval measured across that moment negative, so every
+    /// read is clamped to never fall below the last one.
+    high_water: std::sync::atomic::AtomicU64,
 }
 
 #[derive(Debug)]
@@ -190,7 +197,10 @@ impl PerfCycleCounter {
                 io::Error::new(io::ErrorKind::Unsupported, "no CPU PMU available")
             })));
         }
-        Ok(PerfCycleCounter { events })
+        Ok(PerfCycleCounter {
+            events,
+            high_water: std::sync::atomic::AtomicU64::new(0),
+        })
     }
 
     /// How many PMUs this counter spans. Two on a hybrid CPU, one elsewhere.
@@ -213,7 +223,15 @@ impl PerfCycleCounter {
                 total = total.saturating_add(value);
             }
         }
-        ran.then_some(total)
+        ran.then(|| self.monotonic(total))
+    }
+
+    /// `total`, or the largest total already returned if that is larger.
+    fn monotonic(&self, total: u64) -> u64 {
+        let previous = self
+            .high_water
+            .fetch_max(total, std::sync::atomic::Ordering::Relaxed);
+        previous.max(total)
     }
 
     /// Sums every event through the `read` syscall, returning an error when
@@ -229,7 +247,7 @@ impl PerfCycleCounter {
             }
         }
         if ran {
-            Ok(total)
+            Ok(self.monotonic(total))
         } else {
             Err(PerfError::Read(io::Error::other(
                 "no event was scheduled onto hardware",

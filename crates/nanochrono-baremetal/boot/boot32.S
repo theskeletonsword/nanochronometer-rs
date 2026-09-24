@@ -96,6 +96,14 @@ _start:
      * Inline rather than a `call`: the stack is itself inside .bss, so a
      * routine would overwrite its own return address partway through and
      * `ret` into nothing. */
+    /* The direction flag. Multiboot leaves EFLAGS undefined apart from VM
+     * and IF, so DF may be set — and then `rep stosl` below walks *down*
+     * from __bss_start, zeroing whatever precedes .bss instead. The Rust
+     * ABI also requires DF clear at every call: compiler-builtins'
+     * memcpy/memset use `rep movs`/`rep stos` and would copy backwards
+     * through memory for the whole run. */
+    cld
+
     mov $__bss_start, %edi
     mov $__bss_end, %ecx
     sub %edi, %ecx                  /* byte count */
@@ -110,6 +118,7 @@ _start:
     call check_long_mode
     call enable_sse
     call build_page_tables
+    call install_stack_guard
     call enter_long_mode
 
     /* The GDT is loaded and CS still refers to the 32-bit descriptor. A far
@@ -277,6 +286,60 @@ build_page_tables:
     jb 1b
     ret
 
+/* A guard page under the kernel stack.
+ *
+ * Without one, a stack overflow runs silently into whatever .bss holds below
+ * the stack — the page directories, as it happens — and the kernel carries on
+ * with corrupted state. With one, the first write past the end is a page
+ * fault, reported as such.
+ *
+ * A 4 KiB hole cannot be punched in a 1 GiB page, so the first gigabyte is
+ * re-expressed as 2 MiB pages (in `pd`'s first directory, which the 1 GiB
+ * path otherwise leaves unused), and the one 2 MiB page containing the guard
+ * as 4 KiB pages with the guard's entry not present. The linker script
+ * asserts the image lies inside that first gigabyte. The first gigabyte stays
+ * cached, exactly as before. */
+install_stack_guard:
+    cmpb $0, have_gib_pages
+    je 1f
+    xor %ecx, %ecx
+2:  mov %ecx, %eax
+    shl $21, %eax
+    or $0b10000011, %eax            /* present + writable + 2 MiB */
+    mov %eax, pd(, %ecx, 8)
+    movl $0, pd + 4(, %ecx, 8)
+    inc %ecx
+    cmp $512, %ecx
+    jb 2b
+    mov $pd, %eax
+    or $0b11, %eax
+    mov %eax, pdpt                  /* PDPT[0] -> the directory, not a page */
+    movl $0, pdpt + 4
+1:
+    mov $nc_stack_guard, %ebx
+    shr $21, %ebx                   /* which 2 MiB page holds the guard */
+    mov %ebx, %edx
+    shl $21, %edx                   /* and where that page starts */
+    xor %ecx, %ecx
+3:  mov %ecx, %eax
+    shl $12, %eax
+    add %edx, %eax
+    or $0b11, %eax                  /* present + writable, 4 KiB */
+    mov %eax, guard_pt(, %ecx, 8)
+    movl $0, guard_pt + 4(, %ecx, 8)
+    inc %ecx
+    cmp $512, %ecx
+    jb 3b
+    mov $nc_stack_guard, %eax
+    shr $12, %eax
+    and $511, %eax
+    movl $0, guard_pt(, %eax, 8)    /* the guard: not present */
+    mov $guard_pt, %eax
+    or $0b11, %eax
+    mov %eax, pd(, %ebx, 8)
+    movl $0, pd + 4(, %ebx, 8)
+    ret
+
 /* The same map, built from 2 MiB pages, for a CPU without PDPE1GB.
  *
  * Sixty-four gigabytes rather than the 512 the 1 GiB path covers, because the
@@ -435,6 +498,16 @@ long_mode_start:
     mov %ax, %fs
     mov %ax, %gs
 
+    /* The upper halves of the general registers are undefined after the
+     * switch from protected mode, RSP included: only ESP was ever loaded.
+     * A 32-bit write zero-extends, so this makes RSP exactly `stack_top`,
+     * which is 4 KiB aligned — the System V rule that RSP is 16-byte
+     * aligned at a `call` holds for `kmain`. */
+    mov $stack_top, %esp
+
+    /* Exceptions become reports instead of resets from here on. */
+    call setup_exceptions
+
     /* Recover the values saved in 32-bit mode, into the first two System V
      * argument registers. A 32-bit load zero-extends, which is what is
      * wanted: both quantities are 32-bit. */
@@ -450,18 +523,143 @@ long_mode_start:
     jmp 1b
 
 /* ---------------------------------------------------------------------------
+ * Exceptions.
+ *
+ * Without an IDT every exception is a triple fault: the CPU cannot deliver
+ * the fault, cannot deliver the resulting double fault, and resets. On real
+ * hardware that is a reboot loop with no message; under QEMU with
+ * -no-reboot, an exit. Either way the one piece of information that matters
+ * — which instruction, and why — is lost.
+ *
+ * So the 32 architectural exception vectors get stubs that push a uniform
+ * frame and call `nanochrono_x86_exception`, which reports and halts. The
+ * double fault, NMI and machine check run on their own stack (IST1): a
+ * double fault is what a kernel-stack overflow becomes, and a handler that
+ * pushes onto the stack that just overflowed faults a third time.
+ *
+ * Vectors 32-255 are left outside the IDT limit. Interrupts stay masked for
+ * the whole run; one that arrives anyway raises #GP, which is reported.
+ * ------------------------------------------------------------------------ */
+setup_exceptions:
+    /* The TSS descriptor is 16 bytes at selector 0x10. Its base is only
+     * known at link time as a relocatable symbol, and the descriptor splits
+     * the base across four fields, so it is assembled here. */
+    lea tss64(%rip), %rax
+    mov $103, %ecx                  /* limit: sizeof(TSS) - 1           */
+    mov %rax, %r8
+    and $0xFFFFFF, %r8              /* base[23:0] -> bits 16..39        */
+    shl $16, %r8
+    or %r8, %rcx
+    movabs $(0x89 << 40), %r8       /* present, type 9: available TSS   */
+    or %r8, %rcx
+    mov %rax, %r8
+    shr $24, %r8
+    and $0xFF, %r8                  /* base[31:24] -> bits 56..63       */
+    shl $56, %r8
+    or %r8, %rcx
+    mov %rcx, gdt64 + 16(%rip)
+    shr $32, %rax                   /* base[63:32] in the high quadword */
+    mov %rax, gdt64 + 24(%rip)
+
+    lea ist1_top(%rip), %rax
+    mov %rax, tss64 + 36(%rip)      /* IST1                             */
+    lea ist2_top(%rip), %rax
+    mov %rax, tss64 + 44(%rip)      /* IST2: page faults                */
+    movw $104, tss64 + 102(%rip)    /* I/O map base past the limit: none */
+    mov $0x10, %ax
+    ltr %ax
+
+    /* 32 interrupt gates, one per stub, 16 bytes apart. */
+    lea isr_stubs(%rip), %r8
+    lea idt64(%rip), %r9
+    xor %ecx, %ecx
+1:  mov %r8, %rax
+    mov %rax, %r10
+    and $0xFFFF, %r10               /* offset[15:0]                     */
+    or $(0x08 << 16), %r10          /* selector: the 64-bit code segment */
+    movabs $(0x8E << 40), %r11      /* present, DPL 0, interrupt gate   */
+    or %r11, %r10
+    mov %rax, %r11
+    shr $16, %r11
+    and $0xFFFF, %r11
+    shl $48, %r11                   /* offset[31:16]                    */
+    or %r11, %r10
+    cmp $2, %ecx                    /* NMI                              */
+    je 2f
+    cmp $8, %ecx                    /* #DF                              */
+    je 2f
+    cmp $18, %ecx                   /* #MC                              */
+    je 2f
+    /* #PF on a stack of its own: a fault on the stack guard is taken while
+     * RSP points into the guard, and pushing the frame there would fault
+     * again. */
+    cmp $14, %ecx
+    jne 3f
+    movabs $(2 << 32), %r11         /* IST2                             */
+    or %r11, %r10
+    jmp 3f
+2:  movabs $(1 << 32), %r11         /* IST1                             */
+    or %r11, %r10
+3:  mov %r10, (%r9)
+    shr $32, %rax                   /* offset[63:32]                    */
+    mov %rax, 8(%r9)
+    add $16, %r8
+    add $16, %r9
+    inc %ecx
+    cmp $32, %ecx
+    jb 1b
+
+    lidt idt64_pointer(%rip)
+    ret
+
+/* One stub per vector, 16 bytes apart so the loop above can compute each
+ * address. The CPU pushes an error code for 8, 10-14, 17, 21, 29 and 30;
+ * the others push a zero so every frame has the same shape:
+ *   [vector, error, RIP, CS, RFLAGS, RSP, SS] */
+.balign 16
+isr_stubs:
+.irp v, 0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31
+    .balign 16
+    .if (\v == 8) || (\v == 10) || (\v == 11) || (\v == 12) || (\v == 13) || (\v == 14) || (\v == 17) || (\v == 21) || (\v == 29) || (\v == 30)
+    .else
+    pushq $0
+    .endif
+    pushq $\v
+    jmp isr_common
+.endr
+
+isr_common:
+    cld
+    mov %rsp, %rdi                  /* the frame, as the first argument */
+    and $-16, %rsp                  /* System V alignment for the call  */
+    call nanochrono_x86_exception
+    cli
+1:  hlt
+    jmp 1b
+
+/* ---------------------------------------------------------------------------
  * Tables and stack.
  * ------------------------------------------------------------------------ */
-.section .rodata
-.align 8
+/* In .data, not .rodata: `ltr` writes the busy bit into the TSS descriptor. */
+.section .data
+.align 16
 gdt64:
     .quad 0                                     /* the mandatory null entry */
     /* Code segment: executable, descriptor type, present, 64-bit.
      * Long mode ignores base and limit, so only the flags matter. */
     .quad (1<<43) | (1<<44) | (1<<47) | (1<<53)
+    /* 0x10: the TSS, 16 bytes, filled in by `setup_exceptions`. */
+    .quad 0
+    .quad 0
+gdt64_end:
 gdt64_pointer:
-    .short . - gdt64 - 1
+    .short gdt64_end - gdt64 - 1
     .quad gdt64
+
+.align 16
+idt64_pointer:
+    .short 32 * 16 - 1
+    .quad idt64
 
 .section .data
 .align 4
@@ -490,8 +688,29 @@ pdpt:
  * CPU that has 1 GiB pages. */
 pd:
     .skip 4096 * PD_COUNT
+/* The 4 KiB table for the 2 MiB page around the stack guard. */
+guard_pt:
+    .skip 4096
+/* Never mapped; see `install_stack_guard`. */
+.global nc_stack_guard
+nc_stack_guard:
+    .skip 4096
 stack_bottom:
     /* 64 KiB. The kernel makes no deep calls and allocates nothing, but the
      * measurement buffers are stack-resident. */
     .skip 65536
 stack_top:
+
+.align 16
+idt64:
+    .skip 32 * 16
+tss64:
+    .skip 104
+.align 16
+ist1_bottom:
+    .skip 32768
+ist1_top:
+.align 16
+ist2_bottom:
+    .skip 32768
+ist2_top:

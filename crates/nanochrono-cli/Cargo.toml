@@ -17,3 +17,8 @@ nanochrono-crypto.workspace = true
 nanochrono-bench.workspace = true
 clap = { version = "4.6.6", features = ["derive"] }
 ctrlc = "3.5.2"
+
+# Embeds the icon into nanochrono.exe (see build.rs). A build dependency, not
+# a target one, because the target is what matters and build.rs asks for it.
+[build-dependencies]
+winresource = "0.1"

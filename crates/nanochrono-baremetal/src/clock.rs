@@ -23,7 +23,9 @@
 //! point: the displayed time and the measured interval come from one source,
 //! so they cannot disagree.
 
+#[cfg(x86_any)]
 use crate::arch::x86::{cpuid, inb, outb};
+#[cfg(x86_any)]
 use nanochrono_core::cpu::vendor;
 
 /// Nanoseconds per second, and the rest of the ladder.
@@ -55,6 +57,9 @@ pub enum Source {
     BaseFrequency,
     /// Measured against the 8254 PIT.
     Pit,
+    /// Stated by the architecture: `CNTFRQ_EL0` on ARM, the devicetree's
+    /// `timebase-frequency` on POWER and RISC-V. No calibration to do.
+    Architectural,
     /// Nothing worked; the rate is a guess and times are not shown.
     Unknown,
 }
@@ -66,6 +71,7 @@ impl Source {
             Source::Hypervisor => "kvm leaf",
             Source::BaseFrequency => "cpuid 16h",
             Source::Pit => "8254 pit",
+            Source::Architectural => "architectural",
             Source::Unknown => "unknown",
         }
     }
@@ -79,6 +85,7 @@ impl Source {
 /// A rate that is obviously wrong is worse than no rate: it turns every
 /// duration on screen into a confident fiction. Anything outside this band is
 /// rejected and the next method tried.
+#[cfg(x86_any)]
 const PLAUSIBLE: core::ops::RangeInclusive<u64> = 100_000_000..=100_000_000_000;
 
 impl Calibration {
@@ -88,6 +95,28 @@ impl Calibration {
     /// Drives the PIT through I/O ports in the fallback path; requires ring 0
     /// and that nothing else is using timer channel 2.
     pub unsafe fn measure() -> Calibration {
+        // Everywhere but x86 the counter's rate is part of the architecture:
+        // there is nothing to measure, only something to read.
+        #[cfg(not(x86_any))]
+        {
+            match nanochrono_core::arch::declared_counter_hz() {
+                Some(hz) if hz > 0 => Calibration { hz, source: Source::Architectural },
+                _ => Calibration { hz: 1_000_000_000, source: Source::Unknown },
+            }
+        }
+        // SAFETY: forwarded from this function's own contract.
+        #[cfg(x86_any)]
+        unsafe {
+            Self::measure_x86()
+        }
+    }
+
+    /// The x86 search: exact leaves first, the PIT as the fallback.
+    ///
+    /// # Safety
+    /// As [`measure`](Self::measure).
+    #[cfg(x86_any)]
+    unsafe fn measure_x86() -> Calibration {
         if let Some(hz) = hypervisor_tsc_hz() {
             return Calibration {
                 hz,
@@ -145,6 +174,7 @@ impl Calibration {
     }
 }
 
+#[cfg(x86_any)]
 /// `CPUID.15H`: TSC = crystal * numerator / denominator.
 fn crystal_tsc_hz() -> Option<u64> {
     // Intel only, and this is not caution for its own sake — it is the rule
@@ -181,6 +211,7 @@ fn crystal_tsc_hz() -> Option<u64> {
     PLAUSIBLE.contains(&hz).then_some(hz)
 }
 
+#[cfg(x86_any)]
 /// `CPUID.16H`: the nominal base frequency, in megahertz.
 ///
 /// Not the TSC rate in general — the TSC runs at the *base* frequency while
@@ -200,6 +231,7 @@ fn base_frequency_tsc_hz() -> Option<u64> {
     PLAUSIBLE.contains(&hz).then_some(hz)
 }
 
+#[cfg(x86_any)]
 /// `CPUID.40000010H:EAX`: the TSC frequency in kHz, as the hypervisor set it.
 ///
 /// Exact by construction under KVM, because the host chose the number this
@@ -221,15 +253,20 @@ fn hypervisor_tsc_hz() -> Option<u64> {
     PLAUSIBLE.contains(&hz).then_some(hz)
 }
 
+#[cfg(x86_any)]
 /// The 8254's input clock: 1.193182 MHz, the NTSC colourburst over three.
 const PIT_HZ: u64 = 1_193_182;
+#[cfg(x86_any)]
 /// Channel 2 data port. The only channel wired to something a kernel can poll
 /// without an interrupt controller.
 const PIT_CH2: u16 = 0x42;
+#[cfg(x86_any)]
 const PIT_COMMAND: u16 = 0x43;
+#[cfg(x86_any)]
 /// The port whose bit 0 gates channel 2 and whose bit 5 mirrors its output.
 const PIT_GATE: u16 = 0x61;
 
+#[cfg(x86_any)]
 /// Measures the counter against the PIT.
 ///
 /// Channel 2 is used rather than 0 because its gate is under software control
@@ -298,7 +335,9 @@ unsafe fn pit_tsc_hz() -> Option<u64> {
 // Wall clock
 // ---------------------------------------------------------------------------
 
+#[cfg(x86_any)]
 const CMOS_ADDRESS: u16 = 0x70;
+#[cfg(x86_any)]
 const CMOS_DATA: u16 = 0x71;
 
 /// A date and time as the RTC reports it.
@@ -329,6 +368,7 @@ impl DateTime {
 ///
 /// # Safety
 /// Drives the CMOS index and data ports; requires ring 0.
+#[cfg(x86_any)]
 pub unsafe fn read_rtc() -> Option<DateTime> {
     // SAFETY: caller guarantees ring 0.
     unsafe {
@@ -381,6 +421,7 @@ pub unsafe fn read_rtc() -> Option<DateTime> {
     }
 }
 
+#[cfg(x86_any)]
 /// The six fields, undecoded.
 ///
 /// # Safety
@@ -400,6 +441,7 @@ unsafe fn raw_rtc() -> (u8, u8, u8, u8, u8, u8) {
     }
 }
 
+#[cfg(x86_any)]
 /// Waits for the update-in-progress flag to clear.
 ///
 /// # Safety
@@ -417,6 +459,24 @@ unsafe fn wait_for_rtc() -> Option<()> {
     None
 }
 
+/// The RTC's seconds register, raw (BCD or binary as the RTC is set), or
+/// `None` while an update is in progress and the value may be torn. For
+/// seeing the second change, not for telling the time.
+///
+/// # Safety
+/// Drives the CMOS ports; requires ring 0.
+#[cfg(x86_any)]
+pub unsafe fn rtc_second_raw() -> Option<u8> {
+    // SAFETY: forwarded from this function's own contract.
+    unsafe {
+        if cmos(0x0A) & 0x80 != 0 {
+            return None;
+        }
+        Some(cmos(0x00))
+    }
+}
+
+#[cfg(x86_any)]
 /// Reads one CMOS register.
 ///
 /// # Safety
@@ -488,4 +548,23 @@ impl Clock {
         // the alternative is a clock that reads 24:xx.
         Some(total % (86_400 * NS_PER_S))
     }
+}
+
+/// No CMOS RTC off x86. A PL031 (ARM) or Goldfish RTC (RISC-V `virt`) would
+/// be the equivalent; until one is read the wall clock is simply unknown.
+///
+/// # Safety
+/// None; the signature matches the x86 one.
+#[cfg(not(x86_any))]
+pub unsafe fn read_rtc() -> Option<DateTime> {
+    None
+}
+
+/// See [`read_rtc`]: no RTC to watch off x86.
+///
+/// # Safety
+/// None; the signature matches the x86 one.
+#[cfg(not(x86_any))]
+pub unsafe fn rtc_second_raw() -> Option<u8> {
+    None
 }

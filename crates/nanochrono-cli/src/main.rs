@@ -41,6 +41,13 @@ struct Cli {
     #[arg(long, global = true, value_name = "INDEX")]
     pin_cpu: Option<u32>,
 
+    /// AArch64: time with the physical counter (CNTPCT_EL0) instead of the
+    /// virtual one (CNTVCT_EL0). Meant for real hardware: inside a VM the
+    /// hypervisor may trap every read, and under nested virtualization it is
+    /// slow and unstable. Allowed anyway, with a warning.
+    #[arg(long, global = true)]
+    physical_counter: bool,
+
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -66,6 +73,16 @@ enum Command {
         /// Skip the trap-cost probe, which costs a few microseconds.
         #[arg(long)]
         no_timing: bool,
+        /// Ask the kernel module (`/proc/nanochrono`) to run its hypervisor
+        /// probes again. It probes once at load; repeats are refused until
+        /// its cooldown (10 s by default) passes. Needs root.
+        #[arg(long)]
+        reprobe: bool,
+        /// Set the kernel module's re-probe cooldown in seconds. 0 disables
+        /// it — and the user then assumes the cloud provider's reaction
+        /// (throttling, a ban) to repeated VM exits. Needs root.
+        #[arg(long, value_name = "SECONDS")]
+        cooldown: Option<u32>,
     },
     /// Report how the guest's nanoseconds relate to the host's.
     HostSync,
@@ -123,6 +140,10 @@ enum Command {
         #[arg(long, default_value_t = 2000)]
         samples: u32,
     },
+    /// Compare per-thread perf counters (ring 3) with the kernel module
+    /// counters (ring 0, `/proc/nanochrono`). Needs the kernel module for
+    /// the ring-0 half: `cd kernel/linux && make load`.
+    Perf(PerfArgs),
 }
 
 #[derive(Args, Clone)]
@@ -173,6 +194,20 @@ struct CalibrateArgs {
 }
 
 #[derive(Args, Clone)]
+struct PerfArgs {
+    /// Select what the ring-0 module counts before reading: `cycles` or `instr`.
+    /// Needs write access to /proc/nanochrono (usually root).
+    #[arg(long, value_name = "EVENT")]
+    event: Option<String>,
+    /// Enable counting in the ring-0 module.
+    #[arg(long, conflicts_with = "disable")]
+    enable: bool,
+    /// Disable counting in the ring-0 module.
+    #[arg(long, conflicts_with = "enable")]
+    disable: bool,
+}
+
+#[derive(Args, Clone)]
 struct BenchArgs {
     /// Which family of work to measure.
     #[arg(long, value_enum, default_value_t = BenchModeArg::Isa)]
@@ -201,6 +236,11 @@ enum BenchModeArg {
     /// only, for the same reason and more so — it is a Linux kernel module.
     #[cfg(target_os = "linux")]
     Ring0,
+    /// The bare crypto instructions in the project's own kernels (AES
+    /// round, SHA-256 round, carry-less multiply, VAES, VPCLMULQDQ). Speed
+    /// only: no key schedule, no mode, no authentication. `crypto` is the
+    /// mode for real, secure crypto.
+    CryptoRaw,
 }
 
 impl From<BenchModeArg> for BenchMode {
@@ -213,6 +253,7 @@ impl From<BenchModeArg> for BenchMode {
             BenchModeArg::Kernel => BenchMode::KernelCrypto,
             #[cfg(target_os = "linux")]
             BenchModeArg::Ring0 => BenchMode::KernelCryptoRing0,
+            BenchModeArg::CryptoRaw => BenchMode::CryptoRaw,
         }
     }
 }
@@ -226,6 +267,14 @@ fn main() -> ExitCode {
     if let Some(cpu) = cli.pin_cpu {
         if !platform::pin_thread_to_cpu(cpu) {
             eprintln!("warning: could not pin to CPU {cpu}; results will be noisier");
+        }
+    }
+
+    // Before the chronometer exists, so its calibration and every read use
+    // the counter asked for.
+    if cli.physical_counter {
+        if let Err(code) = enable_physical_counter() {
+            return code;
         }
     }
 
@@ -259,7 +308,11 @@ fn main() -> ExitCode {
         Command::Stopwatch => run_stopwatch(chrono),
         Command::Once => run_once(chrono),
         Command::Dispatch => run_dispatch(),
-        Command::Hypervisor { no_timing } => run_hypervisor(no_timing),
+        Command::Hypervisor {
+            no_timing,
+            reprobe,
+            cooldown,
+        } => run_hypervisor(no_timing, reprobe, cooldown),
         Command::HostSync => run_host_sync(),
         Command::Integrity { drill } => run_integrity(drill),
         Command::Catalog => run_catalog(),
@@ -280,6 +333,7 @@ fn main() -> ExitCode {
         Command::AsmProbe => run_asm_probe(),
         Command::AsmSimd => run_asm_simd(&chrono),
         Command::SctAudit { samples } => run_sct_audit(&chrono, samples),
+        Command::Perf(args) => run_perf(args),
     };
 
     match result {
@@ -413,7 +467,37 @@ fn run_host_sync() -> Result<(), String> {
     Ok(())
 }
 
-fn run_hypervisor(no_timing: bool) -> Result<(), String> {
+fn run_hypervisor(no_timing: bool, reprobe: bool, cooldown: Option<u32>) -> Result<(), String> {
+    use nanochrono_core::hypervisor as hv;
+    use nanochrono_core::reprobe::{COOLDOWN_NOTE, COOLDOWN_OFF_WARNING};
+
+    if let Some(seconds) = cooldown {
+        if seconds == 0 {
+            eprintln!("WARNING: {COOLDOWN_OFF_WARNING}");
+        }
+        hv::kernel_module_set_cooldown(seconds)
+            .map_err(|e| format!("cannot set the module's cooldown ({}): {e}", hv::KERNEL_MODULE_PATH))?;
+        println!("module re-probe cooldown = {seconds} s");
+    }
+    if reprobe {
+        match hv::kernel_module_reprobe() {
+            Ok(()) => println!("module re-probed the hypervisor"),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                let wait = hv::kernel_module_probe()
+                    .and_then(|p| p.hypercall_next_ms)
+                    .map(|ms| format!(" — {} s left", ms.div_ceil(1000)))
+                    .unwrap_or_default();
+                return Err(format!("the module refused: still cooling down{wait}. {COOLDOWN_NOTE}"));
+            }
+            Err(e) => {
+                return Err(format!(
+                    "cannot ask the module to re-probe ({}): {e}",
+                    hv::KERNEL_MODULE_PATH
+                ))
+            }
+        }
+    }
+
     // `--no-timing` is the only reason to detect afresh: it deliberately
     // skips the trap-cost probe, which the cached report has already paid
     // for. Everything else comes from the process-wide cache, so a program
@@ -600,6 +684,38 @@ fn run_catalog() -> Result<(), String> {
     Ok(())
 }
 
+/// Switches every counter read to `CNTPCT_EL0`, with the warning.
+///
+/// Refused only where the read cannot run at all (the kernel makes it an
+/// illegal instruction for user space). A VM — nested or not — is not a
+/// refusal: the counter works there, it is just trapped, slow or unstable,
+/// and saying so is the warning's job, not a reason to deny the flag.
+fn enable_physical_counter() -> Result<(), ExitCode> {
+    use nanochrono_core::arch::{self, CounterSource};
+    if let Err(e) = arch::set_counter_source(CounterSource::Physical) {
+        eprintln!("error: --physical-counter: {e}");
+        return Err(ExitCode::from(2));
+    }
+    eprintln!("counter: {} (physical)", CounterSource::Physical.name());
+    eprintln!("warning: {}", arch::PHYSICAL_COUNTER_WARNING);
+    let report = nanochrono_core::hypervisor::cached();
+    if report.is_virtualized() {
+        eprintln!(
+            "warning: this system is virtualized ({}); expect trapped, jittery reads",
+            report.hypervisor
+        );
+    }
+    if let Some(check) = arch::physical_counter_check() {
+        eprintln!(
+            "counter: one read costs {} ns physical vs {} ns virtual{}",
+            check.physical_read_ns,
+            check.virtual_read_ns,
+            if check.trapped { " — the physical read is being trapped" } else { "" }
+        );
+    }
+    Ok(())
+}
+
 fn run_clock(chrono: Chronometer, args: ClockArgs, live: bool) -> Result<(), String> {
     let stop = interrupt_flag();
     let zone = args.zone();
@@ -713,6 +829,19 @@ fn print_counters(s: &NanoclockSnapshot) {
             "arm64 cntfrq_el0={} cntvct_el0={} cntvct_isb={} cntvct_ns={}",
             s.cntfrq_el0, s.cntvct_el0, s.cntvct_isb, s.cntvct_ns,
         );
+    } else if cfg!(any(
+        target_arch = "powerpc",
+        target_arch = "powerpc64",
+        target_arch = "riscv32",
+        target_arch = "riscv64",
+        target_arch = "arm"
+    )) {
+        println!(
+            "{} timebase={} timebase_hz={}",
+            nanochrono_core::arch::ARCH.name(),
+            nanochrono_core::arch::counter_raw(),
+            nanochrono_core::arch::declared_counter_hz().unwrap_or(0),
+        );
     }
     println!(
         "perf_cycles={} ({} PMU event(s), via perf_event_open)",
@@ -721,6 +850,95 @@ fn print_counters(s: &NanoclockSnapshot) {
             .unwrap_or_else(|| "unavailable".to_string()),
         s.perf_pmu_count,
     );
+    // Ring 0, when the perf module owns /proc/nanochrono. System-wide
+    // per-CPU counts, not per-thread: a different question from the line
+    // above, which is why both are shown rather than merged.
+    #[cfg(target_os = "linux")]
+    match nanochrono_core::ring0_perf::Ring0Perf::read() {
+        Some(r) => println!(
+            "ring0_{}={} (raw={} npmu={} enabled_ns={} running_ns={}, via /proc/nanochrono)",
+            r.event.name(),
+            r.scaled,
+            r.raw,
+            r.npmu,
+            r.enabled_ns,
+            r.running_ns,
+        ),
+        None => println!("ring0=unavailable (module not loaded; see kernel/linux/README.md)"),
+    }
+}
+
+fn run_perf(args: PerfArgs) -> Result<(), String> {
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = args;
+        return Err("perf ring 0 is Linux-only; ring 3 is reported via `once` on this platform"
+            .to_string());
+    }
+    #[cfg(target_os = "linux")]
+    {
+        use nanochrono_core::ring0_perf::{Ring0Event, Ring0Perf};
+
+        if let Some(name) = args.event.as_deref() {
+            let event = Ring0Event::parse(name)
+                .ok_or_else(|| format!("unknown event '{name}': use cycles or instr"))?;
+            Ring0Perf::select(event).map_err(|e| {
+                format!(
+                    "could not select {} in /proc/nanochrono: {e} \
+                     (module loaded? writable? try sudo)",
+                    event.name()
+                )
+            })?;
+            println!("ring0 event selected: {}", event.name());
+        }
+        if args.enable {
+            Ring0Perf::set_enabled(true).map_err(|e| {
+                format!("could not enable /proc/nanochrono: {e} (try sudo)")
+            })?;
+            println!("ring0 enabled");
+        }
+        if args.disable {
+            Ring0Perf::set_enabled(false).map_err(|e| {
+                format!("could not disable /proc/nanochrono: {e} (try sudo)")
+            })?;
+            println!("ring0 disabled");
+        }
+
+        // Ring 3: per-thread, follows this thread.
+        let r3 = nanochrono_core::perf::read_thread_cycles();
+        println!(
+            "ring3_cycles={} ({} PMU event(s), via perf_event_open, per-thread)",
+            r3.map(|v| v.to_string())
+                .unwrap_or_else(|| "unavailable".to_string()),
+            nanochrono_core::perf::pmu_count(),
+        );
+
+        // Ring 0: system-wide per-CPU sums from the module.
+        match Ring0Perf::read() {
+            Some(r) => {
+                println!("ring0_source=perf (/proc/nanochrono, nanochrono.ko)");
+                println!("ring0_event={}", r.event.name());
+                println!("ring0_enabled={}", yes_no(r.enabled));
+                println!("ring0_npmu={}", r.npmu);
+                println!("ring0_raw={}", r.raw);
+                println!("ring0_enabled_ns={}", r.enabled_ns);
+                println!("ring0_running_ns={}", r.running_ns);
+                println!("ring0_scaled={} (multiplexing-corrected; the number to use)", r.scaled);
+                if !r.enabled {
+                    println!("note: counting is disabled; `perf --enable` to resume");
+                }
+            }
+            None => {
+                println!("ring0=unavailable");
+                println!(
+                    "  the kernel module is not loaded, or this machine exposes no \
+                     PMU events to it (perf_available=0 in /proc/nanochrono)."
+                );
+                println!("  cd kernel/linux && sudo make load");
+            }
+        }
+        Ok(())
+    }
 }
 
 fn run_calibrate_route(chrono: Chronometer, args: CalibrateArgs) -> Result<(), String> {
@@ -880,6 +1098,11 @@ fn run_bench(chrono: &Chronometer, args: BenchArgs) -> Result<(), String> {
             k.name().eq_ignore_ascii_case(&args.kernel)
                 || matches!(k, BenchKernel::Kernel(a) | BenchKernel::Ring0(a)
                     if a.algorithm().eq_ignore_ascii_case(&args.kernel))
+                // `vaes` as well as `vaes (ymm)`: the register width is a
+                // label, not something anyone types.
+                || matches!(k, BenchKernel::CryptoRaw(c)
+                    if c.name().eq_ignore_ascii_case(&args.kernel)
+                        || c.name().split(" (").next().is_some_and(|short| short.eq_ignore_ascii_case(&args.kernel)))
         });
         match wanted {
             Some(k) => vec![k],

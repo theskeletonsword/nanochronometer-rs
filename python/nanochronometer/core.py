@@ -38,6 +38,8 @@ class NanoClockSnapshot(ctypes.Structure):
     _fields_ = [
         ("status", ctypes.c_int), ("arch", ctypes.c_uint32), ("route", ctypes.c_uint32),
         ("best_simd_family", ctypes.c_uint32), ("backend", ctypes.c_uint32),
+        # Explicit: see `_pad_backend` in include/nanochrono.h.
+        ("_pad_backend", ctypes.c_uint32),
         ("unix_time_ns", ctypes.c_uint64), ("monotonic_ns", ctypes.c_uint64),
         ("process_time_ns", ctypes.c_uint64), ("thread_time_ns", ctypes.c_uint64),
         ("selected_raw_units", ctypes.c_uint64), ("selected_ns", ctypes.c_uint64),

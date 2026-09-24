@@ -68,25 +68,28 @@ impl Palette {
         warn: 0x00FF_C36B,
     };
 
-    /// The measurement interface, matching the desktop GUI's dark theme.
+    /// The measurement interface: black, with the logo's two inks for the
+    /// lettering — white for what is read, the logo green for labels and
+    /// accents. No grey anywhere, so the embedded logo sits on its own
+    /// background.
     pub const APP: Palette = Palette {
-        background: 0x000B_0E13,
-        panel: 0x0014_1A23,
-        shadow: 0x0007_090D,
-        title: 0x00F0_F4FA,
-        text: 0x00DC_E4EE,
-        muted: 0x0078_8799,
-        accent: 0x0038_DCA6,
+        background: 0x0000_0000,
+        panel: 0x000A_0C0A,
+        shadow: 0x0000_0000,
+        title: 0x00FF_FFFF,
+        text: 0x00F4_F7F4,
+        muted: 0x002F_B83C,
+        accent: 0x0039_E84A,
         danger: 0x00FF_7A66,
-        button: 0x001E_2833,
-        button_edge: 0x002E_3C4B,
-        divider: 0x0022_2C38,
-        header_from: 0x001A_2431,
-        header_to: 0x0011_1823,
-        hover: 0x0028_3644,
-        active: 0x0032_4657,
-        track: 0x0019_212B,
-        glow: 0x0016_5C45,
+        button: 0x0010_1410,
+        button_edge: 0x001F_4A26,
+        divider: 0x0014_2A18,
+        header_from: 0x0000_0000,
+        header_to: 0x0000_0000,
+        hover: 0x0016_2E1A,
+        active: 0x001F_4A26,
+        track: 0x0012_1812,
+        glow: 0x0014_5C22,
         warn: 0x00FF_C36B,
     };
 }

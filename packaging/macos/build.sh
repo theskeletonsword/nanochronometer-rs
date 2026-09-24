@@ -104,10 +104,10 @@ for arch in "${requested[@]}"; do
 
     echo "=== ${arch} (${target})"
     rustup target add "${target}" >/dev/null 2>&1 || true
-    cargo build --release --target "${target}" \
+    cargo build --profile dist --target "${target}" \
         -p nanochrono-cli -p nanochrono-ffi -p nanochrono-gui
 
-    src="${repo_root}/target/${target}/release"
+    src="${repo_root}/target/${target}/dist"
     dst="${out_dir}/${arch}"
     mkdir -p "${dst}"
     cp "${src}/nanochrono" "${dst}/"

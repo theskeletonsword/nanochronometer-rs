@@ -1,0 +1,5 @@
+# cmd.exe mis-parses labels (goto/call) in batch files with LF-only line
+# endings, so they are checked out with CRLF everywhere.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.inf text eol=crlf

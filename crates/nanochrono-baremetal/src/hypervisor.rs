@@ -76,6 +76,12 @@ pub struct Report {
     /// The whole point is that this is a small number and never grows. See
     /// [`hypercalls`].
     pub hypercalls: u32,
+    /// x86-64: the hypercall instruction the HAL chose for this CPU's vendor
+    /// (`None` elsewhere, or for an unknown vendor — then no hypercall).
+    pub hypercall_insn: Option<nanochrono_core::hypercall_hal::HypercallInsn>,
+    /// How many times detection has run: 1 is the boot-time negotiation,
+    /// anything more a re-probe the user asked for. See [`reprobe`].
+    pub probes: u32,
 }
 
 impl Report {
@@ -104,12 +110,12 @@ pub struct ClockPairing {
     pub counter: u64,
 }
 
-/// Runs every detector.
+/// Runs every detector — every time. Only [`detect`] and [`reprobe`] call it.
 ///
 /// # Safety
 /// Issues a hypercall and reads MSRs; requires ring 0 / EL1.
-pub unsafe fn detect() -> Report {
-    #[cfg(target_arch = "x86_64")]
+unsafe fn probe_now() -> Report {
+    #[cfg(x86_any)]
     // SAFETY: forwarded from this function's own contract.
     unsafe {
         x86::detect()
@@ -119,9 +125,167 @@ pub unsafe fn detect() -> Report {
     unsafe {
         arm::detect()
     }
+    #[cfg(any(target_arch = "powerpc", target_arch = "powerpc64"))]
+    {
+        ppc::detect()
+    }
+    #[cfg(any(target_arch = "riscv32", target_arch = "riscv64"))]
+    {
+        riscv::detect()
+    }
+    // 32-bit ARM: no detector yet; reported as bare metal would be a claim,
+    // so the report says nothing either way.
+    #[cfg(target_arch = "arm")]
+    {
+        Report::default()
+    }
 }
 
-#[cfg(target_arch = "x86_64")]
+// ---------------------------------------------------------------------------
+// Once at boot, then only on request, behind the cooldown
+// ---------------------------------------------------------------------------
+//
+// The negotiation with the host — the hypercalls, the clock pairing — runs
+// once, the first time anything asks (the self-test, during boot). Every
+// later caller — the self-test's printout, the GUI, the serial console — gets
+// that cached report. A hypervisor on a cloud host (Azure, GCP, AWS,
+// Vultr…) reads a guest that keeps exiting as abuse, and throttles or bans
+// it; a panel that re-detected on every frame would do exactly that.
+//
+// The user can ask again (a key in the GUI and the console), at most once
+// every `nanochrono_core::reprobe::DEFAULT_COOLDOWN_S` seconds. Settings can
+// switch the wait off, with the warning that the ban risk is then the user's.
+
+struct Cache {
+    report: Option<Report>,
+    /// `arch::counter_ordered()` at the last probe.
+    last_ticks: u64,
+    cooldown_s: u32,
+}
+
+/// One core, no interrupt handler touches it: every access is from the
+/// kernel's single thread of control, so a plain static is enough.
+static mut CACHE: Cache = Cache {
+    report: None,
+    last_ticks: 0,
+    cooldown_s: nanochrono_core::reprobe::DEFAULT_COOLDOWN_S,
+};
+
+fn cache() -> &'static mut Cache {
+    // SAFETY: single-threaded kernel, see `CACHE`; no reference outlives the
+    // caller's statement.
+    unsafe { &mut *core::ptr::addr_of_mut!(CACHE) }
+}
+
+fn record(mut report: Report) -> Report {
+    let c = cache();
+    report.probes = c.report.map_or(1, |r| r.probes.saturating_add(1));
+    report.hypercalls = hypercalls();
+    c.report = Some(report);
+    c.last_ticks = crate::arch::counter_ordered();
+    report
+}
+
+/// The hypervisor report: probed the first time (the boot negotiation),
+/// cached ever after.
+///
+/// # Safety
+/// The first call issues a hypercall and reads MSRs; requires ring 0 / EL1.
+pub unsafe fn detect() -> Report {
+    if let Some(report) = cache().report {
+        return report;
+    }
+    // SAFETY: forwarded from this function's own contract.
+    record(unsafe { probe_now() })
+}
+
+/// Whole seconds until [`reprobe`] is allowed; 0 = now. `hz` is the rate of
+/// `arch::counter_ordered()`.
+pub fn reprobe_wait_s(hz: u64) -> u32 {
+    let c = cache();
+    if c.cooldown_s == 0 || c.report.is_none() || hz == 0 {
+        return 0;
+    }
+    let elapsed = crate::arch::counter_ordered().wrapping_sub(c.last_ticks);
+    let window = c.cooldown_s as u64 * hz;
+    window.saturating_sub(elapsed).div_ceil(hz) as u32
+}
+
+/// Probes again, if the cooldown allows. `Err` carries the seconds left.
+///
+/// # Safety
+/// As [`detect`]: issues a hypercall; requires ring 0 / EL1.
+pub unsafe fn reprobe(hz: u64) -> Result<Report, u32> {
+    let wait = reprobe_wait_s(hz);
+    if wait > 0 {
+        return Err(wait);
+    }
+    // SAFETY: forwarded from this function's own contract.
+    Ok(record(unsafe { probe_now() }))
+}
+
+/// Whether the re-probe wait is on.
+pub fn cooldown_enabled() -> bool {
+    cache().cooldown_s != 0
+}
+
+/// Turns the re-probe wait on (the default length) or off. Off is the
+/// user's risk: `nanochrono_core::reprobe::COOLDOWN_OFF_WARNING`.
+pub fn set_cooldown_enabled(on: bool) {
+    cache().cooldown_s = if on { nanochrono_core::reprobe::DEFAULT_COOLDOWN_S } else { 0 };
+}
+
+/// RISC-V: the SBI names its implementation. KVM (ID 3), Xvisor (2), Xen (7)
+/// and bhyve (11) are hypervisors, and their SBI *is* the hypercall
+/// interface — the query is already a hypercall, answered, which is proof.
+/// Firmware implementations (OpenSBI, RustSBI, …) mean bare metal.
+#[cfg(any(target_arch = "riscv32", target_arch = "riscv64"))]
+mod riscv {
+    use super::Report;
+    use crate::arch::riscv::{sbi, sbi_identity};
+
+    pub(super) fn detect() -> Report {
+        let (_, id, _) = sbi_identity();
+        super::HYPERCALLS.fetch_add(3, super::Ordering::Relaxed);
+        let mut report = Report::default();
+        let name = sbi::impl_name(id).as_bytes();
+        let n = name.len().min(report.signature.len());
+        report.signature[..n].copy_from_slice(&name[..n]);
+        let hypervisor = matches!(id, 2 | 3 | 7 | 11);
+        report.hypercall_ok = hypervisor;
+        report.cpuid_bit = hypervisor;
+        report.hypercalls = super::hypercalls();
+        report
+    }
+}
+
+/// PowerPC: the MSR says it directly, no hypercall needed.
+///
+/// On 64-bit Book3S, `MSR[HV]` set means this kernel *is* in hypervisor
+/// state — `powernv`, bare metal — and clear means a hypervisor sits above
+/// it (a `pseries` LPAR under PowerVM or KVM). No `sc 1` is issued: it would
+/// be a hypercall into whatever that hypervisor is, with nothing gained that
+/// the MSR does not already say. 32-bit Book E has no equivalent visible from
+/// the guest, so nothing is claimed there.
+#[cfg(any(target_arch = "powerpc", target_arch = "powerpc64"))]
+mod ppc {
+    use super::Report;
+
+    pub(super) fn detect() -> Report {
+        let mut report = Report::default();
+        #[cfg(target_arch = "powerpc64")]
+        {
+            report.cpuid_bit = crate::arch::ppc::msr() & crate::arch::ppc::MSR_HV == 0;
+        }
+        report.hypercalls = super::hypercalls();
+        report
+    }
+}
+
+#[cfg(x86_any)]
+// The KVM clock pairing below is a long-mode interface (a 64-bit guest
+// address in RBX); on i386 it is compiled out and its pieces go unused.
+#[cfg_attr(target_arch = "x86", allow(dead_code, unused_imports))]
 mod x86 {
     use super::{ClockPairing, Report};
     use crate::arch::x86::cpuid;
@@ -189,24 +353,41 @@ mod x86 {
         // So the signature has to be KVM's specifically. `KVM_HC_*` is KVM's
         // interface; no other hypervisor answers it, and guessing costs the
         // machine.
-        if report.signature_str().starts_with("KVMKVMKVM") {
-            // SAFETY: the vendor leaf identifies KVM, which implements this
-            // hypercall, and the caller guarantees CPL 0.
-            unsafe {
-                report.pairing = clock_pairing();
-                report.hypercall_ok = report.pairing.is_some();
+        //
+        // And the instruction has to be the CPU's own: the hypercall HAL
+        // (`nanochrono_core::hypercall_hal`) picks `VMCALL` on Intel,
+        // Zhaoxin and Centaur, `VMMCALL` on AMD and Hygon, at every boot —
+        // the same image boots on either vendor. An unknown vendor gets none.
+        // The clock-pairing hypercall passes a 64-bit guest address in RBX;
+        // it is a long-mode interface, so i386 reports the hypervisor from
+        // CPUID alone.
+        #[cfg(target_arch = "x86_64")]
+        {
+            report.hypercall_insn = nanochrono_core::hypercall_hal::detect();
+            if let (true, Some(insn)) =
+                (report.signature_str().starts_with("KVMKVMKVM"), report.hypercall_insn)
+            {
+                // SAFETY: the vendor leaf identifies KVM, which implements this
+                // hypercall; the HAL chose this CPU's instruction; the caller
+                // guarantees CPL 0.
+                unsafe {
+                    report.pairing = clock_pairing(insn);
+                    report.hypercall_ok = report.pairing.is_some();
+                }
             }
         }
         report.hypercalls = super::hypercalls();
         report
     }
 
+#[cfg(target_arch = "x86_64")]
     /// Asks the host to pair its clock with this machine's counter.
     ///
     /// # Safety
     /// Issues `VMCALL`; requires CPL 0 *and* a hypervisor that implements it.
     /// Without one this is `#UD` with no handler.
-    unsafe fn clock_pairing() -> Option<ClockPairing> {
+    unsafe fn clock_pairing(insn: nanochrono_core::hypercall_hal::HypercallInsn) -> Option<ClockPairing> {
+        use nanochrono_core::hypercall_hal::HypercallInsn;
         super::HYPERCALLS.fetch_add(1, super::Ordering::Relaxed);
 
         // The identity map means the virtual address is the physical one.
@@ -220,15 +401,26 @@ mod x86 {
         // rejects it as an operand, which is the same reason `cpuid` in
         // `nanochrono-core` is written this way.
         unsafe {
-            core::arch::asm!(
-                "xchg rbx, {gpa}",
-                "vmcall",
-                "xchg rbx, {gpa}",
-                gpa = inout(reg) gpa => _,
-                inlateout("rax") KVM_HC_CLOCK_PAIRING => ret,
-                in("rcx") KVM_CLOCK_PAIRING_WALLCLOCK,
-                options(nostack),
-            );
+            match insn {
+                HypercallInsn::Vmcall => core::arch::asm!(
+                    "xchg rbx, {gpa}",
+                    "vmcall",
+                    "xchg rbx, {gpa}",
+                    gpa = inout(reg) gpa => _,
+                    inlateout("rax") KVM_HC_CLOCK_PAIRING => ret,
+                    in("rcx") KVM_CLOCK_PAIRING_WALLCLOCK,
+                    options(nostack),
+                ),
+                HypercallInsn::Vmmcall => core::arch::asm!(
+                    "xchg rbx, {gpa}",
+                    "vmmcall",
+                    "xchg rbx, {gpa}",
+                    gpa = inout(reg) gpa => _,
+                    inlateout("rax") KVM_HC_CLOCK_PAIRING => ret,
+                    in("rcx") KVM_CLOCK_PAIRING_WALLCLOCK,
+                    options(nostack),
+                ),
+            }
         }
         if ret != 0 {
             return None;
@@ -261,24 +453,36 @@ mod arm {
     const KVM_PTP_VIRT_COUNTER: u64 = 0;
     /// `SMCCC_RET_NOT_SUPPORTED`.
     const NOT_SUPPORTED: i64 = -1;
+    /// KVM's vendor-hypervisor UID, as the four registers return it
+    /// (`28b46fb6-2ec5-11e9-a9ca-4b564d003a74`).
+    const KVM_UID: [u64; 4] = [0xB66F_B428, 0xE911_C52E, 0x564B_CAA9, 0x743A_004D];
+    /// `ARM_SMCCC_VENDOR_HYP_KVM_FEATURES_FUNC_ID`: bitmap of KVM services.
+    const KVM_FEATURES: u64 = 0x8600_0000;
+    /// Bit in that bitmap for the PTP service.
+    const KVM_FEATURE_PTP: u32 = 1;
 
     /// # Safety
     /// Requires EL1 or above.
     pub(super) unsafe fn detect() -> Report {
         let mut report = Report::default();
 
-        // AArch64 has no CPUID bit to read. `HVC` from EL1 either reaches an
-        // EL2 handler or is undefined — and unlike x86 there is no recovery
-        // from the undefined case without a vector table, so the counter
-        // frequency is checked first as a cheap filter.
-        let hz = nanochrono_core::arch::aarch64::cntfrq();
-        let plausible_guest = hz == 62_500_000 || hz == 1_000_000_000;
-        if !plausible_guest {
+        // AArch64 has no CPUID bit to read, so the hypercall is the probe.
+        //
+        // At EL2 or EL3 there is nothing above to ask: this kernel *is* the
+        // hypervisor level, and an `HVC` would trap straight back into its
+        // own vector table. Only EL1 asks.
+        //
+        // At EL1 the call is safe whether or not anything answers: an
+        // UNDEFINED `HVC` is caught by the vector table and comes back as
+        // SMCCC "not supported" (see `arch::arm::hvc`). That replaces the old
+        // guard — a guess from the counter frequency — which let the call
+        // through on bare metal clocked at 1 GHz and refused it under KVM on
+        // boards clocked at anything other than 62.5 MHz or 1 GHz.
+        if crate::arch::arm::current_el() != 1 {
             return report;
         }
 
-        // SAFETY: caller guarantees EL1+, and the frequency indicates a
-        // virtual timer, so an EL2 handler is very likely present.
+        // SAFETY: at EL1, with the vectors the entry stub installed.
         unsafe {
             let version = hvc(SMCCC_VERSION, 0);
             if version[0] as i64 == NOT_SUPPORTED {
@@ -287,6 +491,7 @@ mod arm {
             report.hypercall_ok = true;
 
             let uid = hvc(VENDOR_HYP_UID, 0);
+            let is_kvm = uid == KVM_UID;
             if uid[0] as i64 != NOT_SUPPORTED {
                 // The four words are reported raw: the byte order that
                 // assembles them into a UUID has never been testable here
@@ -295,6 +500,15 @@ mod arm {
                     report.signature[i * 4..i * 4 + 4]
                         .copy_from_slice(&(*word as u32).to_le_bytes());
                 }
+            }
+
+            // The vendor-hypervisor range (0x8600_xxxx) means whatever each
+            // vendor says it means, so a KVM function ID is only issued to a
+            // hypervisor that identified itself as KVM *and* lists PTP in its
+            // feature bitmap. Issued to anything else it is a different call.
+            if !is_kvm || hvc(KVM_FEATURES, 0)[0] & (1 << KVM_FEATURE_PTP) == 0 {
+                report.hypercalls = super::hypercalls();
+                return report;
             }
 
             let ptp = hvc(KVM_PTP, KVM_PTP_VIRT_COUNTER);
@@ -312,25 +526,13 @@ mod arm {
         report
     }
 
+    /// Counts the call and forwards it to the fault-tolerant stub.
+    ///
     /// # Safety
-    /// Requires EL1, and an EL2 handler — an `HVC` with none is undefined and
-    /// this kernel has no vector table to recover through.
+    /// Requires EL1 with the exception vectors installed.
     unsafe fn hvc(function: u64, arg: u64) -> [u64; 4] {
         super::HYPERCALLS.fetch_add(1, super::Ordering::Relaxed);
-
-        let mut regs = [0u64; 4];
-        // SAFETY: forwarded from this function's own contract. Both function
-        // IDs used here are read-only queries.
-        unsafe {
-            core::arch::asm!(
-                "hvc #0",
-                inlateout("x0") function => regs[0],
-                inlateout("x1") arg => regs[1],
-                out("x2") regs[2],
-                out("x3") regs[3],
-                options(nostack),
-            );
-        }
-        regs
+        // SAFETY: forwarded from this function's own contract.
+        unsafe { crate::arch::arm::hvc(function, arg) }
     }
 }

@@ -499,6 +499,44 @@ pub extern "C" fn nc_asm_simd_family_name(family: u32) -> *const c_char {
     )
 }
 
+/// `nc_set_physical_counter` result: the counter was switched.
+pub const NC_COUNTER_OK: c_int = 0;
+/// The architecture has no separate physical counter (only AArch64 does).
+pub const NC_COUNTER_NO_PHYSICAL: c_int = -1;
+/// The OS does not let this process read `CNTPCT_EL0`.
+pub const NC_COUNTER_NOT_PERMITTED: c_int = -2;
+
+/// AArch64: nonzero selects the physical counter (`CNTPCT_EL0`) for every
+/// read, zero the virtual one (`CNTVCT_EL0`, the default).
+///
+/// A virtual machine is not a refusal: the counter can be enabled there,
+/// which is what [`nc_physical_counter_warning`] exists to caution against —
+/// the hypervisor may trap every read, and under nested virtualization it is
+/// slow and unstable. Call before creating a context so its calibration uses
+/// the chosen counter.
+#[no_mangle]
+pub extern "C" fn nc_set_physical_counter(enable: c_int) -> c_int {
+    use nanochrono_core::arch::{self, CounterSource, CounterSourceError};
+    let source = if enable != 0 { CounterSource::Physical } else { CounterSource::Virtual };
+    match arch::set_counter_source(source) {
+        Ok(()) => NC_COUNTER_OK,
+        Err(CounterSourceError::NoPhysicalCounter) => NC_COUNTER_NO_PHYSICAL,
+        Err(CounterSourceError::NotPermitted) => NC_COUNTER_NOT_PERMITTED,
+    }
+}
+
+/// 1 when reads use the physical counter, 0 otherwise.
+#[no_mangle]
+pub extern "C" fn nc_physical_counter_enabled() -> c_int {
+    (nanochrono_core::arch::counter_source() == nanochrono_core::arch::CounterSource::Physical) as c_int
+}
+
+/// The warning interfaces should show next to the setting (static string).
+#[no_mangle]
+pub extern "C" fn nc_physical_counter_warning() -> *const c_char {
+    static_cstr(nanochrono_core::arch::PHYSICAL_COUNTER_WARNING)
+}
+
 #[no_mangle]
 pub extern "C" fn nc_select_best_simd_family() -> u32 {
     SimdFamily::best().map_or(0, |f| f as u32)
@@ -543,7 +581,14 @@ pub struct nc_nanoclock_snapshot_t {
     pub route: u32,
     pub best_simd_family: u32,
     pub backend: u32,
-    /* 4 bytes of implicit padding here, to align the u64s that follow. */
+    /// Explicit, not implicit: the 2.x ABI had four bytes of padding here
+    /// that the compiler inserted to 8-align the `u64` run. On i386 System V
+    /// (Linux, Android) a `u64` is only 4-aligned, so the implicit padding
+    /// vanished there and every later field moved by four bytes — and Go and
+    /// .NET, which disagree with C about that alignment, would read a third
+    /// layout. Spelled out, the offsets are the same on every target and
+    /// unchanged from 2.x on the 64-bit ones.
+    pub _pad_backend: u32,
     pub unix_time_ns: u64,
     pub monotonic_ns: u64,
     pub process_time_ns: u64,
@@ -579,6 +624,12 @@ pub struct nc_nanoclock_snapshot_t {
 pub const NC_ARCH_UNKNOWN: u32 = 0;
 pub const NC_ARCH_X64: u32 = 1;
 pub const NC_ARCH_ARM64: u32 = 2;
+/// PowerPC, 32- or 64-bit, either byte order.
+pub const NC_ARCH_POWERPC: u32 = 3;
+/// RISC-V, RV32 or RV64.
+pub const NC_ARCH_RISCV: u32 = 4;
+/// 32-bit ARM.
+pub const NC_ARCH_ARM32: u32 = 5;
 
 /// Captures every clock route into `out`. Returns 1 on success.
 #[no_mangle]
@@ -595,11 +646,15 @@ pub unsafe extern "C" fn nc_nanoclock_snapshot(
         arch: match nanochrono_core::arch::ARCH {
             nanochrono_core::arch::Arch::X86 => NC_ARCH_X64,
             nanochrono_core::arch::Arch::Aarch64 => NC_ARCH_ARM64,
+            nanochrono_core::arch::Arch::PowerPc => NC_ARCH_POWERPC,
+            nanochrono_core::arch::Arch::RiscV => NC_ARCH_RISCV,
+            nanochrono_core::arch::Arch::Arm32 => NC_ARCH_ARM32,
             nanochrono_core::arch::Arch::Portable => NC_ARCH_UNKNOWN,
         },
         route: route_to_u32(s.route),
         best_simd_family: s.best_simd.map_or(0, |f| f as u32),
         backend: s.backend as u32,
+        _pad_backend: 0,
         unix_time_ns: s.unix_time_ns,
         monotonic_ns: s.monotonic_ns,
         process_time_ns: s.process_time_ns,
@@ -1238,7 +1293,7 @@ mod tests {
 
     #[test]
     fn format_truncates_without_overflowing() {
-        let mut buf = [0i8; 8];
+        let mut buf = [0 as std::ffi::c_char; 8];
         unsafe {
             nc_format_ns(3_661_000_000_000, buf.as_mut_ptr(), buf.len());
             let s = std::ffi::CStr::from_ptr(buf.as_ptr()).to_str().unwrap();
@@ -1251,7 +1306,7 @@ mod tests {
     fn format_rejects_a_null_or_empty_buffer() {
         unsafe {
             nc_format_ns(0, std::ptr::null_mut(), 16);
-            let mut buf = [0i8; 4];
+            let mut buf = [0 as std::ffi::c_char; 4];
             assert_eq!(nc_format_unix_time_ns_ex(0, 1, 0, buf.as_mut_ptr(), 0), 0);
         }
     }
@@ -1466,6 +1521,9 @@ const INSTRUCTION_FAMILIES: &[(&str, FamilyGate)] = &[
     ("sve", |f| f.sve),
     ("sve2", |f| f.sve2),
     ("sme", |f| f.sme),
+    ("altivec", |f| f.altivec),
+    ("vsx", |f| f.vsx),
+    ("rvv", |f| f.rvv),
 ];
 
 use nanochrono_core::CpuFeatures;
@@ -1512,6 +1570,9 @@ fn kernel_for_family(family: u32) -> Option<FamilyKernel> {
         9 => FamilyKernel::Timer(Backend::Sve),
         10 => FamilyKernel::Timer(Backend::Sve2),
         11 => FamilyKernel::Timer(Backend::Sme),
+        12 => FamilyKernel::Timer(Backend::Altivec),
+        13 => FamilyKernel::Timer(Backend::Vsx),
+        14 => FamilyKernel::Timer(Backend::Rvv),
         _ => return None,
     })
 }

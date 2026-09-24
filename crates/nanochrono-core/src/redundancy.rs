@@ -47,7 +47,17 @@
 //!   corrupted measurement **detectable** instead of silent, which is the
 //!   honest and achievable goal.
 
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::Ordering;
+
+/// The event counters' storage. 64-bit where the target has 64-bit atomics;
+/// 32-bit PowerPC (and other 32-bit targets) have none, and there the
+/// counters are 32 bits wide. Reaching 2³² integrity checks on such a
+/// machine is not a realistic concern, and the alternative — a lock — is
+/// not available in a freestanding build.
+#[cfg(target_has_atomic = "64")]
+type EventCounter = core::sync::atomic::AtomicU64;
+#[cfg(not(target_has_atomic = "64"))]
+type EventCounter = core::sync::atomic::AtomicU32;
 
 /// Outcome of an integrity check.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -117,10 +127,10 @@ impl Integrity {
 
 // --- process-wide counters -------------------------------------------------
 
-static CHECKS: AtomicU64 = AtomicU64::new(0);
-static ECC_CORRECTIONS: AtomicU64 = AtomicU64::new(0);
-static TMR_CORRECTIONS: AtomicU64 = AtomicU64::new(0);
-static UNRECOVERABLE: AtomicU64 = AtomicU64::new(0);
+static CHECKS: EventCounter = EventCounter::new(0);
+static ECC_CORRECTIONS: EventCounter = EventCounter::new(0);
+static TMR_CORRECTIONS: EventCounter = EventCounter::new(0);
+static UNRECOVERABLE: EventCounter = EventCounter::new(0);
 
 /// How often the tiers have fired since the process started.
 ///
@@ -156,12 +166,15 @@ impl IntegrityStats {
 }
 
 /// Reads the process-wide counters.
+// `u64::from` is a no-op where the counters are 64-bit and a widening where
+// they are 32-bit (no 64-bit atomics), which is why it stays.
+#[allow(clippy::useless_conversion)]
 pub fn stats() -> IntegrityStats {
     IntegrityStats {
-        checks: CHECKS.load(Ordering::Relaxed),
-        ecc_corrections: ECC_CORRECTIONS.load(Ordering::Relaxed),
-        tmr_corrections: TMR_CORRECTIONS.load(Ordering::Relaxed),
-        unrecoverable: UNRECOVERABLE.load(Ordering::Relaxed),
+        checks: u64::from(CHECKS.load(Ordering::Relaxed)),
+        ecc_corrections: u64::from(ECC_CORRECTIONS.load(Ordering::Relaxed)),
+        tmr_corrections: u64::from(TMR_CORRECTIONS.load(Ordering::Relaxed)),
+        unrecoverable: u64::from(UNRECOVERABLE.load(Ordering::Relaxed)),
     }
 }
 

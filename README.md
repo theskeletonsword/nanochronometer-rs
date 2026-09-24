@@ -1,4 +1,7 @@
-![Description](./assets/nanochronometer_logo.svg)
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="./assets/nanochronometer_logo_dark.svg">
+  <img alt="NanoChronometer" src="./assets/nanochronometer_logo.svg">
+</picture>
 
 
 Nanosecond-resolution stopwatch, precision clock and ISA microbenchmark
@@ -165,12 +168,25 @@ certificate and a Mac — this project cannot do it for you.
 ### Bare metal (no operating system)
 
 ```sh
-./packaging/baremetal/build.sh              # x86_64 and aarch64 ELF kernels
+./packaging/baremetal/build.sh              # every architecture below
 ./packaging/baremetal/build.sh run aarch64  # build and boot under QEMU
+./packaging/baremetal/build.sh run ppc-g4   # the ppc build, via Open Firmware
 ./packaging/baremetal/build.sh test         # the host-side decoding tests
 ```
 
-A freestanding build for `x86_64-unknown-none` and `aarch64-unknown-none`: no
+| Architecture | Rust target | Machine (QEMU) | Enters via | Console |
+|---|---|---|---|---|
+| x86-64 | `x86_64-nanochrono-none` | PC, **KVM** | multiboot 1/2 → `boot32.S` | 16550 (COM1), VGA |
+| AArch64 | `aarch64-unknown-none` | `virt` at EL1, EL2 or EL3 | ELF entry | PL011 |
+| ppc64 / ppc64le | `powerpc64{,le}-nanochrono-none` | `powernv8/9/10` (OpenPOWER) | skiboot, in place at `0x2000_0000` | OPAL |
+| ppc (e500) | `powerpc-nanochrono-none` | `ppce500 -cpu e500mc` | ePAPR (device tree in r3) | 16550 in CCSR |
+| ppc (G3/G4) | the same image | `mac99`, `g3beige`; real Macs | Open Firmware (client interface in r5) | OF `stdout` |
+| RISC-V 64 / 32 | `riscv64gc-` / `riscv32imac-unknown-none-elf` | `virt` + OpenSBI | SBI, S-mode (a0 = hart, a1 = tree) | 16550, else SBI console |
+
+Every architecture other than x86-64 runs under TCG: KVM only runs guests of
+the host's own architecture.
+
+A freestanding build for these targets: no
 syscalls, no allocator, no runtime. It exists because the measurement floor a
 hosted process can reach is set by the kernel underneath it — scheduling,
 interrupts, the syscall boundary — and the only way to see past that floor is
@@ -222,10 +238,29 @@ Three things must be true before Rust runs, and none of them is the default:
   ZMM_Hi256, Hi16_ZMM, all three of which AVX-512 needs) — are masked against
   `CPUID.0DH:EAX`, the set the processor actually implements. `XSETBV` raises
   `#GP` on any bit it does not, so the mask is not optional.
-* **FP and SIMD on AArch64**: `CPACR_EL1.FPEN`, or `CPTR_EL2.TFP` at EL2. The
-  compiler emits NEON freely on this target and every instruction traps until
-  this is set — `ESR` `EC=0x07`, on the first Rust function that touches a `v`
+* **FP and SIMD on AArch64**: `CPACR_EL1.FPEN` — and the control at every
+  level above: `CPTR_EL2` (whose layout depends on `HCR_EL2.E2H`) at EL2,
+  `CPTR_EL3` at EL3, plus the SVE/SME enables where those exist. The compiler
+  emits NEON freely on this target and every instruction traps until this is
+  set — `ESR` `EC=0x07`, on the first Rust function that touches a `v`
   register.
+* **PowerPC**: `MSR[FP]`, and `MSR[VEC]`/`MSR[VSX]` where the core has them;
+  `r1` 16-byte aligned with a zero back chain; `r2` = `.TOC.` on 64-bit. A
+  little-endian image switches itself out of the big-endian mode skiboot
+  enters in, and back for every OPAL call.
+* **RISC-V**: `sstatus.FS` and `sstatus.VS` out of Off; `gp` and a 16-byte
+  aligned `sp`.
+
+**Faults are reported, not fatal-and-silent.** Every architecture installs its
+exception vectors before `kmain`: an IDT with the double fault, NMI, machine
+check and page fault on their own stacks (x86), `VBAR_ELx` (AArch64), IVPR/IVOR
+(e500), `stvec` (RISC-V). An exception prints its cause and address and stops.
+The x86 stack has an unmapped guard page beneath it, so an overflow is
+reported as one instead of corrupting the page tables below it.
+
+**AArch64 runs with the MMU on**: an identity map in which only the kernel
+image is Normal write-back and everything else Device. With the MMU off every
+access is uncached, and a load probe would be measuring DRAM every time.
 
 **The red zone is off.** Both freestanding targets set `disable-redzone` in
 their spec, and `-C no-redzone=yes` is stated explicitly anyway: the 128 bytes
@@ -305,11 +340,56 @@ The `simd` feature of `nanochrono-core` is off for the freestanding x86 build.
 `x86_64-unknown-none` has a soft-float ABI, so LLVM will not allocate an XMM
 register at all; `-Ctarget-feature=-soft-float` appears to lift that but is
 deprecated and slated to become a hard error ([rust-lang/rust#116344]), so the
-feature is switched off rather than the ABI overridden. `boot32.S` still
-enables SSE and XCR0, because a kernel built on this that does run SIMD needs
-it. AArch64 has no such restriction and keeps everything.
+stable fallback switches the feature off rather than overriding the ABI; the
+default `x86_64-nanochrono-none` spec keeps SSE and builds it. Every other
+architecture keeps everything.
 
 [rust-lang/rust#116344]: https://github.com/rust-lang/rust/issues/116344
+
+#### The serial console and the task manager
+
+With no framebuffer (AArch64, RISC-V, PowerPC, x86 in text mode) the kernel
+ends in an interactive console on the UART after the self-test:
+
+* **`t` — task manager.** An htop for a machine that runs one program: CPU
+  active time from the architecture's own activity counters — `APERF`/`MPERF`
+  (x86), the Activity Monitors (AArch64 AMU), `PURR` (POWER) — effective
+  frequency, IPC, and the time spent in each phase of the kernel's loop
+  (render, present, input, measure, idle). The x86 GUI has the same view as
+  the **TASKS** panel (key `T`).
+* **`v` — hypervisor.** The report the boot-time negotiation produced, and
+  a re-probe key (`p`) behind a 10-second cooldown — see
+  [Hypercalls: once, and the vendor's own](#hypercalls-once-and-the-vendors-own).
+  The x86 GUI has it as the **HYPERVISOR** panel (key `V` re-probes).
+* **`s` — settings.** *Enable Physical Counter* (AArch64): `CNTPCT_EL0`
+  instead of the default `CNTVCT_EL0`, with its warning always on screen,
+  the measured cost of each read, and a stronger warning when a hypervisor
+  is detected. It can be enabled in a VM; the warning is why it should not be.
+  *Re-probe cooldown* (`c`; `K` in the x86 GUI): on by default, and off only
+  with the warning that the provider-ban risk is then yours.
+
+Idle is real where the architecture allows it without interrupts — `TPAUSE`
+to a TSC deadline (x86 with WAITPKG), `WFE` woken by the generic timer's
+event stream (AArch64) — so the activity counters show it. Elsewhere the wait
+is a low-priority spin, and 100 % active is then the truth.
+
+### Linux on other architectures
+
+The hosted crates build and are tested for x86-64, i686, AArch64, armv7,
+ppc64le, ppc64, ppc (32-bit, run on a G4) and riscv64 Linux; Android (armv7,
+i686) and Windows (i686) too. The cross toolchains come from their publishers
+and are checked against the published checksums:
+
+```sh
+tools/fetch-cross-toolchains.sh        # Bootlin GCC+glibc per arch, llvm-mingw, the NDK
+source tools/cross-env.sh              # CC, linker and a qemu-user/Wine runner per target
+cargo test --release --workspace --target riscv64gc-unknown-linux-gnu
+```
+
+`--release` because the crypto benchmarks push hundreds of megabytes through
+`ring`, which is hours of work under emulation in a debug build. Put
+`CARGO_TARGET_DIR` on a native filesystem if the checkout lives on exFAT:
+Cargo's artifact cache corrupts there.
 
 ### Linux desktop install
 
@@ -355,6 +435,8 @@ button again returns to it. The hypervisor panel leads with the verdict and
 what it means for every other number in the window — green for native, amber
 for hardware-assisted, red for emulated — then shows the ring 3 evidence and
 the ring 0 evidence side by side, and finally which PMU interface is in use.
+It shows the start-up probe; *RE-PROBE* repeats it at most every 10 seconds
+(see [Hypercalls](#hypercalls-once-and-the-vendors-own)).
 The status bar carries the same verdict at all times, so it is visible from
 every view.
 
@@ -383,6 +465,27 @@ bundle the packaging script builds; see [macOS](#macos).
   directory and reports the path, rather than opening a native file dialog.
 
 ---
+
+## The physical counter (AArch64)
+
+Every interface offers the same switch, off by default:
+
+| | How |
+|---|---|
+| GUI | **SETTINGS** → *Enable Physical Counter* |
+| CLI | `nanochrono --physical-counter <command>` |
+| C ABI | `nc_set_physical_counter(1)`, `nc_physical_counter_warning()` |
+| Bare metal | console **Settings** (`s`, then `p`) |
+| Kernel module | `insmod nanochrono.ko physical_counter=1` |
+
+`CNTVCT_EL0` is the default: what every OS hands user space, never trapped.
+`CNTPCT_EL0` is what the hardware ticks — the same cost on bare metal, but
+inside a VM the hypervisor may trap every read, and under nested
+virtualization it is slow and unstable. **It is allowed in VMs anyway**, with
+the warning shown; the only refusal is an OS that makes the instruction
+illegal for user space (tested once, in a forked child on Linux/Android/
+macOS, under a vectored exception handler on Windows). Switching resets the
+stopwatch: in a VM the two counters differ by `CNTVOFF_EL2`.
 
 ## The CLI
 
@@ -522,6 +625,15 @@ dishonest. The third slot now measures something the old build could not.
 | 1 — CPU ISA | Inline-asm kernels per ISA family | What can this core's datapath do? |
 | 2 — Crypto | rustls/`ring` primitives over real buffers | What does a byte of AEAD or hash cost? |
 | 3 — TLS | End-to-end rustls handshakes | What does establishing a session cost? |
+| 4 — Linux crypto API (ring 3) | The kernel's crypto through `AF_ALG` (Linux only) | What does the kernel's implementation cost from userspace? |
+| 5 — Linux crypto API (ring 0) | The same, inside the kernel module (Linux only) | What is left once the syscall is removed? |
+| 6 — Crypto RAW speed (4 off Linux) | The bare instructions: AES round, SHA-256 round, carry-less multiply, VAES, VPCLMULQDQ | How fast is the silicon, with no cipher around it? |
+
+Crypto RAW is **speed only**: no key schedule, no mode, no authentication. It
+is not a cipher and says nothing about security; Mode 2 is the number for
+real crypto. `nanochrono bench --mode crypto-raw` on the CLI, key `6` (or the
+mode's number) in the GUI. The bare-metal BENCH tab keeps the two apart as
+well: *CRYPTO RAW SPEED* next to *RUSTCRYPTO*.
 
 Every run does three passes with increasing iteration counts and reports
 best/worst/mean. When the spread between passes exceeds 15% the log says so:
@@ -654,11 +766,57 @@ It needs a KVM guest with `ptp_kvm` loaded and read access to `/dev/ptpN`
 (usually `root:clock`). Any of those missing reports `unavailable` rather than
 failing — including on bare metal, which is the common case.
 
+### Hypercalls: once, and the vendor's own
+
+Two rules hold in every ring-0 component — the Linux module, the Windows
+driver and the bare-metal kernel:
+
+**Once.** Everything that makes a guest exit to its hypervisor (the
+hypercall, the `CPUID` exit-cost loop, the trapped `CNTPCT_EL0` read-cost
+measurement) runs once — at module load, at driver start, at boot, where it
+negotiates the host clock — and is cached. Reading the report never repeats
+it. On a cloud host (Azure, GCP, AWS, Vultr…) a guest exiting in a loop reads
+as abuse and gets throttled or banned; a panel refresh or a
+`watch cat /proc/nanochrono` must not be able to cause that. The hosted
+process's own `CPUID` trap probe is likewise run once per process.
+
+A deliberate **re-probe** is allowed once every **10 seconds**:
+
+| Where | Re-probe | Cooldown off |
+|---|---|---|
+| GUI | **HYPERVISOR** → *RE-PROBE* (shows the countdown) | **SETTINGS** → *Re-probe cooldown* |
+| CLI | `nanochrono hypervisor --reprobe` | `nanochrono hypervisor --cooldown 0` |
+| Linux module | `echo reprobe > /proc/nanochrono` (`EAGAIN` while cooling) | `echo cooldown=0 > /proc/nanochrono`, or `hypercall_cooldown=0` |
+| Windows driver | IOCTL `0x22A008`, `tools\query.py --reprobe` (`ERROR_BUSY` while cooling) | IOCTL `0x22A00C`, `query.py --cooldown 0` |
+| Bare metal | console `v` then `p`; x86 GUI `V` | console settings `c`; x86 GUI settings `K` |
+
+The kernel module and the driver enforce the wait themselves, so no program
+can skip it. **Turning it off is allowed, and the user then assumes the
+provider's reaction** — every control that does it says so.
+
+**The vendor's own instruction.** On x86-64 a mandatory hypercall HAL reads
+`CPUID.0H` at every load and boot — never at build time, because one
+installed system (an OS on an external SSD) moves between machines — and
+executes the one instruction that vendor defines:
+
+| Vendor | Instruction |
+|---|---|
+| Intel, Zhaoxin, VIA/Centaur | `VMCALL` |
+| AMD, Hygon | `VMMCALL` |
+| anything else | none |
+
+The other one is `#UD` under most hypervisors, and an unhandled `#UD` in
+ring 0 is a crash. The table is `nanochrono_core::hypercall_hal`; the module
+and driver, built without the crate, carry the same one. Reports name the
+choice (`hypercall_insn=`).
+
 ### Ring 0 — the optional kernel module
 
 `kernel/linux/nanochrono.ko` complements the above. **It is never
 required**; without it detection still works, it is just less certain against
-a hypervisor that hides its CPUID leaf.
+a hypervisor that hides its CPUID leaf. It is one module with one name; it
+also publishes the system-wide perf counters (`perf_*` keys) that
+`nanochrono perf` compares with the per-thread ones.
 
 ```sh
 cd kernel/linux && make && sudo insmod nanochrono.ko
@@ -671,6 +829,13 @@ unconditionally whether or not a hypervisor is present. A hypercall that
 *returns* is proof — and it holds even when the CPUID bit is cleared. Each
 probe emits its own `__ex_table` entry, so a fault on bare metal resumes at
 the fixup instead of oopsing.
+
+The same probe exists for Windows as one driver, `nanochrono.sys`
+(`kernel/windows/`, x64 and ARM64, cross-built with llvm-mingw). It is
+test-signed with `osslsigncode`: `make sign` on Linux, or `autosign.bat` on
+Windows, which creates a self-signed test certificate if there is none and
+can trust it and enable test signing (`/trust`, `/testsigning`). See
+[`kernel/windows/README.md`](kernel/windows/README.md).
 
 On AArch64 the `HVC` carries real SMCCC function IDs rather than a bare `#0`:
 `ARM_SMCCC_VERSION` (`0x80000000`), then the vendor hypervisor UID query
@@ -690,8 +855,8 @@ none is Apache, and anything outside that set taints the kernel and loses
 access to GPL-only symbols. `Dual MIT/GPL` is the most permissive recognised
 option. The directory shares no code with the rest of the tree.
 
-The report is at `/proc/nanochrono`, mode 0444, so an unprivileged measuring
-process can read it. The kernel's Rust crate exposes debugfs but not procfs,
+The report is at `/proc/nanochrono`, mode 0644, so an unprivileged measuring
+process can read it and only root can send it commands. The kernel's Rust crate exposes debugfs but not procfs,
 and debugfs is 0700 — which would have defeated the point — so the module
 declares the procfs ABI itself, guarded by a `CONFIG_RANDSTRUCT_NONE` check
 that refuses to build where a hand-written struct mirror would be unsound.
@@ -899,7 +1064,8 @@ packaging/linux/            .desktop entry and installer
 packaging/macos/            osxcross cross-build, lipo, .app bundle
 packaging/baremetal/        freestanding kernel build and QEMU boot
 packaging/android/          NDK cross-build for the four ABIs
-kernel/linux/               optional ring 0 module (Rust, Dual MIT/GPL)
+kernel/linux/               optional ring 0 module, nanochrono.ko (Rust, Dual MIT/GPL)
+kernel/windows/             the same for Windows, nanochrono.sys (Rust, MIT), osslsigncode signing
 python/, wrappers/          language bindings (unchanged)
 docs/                       design notes carried over from 2.x
 assets/                     icon, logo, optional display font

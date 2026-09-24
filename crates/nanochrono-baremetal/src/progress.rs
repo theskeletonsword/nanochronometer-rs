@@ -36,7 +36,7 @@
 //! say on every machine anyone would run this on.
 
 use crate::draw::{self, Palette};
-use crate::framebuffer::{Colour, Framebuffer};
+use crate::framebuffer::Framebuffer;
 use crate::typeface::{BODY, TITLE};
 
 /// What the kernel is about to do.
@@ -154,9 +154,10 @@ pub fn attach(fb: Option<Framebuffer>) {
 /// loader could get.
 struct Layout {
     centre_x: u32,
-    mark_y: u32,
-    mark_r: u32,
-    wordmark_y: u32,
+    /// The logo: the whole one, or the header's wordmark on a screen too
+    /// narrow for it.
+    logo: &'static crate::logo::Image,
+    logo_y: u32,
     bar_x: u32,
     bar_y: u32,
     bar_w: u32,
@@ -172,7 +173,11 @@ impl Layout {
         // arithmetic one.
         let block_y = fb.height * 2 / 5;
 
-        let mark_r = (fb.height / 14).clamp(24, 64);
+        let logo = if fb.width >= crate::logo::LOGO.width + 32 {
+            &crate::logo::LOGO
+        } else {
+            crate::logo::wordmark(40)
+        };
         let bar_w = (fb.width / 4).clamp(220, 460);
         let bar_h = 6;
 
@@ -185,15 +190,14 @@ impl Layout {
         // wordmark and the caption was clipped to its top few rows.
         let title = TITLE.line_height as u32;
         let body = BODY.line_height as u32;
-        let wordmark_y = block_y + mark_r + title;
-        let bar_y = wordmark_y + title + title / 2;
+        let logo_y = block_y.saturating_sub(logo.height / 2);
+        let bar_y = logo_y + logo.height + title;
         let caption_y = bar_y + bar_h + body;
 
         Layout {
             centre_x,
-            mark_y: block_y,
-            mark_r,
-            wordmark_y,
+            logo,
+            logo_y,
             bar_x: centre_x - bar_w / 2,
             bar_y,
             bar_w,
@@ -207,38 +211,13 @@ impl Layout {
 fn dress(fb: &Framebuffer, p: &Palette, layout: &Layout) {
     fb.clear(p.background);
 
-    // The mark: an accent ring with the background punched out of it, which
-    // is the same construction the interface's header uses so the boot screen
-    // and the interface are recognisably one thing.
-    disc(fb, layout.centre_x, layout.mark_y, layout.mark_r, p.accent);
-    disc(
+    // The logo, the same artwork the interface's header carries, so the boot
+    // screen and the interface are recognisably one thing.
+    crate::logo::draw(
         fb,
-        layout.centre_x,
-        layout.mark_y,
-        layout.mark_r.saturating_sub(3),
-        p.background,
-    );
-    // Centred on the mark: the line box is `line_height` tall and starts at
-    // the `y` given, so its middle lands on `mark_y` when it starts half a
-    // line above it.
-    draw::text_centred(
-        fb,
-        &TITLE,
-        layout.centre_x - layout.mark_r,
-        layout.mark_r * 2,
-        layout.mark_y - (TITLE.line_height as u32) / 2,
-        "N",
-        p.accent,
-    );
-
-    draw::text_centred(
-        fb,
-        &TITLE,
-        0,
-        fb.width,
-        layout.wordmark_y,
-        "NanoChronometer",
-        p.title,
+        layout.logo,
+        layout.centre_x.saturating_sub(layout.logo.width / 2),
+        layout.logo_y,
     );
 
     // The empty bar. Rounded to its own height, which is what makes it a pill
@@ -355,24 +334,4 @@ pub fn phase<T>(phase: Phase, body: impl FnOnce() -> T) -> T {
     let out = body();
     leave(phase);
     out
-}
-
-/// A filled circle.
-///
-/// Written here rather than borrowed from the interface because the boot
-/// screen runs before the interface exists, and a mark drawn from two of
-/// these is less code, and less to go wrong this early, than a plotted arc.
-fn disc(fb: &Framebuffer, cx: u32, cy: u32, r: u32, colour: Colour) {
-    let r = r as i32;
-    for dy in -r..=r {
-        for dx in -r..=r {
-            if dx * dx + dy * dy > r * r {
-                continue;
-            }
-            let (x, y) = (cx as i32 + dx, cy as i32 + dy);
-            if x >= 0 && y >= 0 {
-                fb.set(x as u32, y as u32, colour);
-            }
-        }
-    }
 }

@@ -152,6 +152,15 @@ pub enum PmuKind {
     /// hardware with the same owner problem, so they are tracked with the
     /// same interface descriptor.
     ArmSystemRegister,
+    /// 64-bit Book3S (POWER8 and later): `MMCR0` controls, `PMC5` counts
+    /// instructions completed and `PMC6` cycles, both fixed-function.
+    PowerMmcr,
+    /// RISC-V's `cycle` and `instret` CSRs, readable in S-mode when M-mode
+    /// firmware set `mcounteren.CY`/`IR`.
+    RiscvCounters,
+    /// The 32-bit classic PowerPC PMU (G3 750, G4 74xx): `MMCR0` selects
+    /// events for `PMC1`/`PMC2` at SPRs 952-954.
+    Classic7xx,
     /// A part whose counters this does not know how to reach. Nothing is
     /// programmed and no measurement is reported — which is the only safe
     /// answer, because the alternative is guessing at an MSR address.
@@ -165,12 +174,15 @@ impl PmuKind {
             PmuKind::AmdCore => "amd core (0xc0010200)",
             PmuKind::AmdLegacy => "amd k8 (0xc0010000)",
             PmuKind::ArmSystemRegister => "arm64 system registers",
+            PmuKind::PowerMmcr => "power book3s (mmcr0, pmc5/pmc6)",
+            PmuKind::RiscvCounters => "risc-v cycle/instret csrs",
+            PmuKind::Classic7xx => "classic 7xx/74xx (mmcr0, pmc1/pmc2)",
             PmuKind::Unknown => "unknown",
         }
     }
 }
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(x86_any)]
 mod x86 {
     use super::{
         classify_core, decode_pmu_leaf, mask_to_width, CorePmu, CoreType, CounterRoute, Reading,
@@ -488,7 +500,7 @@ mod x86 {
         // SAFETY: `CR4.PCE` is bit 8 on every x86-64 part; setting a defined
         // bit and preserving the rest cannot fault.
         unsafe {
-            let mut cr4: u64;
+            let mut cr4: usize;
             core::arch::asm!("mov {}, cr4", out(reg) cr4, options(nomem, nostack, preserves_flags));
             cr4 |= 1 << 8;
             core::arch::asm!("mov cr4, {}", in(reg) cr4, options(nomem, nostack, preserves_flags));
@@ -666,7 +678,7 @@ mod x86 {
     /// Writes `CR4`; requires CPL 0.
     #[allow(dead_code)] // Part of the surface; this kernel never leaves ring 0.
     pub unsafe fn allow_rdpmc_from_user() {
-        let mut cr4: u64;
+        let mut cr4: usize;
         // SAFETY: caller guarantees CPL 0. Only bit 8 is touched, so no other
         // control-register state is disturbed.
         unsafe {
@@ -689,6 +701,26 @@ mod arm {
     /// `PMCNTENSET_EL0` bit 31 enables the dedicated cycle counter.
     const PMCNTEN_CYCLE: u64 = 1 << 31;
 
+    /// Whether event counter 0 was programmed with INST_RETIRED.
+    static INSTRUCTIONS: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+    /// Event counter 0 (INST_RETIRED), if `enable_fixed` programmed it.
+    pub(super) fn read_instructions(pmu: &CorePmu) -> Option<Reading> {
+        if !INSTRUCTIONS.load(core::sync::atomic::Ordering::Relaxed) {
+            return None;
+        }
+        let value: u64;
+        // SAFETY: the counter was programmed by `enable_fixed` on this core.
+        unsafe {
+            core::arch::asm!("mrs {v}, PMEVCNTR0_EL0", v = out(reg) value,
+                             options(nomem, nostack, preserves_flags));
+        }
+        Some(Reading {
+            value: value & 0xFFFF_FFFF,
+            core_type: pmu.core_type,
+        })
+    }
+
     /// Classifies this core from `MIDR_EL1`.
     ///
     /// AArch64 has no `CPUID.1AH`. On a big.LITTLE part the clusters report
@@ -710,7 +742,33 @@ mod arm {
         CoreType::Unknown((part ^ (part >> 8)) as u8)
     }
 
+    /// `ID_AA64DFR0_EL1.PMUVer`, bits [11:8]: 0 means no PMU and 0xF an
+    /// IMPLEMENTATION DEFINED one this driver does not know how to program.
+    fn pmu_version() -> u64 {
+        // SAFETY: ID registers are readable at EL1 and above, no side effects.
+        let dfr0: u64 = unsafe {
+            let v: u64;
+            core::arch::asm!("mrs {v}, ID_AA64DFR0_EL1", v = out(reg) v,
+                             options(nomem, nostack, preserves_flags));
+            v
+        };
+        (dfr0 >> 8) & 0xF
+    }
+
     pub(super) fn detect() -> CorePmu {
+        // Every PMU system register is UNDEFINED on a core without the
+        // architected PMU, so the ID register is asked before PMCR_EL0 is
+        // touched. Without this check the first `mrs PMCR_EL0` on such a
+        // core is an undefined-instruction exception.
+        if matches!(pmu_version(), 0 | 0xF) {
+            return CorePmu {
+                leaf: PmuLeaf::default(),
+                core_type: core_type(),
+                route: CounterRoute::None,
+                kind: PmuKind::Unknown,
+                slots: [Default::default(); super::MAX_TRACKED_COUNTERS],
+            };
+        }
         // PMCR_EL0.N, bits [15:11]: the number of event counters. The cycle
         // counter is separate from those and always present when the PMU is.
         let pmcr = read_pmcr();
@@ -763,12 +821,66 @@ mod arm {
         // that would otherwise be silently wrong.
         pmcr &= !(1 << 3);
 
+        // Which exception levels the cycle counter counts in is filtered by
+        // PMCCFILTR_EL0, and by default it does not count at EL2: NSH
+        // (bit 27) has to be set for that. A kernel entered at EL2 — QEMU
+        // with `virtualization=on`, most real boards — otherwise sees a
+        // counter that never moves. At EL2, MDCR_EL2.HPMD (bit 17) can also
+        // prohibit counting there and is cleared. At EL3, MDCR_EL3.SCCD
+        // (bit 23) prohibits the cycle counter in Secure state.
+        let el = crate::arch::arm::current_el();
+        // SAFETY: caller guarantees EL1 or above; each register is written
+        // only at the level that owns it.
+        unsafe {
+            let filter: u64 = if el >= 2 { 1 << 27 } else { 0 };
+            core::arch::asm!("msr PMCCFILTR_EL0, {v}", v = in(reg) filter,
+                             options(nomem, nostack, preserves_flags));
+            if el == 2 {
+                core::arch::asm!(
+                    "mrs {t}, MDCR_EL2",
+                    "bic {t}, {t}, #(1 << 17)",
+                    "msr MDCR_EL2, {t}",
+                    t = out(reg) _,
+                    options(nomem, nostack, preserves_flags),
+                );
+            }
+            if el == 3 {
+                core::arch::asm!(
+                    "mrs {t}, MDCR_EL3",
+                    "bic {t}, {t}, #(1 << 23)",
+                    "msr MDCR_EL3, {t}",
+                    t = out(reg) _,
+                    options(nomem, nostack, preserves_flags),
+                );
+            }
+        }
+
         // SAFETY: caller guarantees EL1, where all three registers are
         // writable.
         unsafe {
             core::arch::asm!("msr PMCR_EL0, {v}", v = in(reg) pmcr,
                              options(nomem, nostack, preserves_flags));
-            core::arch::asm!("msr PMCNTENSET_EL0, {v}", v = in(reg) PMCNTEN_CYCLE,
+            // Event counter 0 counts INST_RETIRED (0x08) when the core says
+            // it implements that event (PMCEID0_EL0 bit 8) and has a counter
+            // to spare. Filtered like the cycle counter: NSH at EL2+.
+            let eid0: u64;
+            core::arch::asm!("mrs {v}, PMCEID0_EL0", v = out(reg) eid0,
+                             options(nomem, nostack, preserves_flags));
+            let instructions = _pmu.leaf.general_counters >= 1 && eid0 & (1 << 8) != 0;
+            if instructions {
+                let evtype: u64 = 0x08 | if el >= 2 { 1 << 27 } else { 0 };
+                core::arch::asm!(
+                    "msr PMSELR_EL0, xzr",
+                    "isb",
+                    "msr PMXEVTYPER_EL0, {t}",
+                    "msr PMXEVCNTR_EL0, xzr",
+                    t = in(reg) evtype,
+                    options(nomem, nostack, preserves_flags),
+                );
+            }
+            INSTRUCTIONS.store(instructions, core::sync::atomic::Ordering::Relaxed);
+            let enable = PMCNTEN_CYCLE | u64::from(instructions);
+            core::arch::asm!("msr PMCNTENSET_EL0, {v}", v = in(reg) enable,
                              options(nomem, nostack, preserves_flags));
             // PMUSERENR_EL0.EN (bit 0) lets EL0 read the counters without
             // trapping. This kernel stays at EL1, but a kernel built on it
@@ -804,12 +916,272 @@ mod arm {
     }
 }
 
+/// POWER8 and later, 64-bit Book3S.
+///
+/// Only the fixed pair is used: `PMC5` (instructions completed) and `PMC6`
+/// (cycles) need no event selection, which differs per generation, so the
+/// same programming is right on POWER8, 9 and 10. `MMCR0` holds the freeze
+/// controls; the kernel clears them all — including `FCH`, freeze in
+/// hypervisor state, which is where `powernv` runs. PMC5/6 also count only
+/// while the thread's run latch (`CTRL[RUN]`) is set, which an operating
+/// system sets whenever it is not idle and a bare kernel has to set itself.
+///
+/// Under QEMU's TCG, `PMC6` is only brought up to date when `MMCR0` is
+/// written, not when it is read. `enable` detects that — the counter does not
+/// move on plain reads — and switches to rewriting `MMCR0` with its own value
+/// before each read. On silicon that write changes nothing (no counter is
+/// reset by it), so the mode is harmless where it is not needed; it is only
+/// turned on where a plain read was shown not to advance.
+///
+/// Anything else — a 32-bit e500 with its separate "embedded" PMU, a G4 with
+/// the 7450-style one, a pre-POWER8 part — is reported as having no PMU this
+/// driver can program. The Time Base remains the measurement there.
+#[cfg(any(target_arch = "powerpc", target_arch = "powerpc64"))]
+mod power {
+    use super::{CorePmu, CoreType, CounterRoute, PmuKind, PmuLeaf, Reading};
+
+
+    static SYNC_ON_READ: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+    pub(super) fn set_sync_on_read(on: bool) {
+        SYNC_ON_READ.store(on, core::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The classic 32-bit parts whose PMU has the 7xx/74xx layout: MMCR0 at
+    /// SPR 952 with 6-bit selectors for PMC1 (bits 6-11) and PMC2 (bits 0-5).
+    /// Event 1 is processor cycles on every counter and event 2 instructions
+    /// completed on PMC1-4 — the encoding FreeBSD's `hwpmc_mpc7xxx` uses for
+    /// both the G3 and the G4.
+    #[cfg(target_arch = "powerpc")]
+    fn has_classic_pmu() -> bool {
+        matches!(crate::arch::ppc::pvr() >> 16, 0x0008 | 0x7000 | 0x000C | 0x800C | 0x8000..=0x8004)
+    }
+
+    /// Whether this core has the Book3S v2.07+ PMU layout.
+    fn has_power_pmu() -> bool {
+        #[cfg(target_arch = "powerpc64")]
+        {
+            matches!(crate::arch::ppc::pvr() >> 16, 0x004B..=0x004E | 0x0080 | 0x0082)
+        }
+        #[cfg(not(target_arch = "powerpc64"))]
+        {
+            false
+        }
+    }
+
+    pub(super) fn detect() -> CorePmu {
+        #[cfg(target_arch = "powerpc")]
+        if has_classic_pmu() {
+            return CorePmu {
+                leaf: PmuLeaf {
+                    version: 1,
+                    general_counters: 4,
+                    general_width: 32,
+                    // PMC1 (cycles) and PMC2 (instructions), programmed as a
+                    // fixed pair.
+                    fixed_counters: 2,
+                    fixed_width: 32,
+                    events_unavailable: 0,
+                },
+                core_type: CoreType::Uniform,
+                route: CounterRoute::None,
+                kind: PmuKind::Classic7xx,
+                slots: [Default::default(); super::MAX_TRACKED_COUNTERS],
+            };
+        }
+        let available = has_power_pmu();
+        CorePmu {
+            leaf: if available {
+                PmuLeaf {
+                    version: 1,
+                    general_counters: 4,
+                    general_width: 32,
+                    fixed_counters: 2,
+                    fixed_width: 32,
+                    events_unavailable: 0,
+                }
+            } else {
+                PmuLeaf::default()
+            },
+            // POWER parts are not hybrid; every thread has the same PMU.
+            core_type: CoreType::Uniform,
+            route: CounterRoute::None,
+            kind: if available { PmuKind::PowerMmcr } else { PmuKind::Unknown },
+            slots: [Default::default(); super::MAX_TRACKED_COUNTERS],
+        }
+    }
+
+    /// Unfreezes PMC5/PMC6 in every privilege state.
+    ///
+    /// # Safety
+    /// Supervisor or hypervisor state on a core `detect` accepted.
+    pub(super) unsafe fn enable_fixed() {
+        #[cfg(target_arch = "powerpc")]
+        if has_classic_pmu() {
+            // SAFETY: supervisor state on a 7xx/74xx: freeze (FC), zero both
+            // counters, then select cycles on PMC1 and instructions completed
+            // on PMC2 with every freeze bit clear.
+            unsafe {
+                core::arch::asm!(
+                    "lis {t}, 0x8000",
+                    "mtspr 952, {t}",
+                    "li {t}, 0",
+                    "mtspr 953, {t}",
+                    "mtspr 954, {t}",
+                    "isync",
+                    "li {t}, (1 << 6) | 2",
+                    "mtspr 952, {t}",
+                    "isync",
+                    t = out(reg) _,
+                    options(nomem, nostack, preserves_flags),
+                );
+            }
+            return;
+        }
+        #[cfg(target_arch = "powerpc64")]
+        // SAFETY: forwarded from this function's contract. SPR numbers from
+        // the Power ISA: MMCR0 795, MMCR1 798, MMCR2 785, MMCRA 786, PMC5
+        // 775, PMC6 776, CTRL 152 (write) / 136 (read).
+        unsafe {
+            core::arch::asm!(
+                // Freeze while reprogramming. `oris` rather than `lis`: `lis`
+                // sign-extends and would set the reserved upper half too.
+                "li {t}, 0",
+                "oris {t}, {t}, 0x8000",
+                "mtspr 795, {t}",
+                "li {t}, 0",
+                "mtspr 798, {t}",
+                "mtspr 785, {t}",
+                "mtspr 786, {t}",
+                "mtspr 775, {t}",
+                "mtspr 776, {t}",
+                // The run latch.
+                "li {t}, 1",
+                "mtspr 152, {t}",
+                "isync",
+                // Every freeze bit clear.
+                "li {t}, 0",
+                "mtspr 795, {t}",
+                "isync",
+                t = out(reg) _,
+                options(nomem, nostack, preserves_flags),
+            );
+        }
+    }
+
+    /// Reads PMC5 (instructions) or PMC6 (cycles).
+    pub(super) fn read_fixed(pmu: &CorePmu, index: u32) -> Option<Reading> {
+        #[cfg(target_arch = "powerpc")]
+        if pmu.kind == PmuKind::Classic7xx {
+            let value: u32;
+            // SAFETY: `kind` is only `Classic7xx` on a core with these SPRs.
+            unsafe {
+                match index {
+                    super::FIXED_CORE_CYCLES => core::arch::asm!("mfspr {v}, 953", v = out(reg) value,
+                                                                 options(nomem, nostack, preserves_flags)),
+                    super::FIXED_INSTRUCTIONS => core::arch::asm!("mfspr {v}, 954", v = out(reg) value,
+                                                                  options(nomem, nostack, preserves_flags)),
+                    _ => return None,
+                }
+            }
+            return Some(Reading { value: value as u64, core_type: pmu.core_type });
+        }
+        if pmu.kind != PmuKind::PowerMmcr {
+            return None;
+        }
+        #[cfg(target_arch = "powerpc64")]
+        {
+            let value: u64;
+            // SAFETY: `kind` is only `PowerMmcr` on a core with these SPRs,
+            // and reading them in supervisor state has no side effects.
+            unsafe {
+                if SYNC_ON_READ.load(core::sync::atomic::Ordering::Relaxed) {
+                    core::arch::asm!("mfspr {t}, 795", "mtspr 795, {t}", "isync", t = out(reg) _,
+                                     options(nomem, nostack, preserves_flags));
+                }
+                match index {
+                    super::FIXED_INSTRUCTIONS => core::arch::asm!("mfspr {v}, 775", v = out(reg) value,
+                                                                  options(nomem, nostack, preserves_flags)),
+                    super::FIXED_CORE_CYCLES => core::arch::asm!("mfspr {v}, 776", v = out(reg) value,
+                                                                 options(nomem, nostack, preserves_flags)),
+                    _ => return None,
+                }
+            }
+            Some(Reading {
+                // The PMCs are 32 bits; the upper half of the SPR read is 0.
+                value: value & 0xFFFF_FFFF,
+                core_type: pmu.core_type,
+            })
+        }
+        #[cfg(not(target_arch = "powerpc64"))]
+        {
+            let _ = index;
+            None
+        }
+    }
+}
+
+/// RISC-V: `cycle` and `instret`.
+///
+/// Whether S-mode may read them is M-mode's decision (`mcounteren`), not
+/// discoverable from S-mode except by trying — so `detect` tries, through the
+/// trap-fixup probes in `arch::riscv`, and a counter that would trap is never
+/// read again. Both are 64 bits (RV32 reads them as two halves). The
+/// `hpmcounter`s would need the SBI PMU extension to program; not used.
+#[cfg(any(target_arch = "riscv32", target_arch = "riscv64"))]
+mod riscv {
+    use super::{CorePmu, CoreType, CounterRoute, PmuKind, PmuLeaf, Reading};
+    use core::sync::atomic::{AtomicBool, Ordering};
+
+    static INSTRET: AtomicBool = AtomicBool::new(false);
+
+    pub(super) fn detect() -> CorePmu {
+        let cycle = crate::arch::riscv::cycle_readable();
+        INSTRET.store(cycle && crate::arch::riscv::instret_readable(), Ordering::Relaxed);
+        CorePmu {
+            leaf: if cycle {
+                PmuLeaf {
+                    version: 1,
+                    general_counters: 0,
+                    general_width: 0,
+                    fixed_counters: if INSTRET.load(Ordering::Relaxed) { 2 } else { 1 },
+                    fixed_width: 64,
+                    events_unavailable: 0,
+                }
+            } else {
+                PmuLeaf::default()
+            },
+            core_type: CoreType::Uniform,
+            route: CounterRoute::None,
+            kind: if cycle { PmuKind::RiscvCounters } else { PmuKind::Unknown },
+            slots: [Default::default(); super::MAX_TRACKED_COUNTERS],
+        }
+    }
+
+    pub(super) fn read_fixed(pmu: &CorePmu, index: u32) -> Option<Reading> {
+        if pmu.kind != PmuKind::RiscvCounters {
+            return None;
+        }
+        // SAFETY: `detect` proved each read legal before `kind` was set.
+        let value = unsafe {
+            match index {
+                super::FIXED_CORE_CYCLES => nanochrono_core::arch::riscv::rdcycle_raw(),
+                super::FIXED_INSTRUCTIONS if INSTRET.load(Ordering::Relaxed) => {
+                    nanochrono_core::arch::riscv::rdinstret_raw()
+                }
+                _ => return None,
+            }
+        };
+        Some(Reading { value, core_type: pmu.core_type })
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The neutral surface
 // ---------------------------------------------------------------------------
 
 /// Fixed counter indices, named so a caller does not pass a bare number.
-#[cfg(target_arch = "x86_64")]
+#[cfg(x86_any)]
 pub use x86::{FIXED_CORE_CYCLES, FIXED_INSTRUCTIONS, FIXED_REF_CYCLES};
 
 // AArch64 has one fixed counter, the cycle counter. The other two indices
@@ -825,6 +1197,28 @@ pub const FIXED_CORE_CYCLES: u32 = 1;
 #[cfg(target_arch = "aarch64")]
 pub const FIXED_REF_CYCLES: u32 = 2;
 
+// RISC-V: `instret` and `cycle` are the fixed-function pair.
+/// Instructions retired, `instret`.
+#[cfg(any(target_arch = "riscv32", target_arch = "riscv64", target_arch = "arm"))]
+pub const FIXED_INSTRUCTIONS: u32 = 0;
+/// Cycles, `cycle`.
+#[cfg(any(target_arch = "riscv32", target_arch = "riscv64", target_arch = "arm"))]
+pub const FIXED_CORE_CYCLES: u32 = 1;
+/// `time` is the reference clock; it is the counter, not a PMU register.
+#[cfg(any(target_arch = "riscv32", target_arch = "riscv64", target_arch = "arm"))]
+pub const FIXED_REF_CYCLES: u32 = 2;
+
+// POWER: PMC5 and PMC6 are the fixed-function pair.
+/// Instructions completed, `PMC5`.
+#[cfg(any(target_arch = "powerpc", target_arch = "powerpc64"))]
+pub const FIXED_INSTRUCTIONS: u32 = 0;
+/// Cycles, `PMC6`.
+#[cfg(any(target_arch = "powerpc", target_arch = "powerpc64"))]
+pub const FIXED_CORE_CYCLES: u32 = 1;
+/// No reference-rate counter on POWER; the Time Base plays that role.
+#[cfg(any(target_arch = "powerpc", target_arch = "powerpc64"))]
+pub const FIXED_REF_CYCLES: u32 = 2;
+
 impl CorePmu {
     /// Describes the PMU of the core this runs on.
     ///
@@ -832,13 +1226,33 @@ impl CorePmu {
     /// the answer differs between core types, and a configuration derived on
     /// one core is not valid on another.
     pub fn detect() -> CorePmu {
-        #[cfg(target_arch = "x86_64")]
+        #[cfg(x86_any)]
         {
             x86::detect()
         }
         #[cfg(target_arch = "aarch64")]
         {
             arm::detect()
+        }
+        #[cfg(any(target_arch = "powerpc", target_arch = "powerpc64"))]
+        {
+            power::detect()
+        }
+        #[cfg(any(target_arch = "riscv32", target_arch = "riscv64"))]
+        {
+            riscv::detect()
+        }
+        // 32-bit ARM: the PMU (PMCCNTR through CP15) is not driven yet; the
+        // interface reports it absent rather than guessing.
+        #[cfg(target_arch = "arm")]
+        {
+            CorePmu {
+                leaf: PmuLeaf::default(),
+                core_type: CoreType::Uniform,
+                route: CounterRoute::None,
+                kind: PmuKind::Unknown,
+                slots: [Default::default(); MAX_TRACKED_COUNTERS],
+            }
         }
     }
 
@@ -885,7 +1299,7 @@ impl CorePmu {
     /// # Safety
     /// Requires ring 0 / EL1 and clobbers any existing PMU configuration.
     pub unsafe fn enable(&mut self) -> CounterRoute {
-        #[cfg(target_arch = "x86_64")]
+        #[cfg(x86_any)]
         {
             // Permit `RDPMC` outside ring 0. Not needed here — see the
             // function — but set before anything else so the state is
@@ -934,7 +1348,7 @@ impl CorePmu {
                     self.route = CounterRoute::None;
                     return self.route;
                 }
-                PmuKind::Unknown | PmuKind::ArmSystemRegister => {
+                PmuKind::Unknown | PmuKind::ArmSystemRegister | PmuKind::PowerMmcr | PmuKind::RiscvCounters | PmuKind::Classic7xx => {
                     // Nothing is known about this part's counters, so nothing
                     // is written to them. A wrong MSR here is a triple fault,
                     // not a wrong number. (`ArmSystemRegister` cannot reach
@@ -969,6 +1383,12 @@ impl CorePmu {
         }
         #[cfg(target_arch = "aarch64")]
         {
+            // No architected PMU: its registers are UNDEFINED, so nothing is
+            // written. `detect` reported version 0 for exactly this case.
+            if !self.is_available() {
+                self.route = CounterRoute::None;
+                return self.route;
+            }
             // SAFETY: forwarded from this function's own contract.
             unsafe { arm::enable_fixed(self) };
             // SAFETY: as above; reads only.
@@ -977,6 +1397,44 @@ impl CorePmu {
             } else {
                 CounterRoute::None
             };
+            self.route
+        }
+        #[cfg(any(target_arch = "riscv32", target_arch = "riscv64", target_arch = "arm"))]
+        {
+            // Nothing to program: the counters free-run unless M-mode
+            // inhibited them (`mcountinhibit`), which `counter_advances`
+            // detects rather than assumes.
+            self.route = if self.is_available()
+                // SAFETY: forwarded from this function's own contract.
+                && unsafe { self.counter_advances(CounterRoute::Fixed) }
+            {
+                CounterRoute::Fixed
+            } else {
+                CounterRoute::None
+            };
+            self.route
+        }
+        #[cfg(any(target_arch = "powerpc", target_arch = "powerpc64"))]
+        {
+            if !self.is_available() {
+                self.route = CounterRoute::None;
+                return self.route;
+            }
+            // SAFETY: forwarded from this function's own contract.
+            unsafe { power::enable_fixed() };
+            // SAFETY: as above; reads only.
+            let mut advances = unsafe { self.counter_advances(CounterRoute::Fixed) };
+            if !advances {
+                // An emulator that updates PMC6 only on MMCR0 writes: ask for
+                // a resynchronisation before each read, and check again.
+                power::set_sync_on_read(true);
+                // SAFETY: as above.
+                advances = unsafe { self.counter_advances(CounterRoute::Fixed) };
+                if !advances {
+                    power::set_sync_on_read(false);
+                }
+            }
+            self.route = if advances { CounterRoute::Fixed } else { CounterRoute::None };
             self.route
         }
     }
@@ -1013,7 +1471,7 @@ impl CorePmu {
     /// # Safety
     /// Requires ring 0 / EL1, or user access explicitly enabled.
     pub unsafe fn read(&self, index: u32) -> Option<Reading> {
-        #[cfg(target_arch = "x86_64")]
+        #[cfg(x86_any)]
         // SAFETY: forwarded from this function's own contract.
         unsafe {
             x86::read_fixed(self, index)
@@ -1022,6 +1480,19 @@ impl CorePmu {
         // SAFETY: forwarded from this function's own contract.
         unsafe {
             arm::read_fixed(self, index)
+        }
+        #[cfg(any(target_arch = "powerpc", target_arch = "powerpc64"))]
+        {
+            power::read_fixed(self, index)
+        }
+        #[cfg(any(target_arch = "riscv32", target_arch = "riscv64"))]
+        {
+            riscv::read_fixed(self, index)
+        }
+        #[cfg(target_arch = "arm")]
+        {
+            let _ = index;
+            None
         }
     }
 
@@ -1048,7 +1519,7 @@ impl CorePmu {
     /// # Safety
     /// Requires ring 0 / EL1.
     pub unsafe fn read_instructions(&self) -> Option<Reading> {
-        #[cfg(target_arch = "x86_64")]
+        #[cfg(x86_any)]
         {
             match self.kind {
                 // SAFETY: as above; `read` checks the counter exists.
@@ -1076,11 +1547,34 @@ impl CorePmu {
         }
         #[cfg(target_arch = "aarch64")]
         {
-            // AArch64's one fixed counter counts cycles, not instructions;
-            // a general event counter would need PMCEID1_EL0 to choose an
-            // instruction event, which this driver does not program.
-            let _ = self;
-            None
+            // AArch64's one fixed counter counts cycles; instructions come
+            // from event counter 0, programmed with INST_RETIRED when the core
+            // implements it (32 bits wide).
+            if self.route == CounterRoute::Fixed {
+                arm::read_instructions(self)
+            } else {
+                None
+            }
+        }
+        #[cfg(any(target_arch = "riscv32", target_arch = "riscv64", target_arch = "arm"))]
+        {
+            if self.route == CounterRoute::Fixed {
+                // SAFETY: forwarded from this function's own contract.
+                unsafe { self.read(FIXED_INSTRUCTIONS) }
+            } else {
+                None
+            }
+        }
+        #[cfg(any(target_arch = "powerpc", target_arch = "powerpc64"))]
+        {
+            // PMC5 is fixed-function instructions completed, so it is
+            // available whenever the fixed route is.
+            if self.route == CounterRoute::Fixed {
+                // SAFETY: forwarded from this function's own contract.
+                unsafe { self.read(FIXED_INSTRUCTIONS) }
+            } else {
+                None
+            }
         }
     }
 
@@ -1107,7 +1601,7 @@ impl CorePmu {
             // So AMD reads through the MSR it just wrote — which is
             // necessarily implemented wherever the write was — and Intel
             // keeps `RDPMC`, where the enumeration already proves a real PMU.
-            #[cfg(target_arch = "x86_64")]
+            #[cfg(x86_any)]
             CounterRoute::General(i) => match self.kind {
                 // SAFETY: as above.
                 PmuKind::AmdCore | PmuKind::AmdLegacy => unsafe {
@@ -1119,7 +1613,7 @@ impl CorePmu {
                 // SAFETY: as above.
                 _ => unsafe { x86::read_general(self, i) },
             },
-            #[cfg(not(target_arch = "x86_64"))]
+            #[cfg(not(x86_any))]
             CounterRoute::General(_) => None,
         }
     }
@@ -1143,8 +1637,14 @@ impl CorePmu {
         // SAFETY: as above.
         let after = unsafe { self.read_cycles() };
 
+        // The route decides the counter's width; see `delta_since_width`.
+        let width = match self.route {
+            CounterRoute::Fixed => self.leaf.fixed_width,
+            CounterRoute::General(_) => self.leaf.general_width,
+            CounterRoute::None => 64,
+        };
         let delta = match (before, after) {
-            (Some(a), Some(b)) => b.delta_since(a),
+            (Some(a), Some(b)) => b.delta_since_width(a, width),
             _ => None,
         };
         (out, delta)

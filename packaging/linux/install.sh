@@ -15,12 +15,12 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 app_id="io.nanochronometer.NanoChrono"
 
 echo "Building release binaries..."
-cargo build --release --manifest-path "${repo_root}/Cargo.toml" \
+cargo build --profile dist --manifest-path "${repo_root}/Cargo.toml" \
     -p nanochrono-cli -p nanochrono-gui -p nanochrono-ffi
 
-install -Dm755 "${repo_root}/target/release/nanochrono"     "${prefix}/bin/nanochrono"
-install -Dm755 "${repo_root}/target/release/nanochrono-gui" "${prefix}/bin/nanochrono-gui"
-install -Dm644 "${repo_root}/target/release/libnanochrono.so" "${prefix}/lib/libnanochrono.so"
+install -Dm755 "${repo_root}/target/dist/nanochrono"     "${prefix}/bin/nanochrono"
+install -Dm755 "${repo_root}/target/dist/nanochrono-gui" "${prefix}/bin/nanochrono-gui"
+install -Dm644 "${repo_root}/target/dist/libnanochrono.so" "${prefix}/lib/libnanochrono.so"
 # The header is generated from the Rust FFI crate, never hand-written.
 "${repo_root}/tools/gen-header.sh"
 install -Dm644 "${repo_root}/include/nanochrono.h"          "${prefix}/include/nanochrono.h"

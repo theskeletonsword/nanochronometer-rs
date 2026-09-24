@@ -28,6 +28,8 @@ pub struct CpuFeatures {
     pub avx2: bool,
     pub avx_vnni: bool,
     pub vaes: bool,
+    /// `VPCLMULQDQ`: carry-less multiply on YMM/ZMM lanes (CPUID.7:ECX[10]).
+    pub vpclmulqdq: bool,
     pub avx512f: bool,
     pub avx512bw: bool,
     pub avx512vl: bool,
@@ -38,6 +40,20 @@ pub struct CpuFeatures {
     pub sme: bool,
     pub arm_aes: bool,
     pub arm_sha2: bool,
+    /// PowerPC VMX, the vector unit Apple and Motorola called AltiVec.
+    pub altivec: bool,
+    /// PowerPC Vector-Scalar Extension (ISA 2.06, POWER7 onward).
+    pub vsx: bool,
+    /// ISA 2.07 (POWER8): the VSX integer and crypto additions.
+    pub ppc_isa207: bool,
+    /// ISA 3.0 (POWER9).
+    pub ppc_isa300: bool,
+    /// ISA 3.1 (POWER10).
+    pub ppc_isa31: bool,
+    /// The in-core AES/SHA vector crypto instructions (`vcipher`, `vshasigma`).
+    pub ppc_vec_crypto: bool,
+    /// RISC-V "V" vector extension (RVV 1.0), enabled for this process.
+    pub rvv: bool,
     /// True when the TSC is invariant, i.e. immune to frequency and C-state
     /// changes. Without this, cycle deltas across a long interval are not
     /// comparable to wall time.
@@ -75,9 +91,190 @@ fn detect() -> CpuFeatures {
     {
         detect_aarch64()
     }
-    #[cfg(not(any(target_arch = "x86_64", target_arch = "x86", target_arch = "aarch64")))]
+    #[cfg(any(target_arch = "powerpc", target_arch = "powerpc64"))]
+    {
+        detect_powerpc()
+    }
+    #[cfg(any(target_arch = "riscv32", target_arch = "riscv64"))]
+    {
+        detect_riscv()
+    }
+    #[cfg(target_arch = "arm")]
+    {
+        detect_arm32()
+    }
+    #[cfg(not(any(
+        target_arch = "x86_64",
+        target_arch = "x86",
+        target_arch = "aarch64",
+        target_arch = "powerpc",
+        target_arch = "powerpc64",
+        target_arch = "riscv32",
+        target_arch = "riscv64",
+        target_arch = "arm"
+    )))]
     {
         CpuFeatures::default()
+    }
+}
+
+/// RISC-V: Linux publishes the single-letter extensions as `AT_HWCAP` bit
+/// `letter - 'a'` (FreeBSD's `HWCAP_ISA_BIT` is the same encoding), and sets
+/// `v` only when the kernel will enable vector state for the process.
+#[cfg(all(any(target_arch = "riscv32", target_arch = "riscv64"), feature = "std"))]
+fn detect_riscv() -> CpuFeatures {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    // SAFETY: `getauxval` has no preconditions.
+    let hwcap = unsafe { libc::getauxval(libc::AT_HWCAP) } as u64;
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    let hwcap = 0u64;
+    CpuFeatures {
+        rvv: hwcap & (1 << (b'v' - b'a')) != 0,
+        // `time` ticks at the platform's fixed timebase.
+        invariant_counter: true,
+        ..Default::default()
+    }
+}
+
+/// 32-bit ARM: NEON from `AT_HWCAP` — the kernel's word on whether the unit
+/// exists *and* is enabled for user space. Android's bionic provides the same
+/// `getauxval`.
+#[cfg(target_arch = "arm")]
+fn detect_arm32() -> CpuFeatures {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    // SAFETY: `getauxval` has no preconditions.
+    let hwcap = unsafe { libc::getauxval(libc::AT_HWCAP) } as u64;
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    let hwcap = 0u64;
+    CpuFeatures {
+        neon: hwcap & crate::arch::arm32::HWCAP_NEON != 0,
+        // The generic timer is fixed-rate; the fallback is the monotonic
+        // clock. Both are invariant.
+        invariant_counter: true,
+        ..Default::default()
+    }
+}
+
+/// RISC-V with no OS: S-mode cannot read `misa`, so the kernel passes on
+/// what the device tree's `riscv,isa` said.
+#[cfg(all(any(target_arch = "riscv32", target_arch = "riscv64"), not(feature = "std")))]
+fn detect_riscv() -> CpuFeatures {
+    CpuFeatures {
+        rvv: crate::arch::riscv::vector_available(),
+        invariant_counter: true,
+        ..Default::default()
+    }
+}
+
+/// `AT_HWCAP` bits, from the kernel's `asm/cputable.h` (the same values
+/// FreeBSD publishes in `machine/cpu.h`).
+#[cfg(all(any(target_arch = "powerpc", target_arch = "powerpc64"), any(feature = "std", test)))]
+mod ppc_hwcap {
+    pub const HAS_ALTIVEC: u64 = 0x1000_0000;
+    pub const HAS_VSX: u64 = 0x0000_0080;
+    /// `AT_HWCAP2`.
+    pub const ARCH_2_07: u64 = 0x8000_0000;
+    pub const HAS_VEC_CRYPTO: u64 = 0x0200_0000;
+    pub const ARCH_3_00: u64 = 0x0080_0000;
+    pub const ARCH_3_1: u64 = 0x0004_0000;
+}
+
+/// PowerPC feature detection on Linux: the auxiliary vector.
+///
+/// The kernel is the only party that knows whether it will *allow* the vector
+/// unit — it enables `MSR[VEC]`/`MSR[VSX]` lazily on first use and would
+/// refuse on a part without one — so HWCAP is the authority, exactly as it is
+/// for AArch64.
+#[cfg(all(any(target_arch = "powerpc", target_arch = "powerpc64"), feature = "std"))]
+fn detect_powerpc() -> CpuFeatures {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    // SAFETY: `getauxval` reads this process's auxiliary vector and returns 0
+    // for an unknown key; it has no preconditions.
+    let (hwcap, hwcap2) = unsafe {
+        (
+            libc::getauxval(libc::AT_HWCAP) as u64,
+            libc::getauxval(libc::AT_HWCAP2) as u64,
+        )
+    };
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    let (hwcap, hwcap2) = (0u64, 0u64);
+    from_ppc_hwcap(hwcap, hwcap2)
+}
+
+/// Decodes HWCAP/HWCAP2 into features. Split out so it is testable anywhere.
+#[cfg(all(any(target_arch = "powerpc", target_arch = "powerpc64"), any(feature = "std", test)))]
+fn from_ppc_hwcap(hwcap: u64, hwcap2: u64) -> CpuFeatures {
+    use ppc_hwcap::*;
+    let altivec = hwcap & HAS_ALTIVEC != 0;
+    // VSX extends the AltiVec register file; a kernel reporting one without
+    // the other is not something to dispatch on.
+    let vsx = altivec && hwcap & HAS_VSX != 0;
+    CpuFeatures {
+        altivec,
+        vsx,
+        ppc_isa207: hwcap2 & ARCH_2_07 != 0,
+        ppc_isa300: hwcap2 & ARCH_3_00 != 0,
+        ppc_isa31: hwcap2 & ARCH_3_1 != 0,
+        ppc_vec_crypto: vsx && hwcap2 & HAS_VEC_CRYPTO != 0,
+        // The Time Base runs at a fixed rate by architecture.
+        invariant_counter: true,
+        ..Default::default()
+    }
+}
+
+/// PowerPC feature detection with no OS: the Processor Version Register.
+///
+/// A freestanding kernel runs in supervisor state, where `mfpvr` is legal. The
+/// version half (bits 0:15) identifies the core family; the table is the
+/// published PVR list (FreeBSD's `machine/spr.h` carries the same values).
+/// The boot stub is what turns `MSR[VEC]`/`MSR[VSX]` on, and it does so only
+/// on a family this table says has the unit — so reporting a feature here and
+/// the MSR bit being set are the same decision.
+#[cfg(all(any(target_arch = "powerpc", target_arch = "powerpc64"), not(feature = "std")))]
+fn detect_powerpc() -> CpuFeatures {
+    let pvr: usize;
+    // SAFETY: supervisor state, which is the only configuration a `no_std`
+    // build of this crate runs in; the read has no side effects.
+    unsafe {
+        core::arch::asm!("mfpvr {v}", v = out(reg) pvr, options(nomem, nostack, preserves_flags));
+    }
+    from_pvr(pvr as u32)
+}
+
+/// Features implied by a PVR. Unknown parts get none: guessing wrong is an
+/// illegal-instruction exception, guessing low is a slower probe.
+#[cfg(any(target_arch = "powerpc", target_arch = "powerpc64"))]
+pub fn from_pvr(pvr: u32) -> CpuFeatures {
+    let version = (pvr >> 16) as u16;
+    // (altivec, vsx, isa 2.07, isa 3.0, isa 3.1)
+    let (altivec, vsx, isa207, isa300, isa31) = match version {
+        // 7400/7410, 745x/744x: G4.
+        0x000C | 0x800C | 0x8000..=0x8004 => (true, false, false, false, false),
+        // 970, 970FX, 970MP, 970GX: G5.
+        0x0039 | 0x003C | 0x0044 | 0x0045 => (true, false, false, false, false),
+        // Cell PPE, POWER6.
+        0x0070 | 0x003E => (true, false, false, false, false),
+        // POWER7, POWER7+.
+        0x003F | 0x004A => (true, true, false, false, false),
+        // POWER8E, POWER8NVL, POWER8.
+        0x004B..=0x004D => (true, true, true, false, false),
+        // POWER9.
+        0x004E => (true, true, true, true, false),
+        // POWER10, POWER11.
+        0x0080 | 0x0082 => (true, true, true, true, true),
+        // e6500: 64-bit Book E with AltiVec.
+        0x8040 => (true, false, false, false, false),
+        _ => (false, false, false, false, false),
+    };
+    CpuFeatures {
+        altivec,
+        vsx,
+        ppc_isa207: isa207,
+        ppc_isa300: isa300,
+        ppc_isa31: isa31,
+        ppc_vec_crypto: isa207,
+        invariant_counter: true,
+        ..Default::default()
     }
 }
 
@@ -122,6 +319,7 @@ fn detect_x86() -> CpuFeatures {
         f.avx512bw = ebx7 & (1 << 30) != 0 && os_zmm;
         f.avx512vl = ebx7 & (1 << 31) != 0 && os_zmm;
         f.vaes = ecx7 & (1 << 9) != 0 && os_ymm;
+        f.vpclmulqdq = ecx7 & (1 << 10) != 0 && os_ymm;
         f.avx512vnni = ecx7 & (1 << 11) != 0 && os_zmm;
 
         if max_sub7 >= 1 {
@@ -189,6 +387,7 @@ fn cross_check_with_windows(f: &mut CpuFeatures) {
         f.fma = false;
         f.avx_vnni = false;
         f.vaes = false;
+        f.vpclmulqdq = false;
     }
 }
 
@@ -464,16 +663,22 @@ impl Vendor {
     }
 }
 
-/// This machine's CPU vendor.
+/// The raw twelve-byte vendor string of `CPUID.0H` (EBX, EDX, ECX).
 #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
-pub fn vendor() -> Vendor {
+pub fn vendor_signature() -> [u8; 12] {
     use crate::arch::x86::cpuid;
     let [_, ebx, ecx, edx] = cpuid(0, 0);
     let mut signature = [0u8; 12];
     signature[0..4].copy_from_slice(&ebx.to_le_bytes());
     signature[4..8].copy_from_slice(&edx.to_le_bytes());
     signature[8..12].copy_from_slice(&ecx.to_le_bytes());
-    Vendor::from_signature(signature)
+    signature
+}
+
+/// This machine's CPU vendor.
+#[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+pub fn vendor() -> Vendor {
+    Vendor::from_signature(vendor_signature())
 }
 
 /// The highest Centaur extended leaf this part answers, or zero.
@@ -526,6 +731,35 @@ pub fn brand_string() -> Option<String> {
     ))]
     {
         None
+    }
+}
+
+#[cfg(all(test, any(target_arch = "powerpc", target_arch = "powerpc64")))]
+mod ppc_tests {
+    use super::*;
+
+    #[test]
+    fn hwcap_decodes_power9() {
+        let f = from_ppc_hwcap(
+            ppc_hwcap::HAS_ALTIVEC | ppc_hwcap::HAS_VSX,
+            ppc_hwcap::ARCH_2_07 | ppc_hwcap::ARCH_3_00 | ppc_hwcap::HAS_VEC_CRYPTO,
+        );
+        assert!(f.altivec && f.vsx && f.ppc_isa207 && f.ppc_isa300 && !f.ppc_isa31);
+        assert!(f.ppc_vec_crypto);
+    }
+
+    #[test]
+    fn vsx_without_altivec_is_refused() {
+        let f = from_ppc_hwcap(ppc_hwcap::HAS_VSX, 0);
+        assert!(!f.vsx && !f.altivec);
+    }
+
+    #[test]
+    fn unknown_pvrs_claim_nothing() {
+        let f = from_pvr(0x1234_0000);
+        assert_eq!(f, CpuFeatures { invariant_counter: true, ..Default::default() });
+        assert!(from_pvr(0x004E_1202).ppc_isa300);
+        assert!(!from_pvr(0x8023_0000).altivec, "e500mc has no AltiVec");
     }
 }
 

@@ -11,7 +11,7 @@
 //! several program the PMU. There is no way to express that in a C signature,
 //! so it is stated once: **this is a ring 0 interface.**
 
-use crate::pmu::CorePmu;
+use crate::pmu::{CorePmu, CounterRoute};
 
 /// Layout version, so a loader can refuse a module it does not understand.
 pub const NC_BM_ABI_VERSION: u32 = 1;
@@ -29,7 +29,10 @@ pub struct nc_bm_pmu_t {
     pub core_type: u32,
     /// 0 none, 1 fixed, 2 general-purpose.
     pub route: u32,
-    pub _pad: u32,
+    /// Which general-purpose counter, when `route` is 2. Was padding in the
+    /// first cut of version 1 and always written as zero, so a caller that
+    /// passes back what `nc_bm_pmu_enable` filled in is compatible either way.
+    pub route_index: u32,
 }
 
 /// The ABI version this module was built with.
@@ -83,15 +86,23 @@ pub unsafe extern "C" fn nc_bm_pmu_read(pmu: *const nc_bm_pmu_t, out: *mut u64) 
     let (Some(flat), Some(out)) = (unsafe { pmu.as_ref() }, unsafe { out.as_mut() }) else {
         return 0;
     };
-    // Re-detect rather than trusting the caller's struct to describe *this*
-    // core: on a hybrid part a struct filled on another core names counters
-    // this one may not have.
+    // The route is taken from what `nc_bm_pmu_enable` returned, not
+    // re-established here. Re-enabling on every read — what this used to do,
+    // because a freshly detected PMU never has a route — reprograms and
+    // resets the counters between the two reads of an interval, so the
+    // difference measured nothing.
     let mut live = CorePmu::detect();
-    if route_code(live.route) != flat.route {
-        // SAFETY: forwarded from this function's own contract.
-        unsafe { live.enable() };
-    }
-    // SAFETY: as above.
+    live.route = match flat.route {
+        1 => CounterRoute::Fixed,
+        // The index is checked against this core's own count: an
+        // out-of-range `RDPMC` index is #GP, and the struct is caller memory.
+        2 if flat.route_index < live.leaf.general_counters as u32 => {
+            CounterRoute::General(flat.route_index)
+        }
+        _ => return 0,
+    };
+    // SAFETY: forwarded from this function's own contract; the route names a
+    // counter this core has, programmed by `nc_bm_pmu_enable`.
     match unsafe { live.read_cycles() } {
         Some(r) => {
             *out = r.value;
@@ -136,7 +147,7 @@ pub extern "C" fn nc_bm_counter_source() -> u32 {
 pub extern "C" fn nc_bm_counter_source_set(counter: u32) -> u32 {
     let source = crate::arch::CounterSource::from_u8(counter as u8);
     let previous = crate::arch::counter_source();
-    crate::arch::set_counter_source(source);
+    let _ = crate::arch::set_counter_source(source);
     previous.as_u8() as u32
 }
 
@@ -155,7 +166,10 @@ fn flatten(pmu: &CorePmu) -> nc_bm_pmu_t {
             CoreType::Unknown(_) => 3,
         },
         route: route_code(pmu.route),
-        _pad: 0,
+        route_index: match pmu.route {
+            crate::pmu::CounterRoute::General(i) => i,
+            _ => 0,
+        },
     }
 }
 

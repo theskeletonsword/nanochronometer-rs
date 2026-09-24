@@ -41,19 +41,26 @@
 use crate::acpi;
 use crate::clock::Clock;
 use crate::draw::{self, Palette, Tween};
+#[cfg(x86_any)]
 use crate::gpio::Mapping;
+#[cfg(x86_any)]
 use crate::i2c_hid::{Discovery, GateState};
 use crate::framebuffer::{Colour, Framebuffer};
 use crate::input::{Event, Input, Motion};
+use nanochrono_core::power_confirm::{Action, Confirm, Outcome};
+use nanochrono_core::crosscheck::{CrossCheck, Unwrap, Verdict};
+use nanochrono_core::space_mode::SpaceMode;
+use nanochrono_core::{Integrity, Protected};
 use crate::multiboot::Memory;
 use crate::pmu::{CorePmu, CounterRoute};
 use crate::text::{self, Text};
-use crate::typeface::{Face, BODY, HEADING, READOUT, READOUT_BIG, TITLE};
+use crate::typeface::{Face, BODY, HEADING, READOUT, READOUT_BIG};
 
 // Set 1 scancodes for everything the interface binds.
 const SCAN_1: u8 = 0x02;
 const SCAN_2: u8 = 0x03;
 const SCAN_3: u8 = 0x04;
+const SCAN_4: u8 = 0x05;
 const SCAN_B: u8 = 0x30;
 const SCAN_C: u8 = 0x2E;
 const SCAN_H: u8 = 0x23;
@@ -65,6 +72,11 @@ const SCAN_R: u8 = 0x13;
 const SCAN_S: u8 = 0x1F;
 const SCAN_U: u8 = 0x16;
 const SCAN_Z: u8 = 0x2C;
+const SCAN_T: u8 = 0x14;
+const SCAN_G: u8 = 0x22;
+const SCAN_V: u8 = 0x2F;
+const SCAN_K: u8 = 0x25;
+const SCAN_ESC: u8 = 0x01;
 const SCAN_SPACE: u8 = 0x39;
 const SCAN_TAB: u8 = 0x0F;
 const SCAN_UP: u8 = 0x48;
@@ -90,16 +102,19 @@ enum Tab {
     Clock,
     Stopwatch,
     Timer,
+    /// The ISA kernels and RustCrypto, run on demand.
+    Bench,
 }
 
 impl Tab {
-    const ALL: [Tab; 3] = [Tab::Clock, Tab::Stopwatch, Tab::Timer];
+    const ALL: [Tab; 4] = [Tab::Clock, Tab::Stopwatch, Tab::Timer, Tab::Bench];
 
     const fn name(self) -> &'static str {
         match self {
             Tab::Clock => "CLOCK",
             Tab::Stopwatch => "STOPWATCH",
             Tab::Timer => "TIMER",
+            Tab::Bench => "BENCH",
         }
     }
 }
@@ -113,16 +128,23 @@ enum Panel {
     Memory,
     Usb,
     Hypervisor,
+    /// The task manager: CPU active time, frequency, IPC, and where the
+    /// loop's time went.
+    Tasks,
+    /// Settings: the counter source.
+    Settings,
 }
 
 impl Panel {
-    const ALL: [Panel; 6] = [
+    const ALL: [Panel; 8] = [
         Panel::Cpu,
         Panel::Pmu,
         Panel::Counter,
         Panel::Memory,
         Panel::Usb,
         Panel::Hypervisor,
+        Panel::Tasks,
+        Panel::Settings,
     ];
 
     const fn name(self) -> &'static str {
@@ -133,6 +155,8 @@ impl Panel {
             Panel::Memory => "MEMORY",
             Panel::Usb => "USB",
             Panel::Hypervisor => "HYPERVISOR",
+            Panel::Tasks => "TASKS",
+            Panel::Settings => "SETTINGS",
         }
     }
 
@@ -142,6 +166,8 @@ impl Panel {
             Panel::Counter => "CNT",
             Panel::Memory => "MEM",
             Panel::Hypervisor => "HYP",
+            Panel::Tasks => "TASK",
+            Panel::Settings => "SET",
             other => other.name(),
         }
     }
@@ -412,13 +438,18 @@ impl Machine {
 /// measurement that nothing else would ever notice. The value carries a
 /// Hamming code and three replicas, so a single flip is corrected on read and
 /// a double flip is reported rather than believed.
+///
+/// Every stored counter value is protected, not only the total: while a run
+/// is in progress the total is usually zero and the reading is all
+/// `started_at`, so a flip there is the one that matters. When each is
+/// checked is [`SpaceMode`]'s decision, not this struct's.
 struct Stopwatch {
     running: bool,
     /// Counter ticks banked from previous runs.
-    accumulated: nanochrono_core::Protected,
+    accumulated: Protected,
     /// The counter when the current run started.
-    started_at: u64,
-    laps: [u64; Stopwatch::MAX_LAPS],
+    started_at: Protected,
+    laps: [Protected; Stopwatch::MAX_LAPS],
     lap_count: usize,
     /// The worst integrity verdict seen since the last reset.
     integrity: nanochrono_core::Integrity,
@@ -430,54 +461,78 @@ impl Stopwatch {
     fn new() -> Stopwatch {
         Stopwatch {
             running: false,
-            accumulated: nanochrono_core::Protected::new(0),
-            started_at: 0,
-            laps: [0; Stopwatch::MAX_LAPS],
+            accumulated: Protected::new(0),
+            started_at: Protected::new(0),
+            laps: [Protected::new(0); Stopwatch::MAX_LAPS],
             lap_count: 0,
-            integrity: nanochrono_core::Integrity::Clean,
+            integrity: Integrity::Clean,
         }
     }
 
-    /// Ticks elapsed, verifying the accumulator as it is read.
-    fn ticks(&mut self, now: u64) -> u64 {
-        let (banked, verdict) = self.accumulated.get_verified();
-        self.integrity = self.integrity.max(verdict);
-        if self.running {
-            banked + now.wrapping_sub(self.started_at)
+    /// Ticks elapsed. With `verify` the stored values are checked (and
+    /// repaired) first; without it they are plain loads — see [`SpaceMode`].
+    /// Returns the worst verdict of this read.
+    fn ticks(&mut self, now: u64, verify: bool) -> (u64, Integrity) {
+        let mut worst = Integrity::Clean;
+        if verify {
+            worst = self.accumulated.verify().max(self.started_at.verify());
+            self.integrity = self.integrity.max(worst);
+        }
+        let banked = self.accumulated.get();
+        let ticks = if self.running {
+            banked + now.wrapping_sub(self.started_at.get())
         } else {
             banked
-        }
+        };
+        (ticks, worst)
     }
 
-    fn toggle(&mut self, now: u64) {
+    /// Checks and repairs every stored value; the worst verdict.
+    fn scrub(&mut self) -> Integrity {
+        let mut worst = self.accumulated.verify().max(self.started_at.verify());
+        for lap in &mut self.laps[..self.lap_count] {
+            worst = worst.max(lap.verify());
+        }
+        self.integrity = self.integrity.max(worst);
+        worst
+    }
+
+    /// Always verified: a pause writes the total back, and a flipped bit
+    /// banked here would be re-encoded as good.
+    fn toggle(&mut self, now: u64) -> Integrity {
         if self.running {
-            let banked = self.ticks(now);
+            let (banked, verdict) = self.ticks(now, true);
             self.accumulated.set(banked);
             self.running = false;
+            verdict
         } else {
-            self.started_at = now;
+            self.started_at.set(now);
             self.running = true;
+            Integrity::Clean
         }
     }
 
     fn reset(&mut self) {
         self.running = false;
         self.accumulated.set(0);
+        self.started_at.set(0);
         self.lap_count = 0;
-        self.laps = [0; Stopwatch::MAX_LAPS];
-        self.integrity = nanochrono_core::Integrity::Clean;
+        self.laps = [Protected::new(0); Stopwatch::MAX_LAPS];
+        self.integrity = Integrity::Clean;
     }
 
-    /// Records a lap, dropping the oldest once the table is full.
-    fn lap(&mut self, now: u64) {
-        let ticks = self.ticks(now);
+    /// Records a lap, dropping the oldest once the table is full. Verified,
+    /// for the same reason as [`toggle`](Self::toggle).
+    fn lap(&mut self, now: u64) -> Integrity {
+        let (ticks, verdict) = self.ticks(now, true);
         if self.lap_count == Stopwatch::MAX_LAPS {
             self.laps.rotate_left(1);
-            self.laps[Stopwatch::MAX_LAPS - 1] = ticks;
+            self.laps[Stopwatch::MAX_LAPS - 1].set(ticks);
         } else {
-            self.laps[self.lap_count] = ticks;
+            self.laps[self.lap_count].set(ticks);
             self.lap_count += 1;
         }
+        verdict
     }
 }
 
@@ -485,10 +540,10 @@ impl Stopwatch {
 struct Timer {
     running: bool,
     /// What it counts down from, in nanoseconds.
-    target_ns: u64,
+    target_ns: Protected,
     /// Counter ticks already spent.
-    spent: u64,
-    started_at: u64,
+    spent: Protected,
+    started_at: Protected,
     /// Set when it reaches zero, cleared by a reset. What makes the readout
     /// go red and stay there rather than blinking past.
     expired: bool,
@@ -503,54 +558,71 @@ impl Timer {
     fn new() -> Timer {
         Timer {
             running: false,
-            target_ns: Timer::DEFAULT_NS,
-            spent: 0,
-            started_at: 0,
+            target_ns: Protected::new(Timer::DEFAULT_NS),
+            spent: Protected::new(0),
+            started_at: Protected::new(0),
             expired: false,
         }
     }
 
     fn elapsed_ticks(&self, now: u64) -> u64 {
         if self.running {
-            self.spent + now.wrapping_sub(self.started_at)
+            self.spent.get() + now.wrapping_sub(self.started_at.get())
         } else {
-            self.spent
+            self.spent.get()
         }
     }
 
-    /// Nanoseconds left, saturating at zero.
-    fn remaining_ns(&mut self, now: u64, clock: &Clock) -> u64 {
+    /// Checks and repairs every stored value; the worst verdict.
+    fn scrub(&mut self) -> Integrity {
+        self.target_ns
+            .verify()
+            .max(self.spent.verify())
+            .max(self.started_at.verify())
+    }
+
+    /// Nanoseconds left, saturating at zero, and the verdict if `verify`.
+    fn remaining_ns(&mut self, now: u64, clock: &Clock, verify: bool) -> (u64, Integrity) {
+        let verdict = if verify { self.scrub() } else { Integrity::Clean };
         let spent = clock.calibration.ticks_to_ns(self.elapsed_ticks(now));
-        if spent >= self.target_ns {
+        let target = self.target_ns.get();
+        if spent >= target {
             if self.running {
                 // Stopped rather than left running past zero: the counter
                 // would keep climbing and the display would be showing a
                 // saturated number that is no longer measuring anything.
-                self.spent = self.elapsed_ticks(now);
+                // Verified first: this stores the total.
+                let verdict = verdict.max(self.scrub());
+                self.spent.set(self.elapsed_ticks(now));
                 self.running = false;
                 self.expired = true;
+                return (0, verdict);
             }
-            return 0;
+            return (0, verdict);
         }
-        self.target_ns - spent
+        (target - spent, verdict)
     }
 
-    fn toggle(&mut self, now: u64) {
+    /// Verified, like the stopwatch's: a pause stores the total.
+    fn toggle(&mut self, now: u64) -> Integrity {
         if self.expired {
-            return;
+            return Integrity::Clean;
         }
         if self.running {
-            self.spent = self.elapsed_ticks(now);
+            let verdict = self.scrub();
+            self.spent.set(self.elapsed_ticks(now));
             self.running = false;
+            verdict
         } else {
-            self.started_at = now;
+            self.started_at.set(now);
             self.running = true;
+            Integrity::Clean
         }
     }
 
     fn reset(&mut self) {
         self.running = false;
-        self.spent = 0;
+        self.spent.set(0);
         self.expired = false;
     }
 
@@ -558,15 +630,14 @@ impl Timer {
         if self.running {
             return;
         }
-        self.target_ns = if up {
-            self.target_ns.saturating_add(Timer::STEP_NS)
+        let target = self.target_ns.get();
+        self.target_ns.set(if up {
+            target.saturating_add(Timer::STEP_NS)
         } else {
-            self.target_ns
-                .saturating_sub(Timer::STEP_NS)
-                .max(Timer::STEP_NS)
-        };
+            target.saturating_sub(Timer::STEP_NS).max(Timer::STEP_NS)
+        });
         self.expired = false;
-        self.spent = 0;
+        self.spent.set(0);
     }
 }
 
@@ -627,8 +698,8 @@ struct Ui {
 
     /// The tab controls, the panel chips, the precision toggle and the two
     /// title-bar buttons.
-    tabs: [Control; 3],
-    chips: [Control; 6],
+    tabs: [Control; 4],
+    chips: [Control; 8],
     precision_chip: Control,
     restart: Control,
     shutdown: Control,
@@ -677,6 +748,256 @@ struct Ui {
     last_readout: Text<24>,
     last_header_clock: Text<24>,
     last_load: Text<8>,
+
+    /// The task manager's figures, refreshed once a second.
+    stats: TaskStats,
+    /// The outcome of the last re-probe request (HYPERVISOR panel).
+    reprobe_status: Text<32>,
+
+    /// The code a restart or power-off waits for. See
+    /// [`nanochrono_core::power_confirm`]: one key must not be enough,
+    /// because one key is what a BadUSB presses.
+    power: Confirm,
+    /// When stored state is checked for flipped bits. See
+    /// [`nanochrono_core::space_mode`].
+    space: SpaceMode,
+    /// The counter against the PM timer and the RTC.
+    checks: Option<ClockChecks>,
+    /// Cycles and instructions over the stopwatch's runs.
+    stopwatch_pmu: PmuTally,
+    /// The benchmark tab's last results, and a run asked for.
+    bench: crate::bench::Results,
+    bench_requested: bool,
+    bench_dirty: bool,
+    /// What the key legend showed last, per [`hint_signature`], so it is
+    /// repainted when the prompt or its countdown changes and not otherwise.
+    hint_state: u64,
+}
+
+/// What the core did while the stopwatch ran: cycles and instructions from
+/// the PMU, summed over every run between reset and now.
+///
+/// Read at start and stop, and folded once a frame while running — never
+/// inside a measurement, only after the counter has been read. The frame
+/// fold is what keeps a narrow counter honest: AArch64 counts instructions
+/// in 32 bits, which wrap several times a second at full speed, and a delta
+/// taken across more than one wrap is wrong. The counts are the whole
+/// core's, the interface's own drawing included.
+#[derive(Clone, Copy, Default)]
+struct PmuTally {
+    running: bool,
+    last_cycles: Option<u64>,
+    last_instructions: Option<u64>,
+    cycles: u64,
+    instructions: u64,
+    cycles_width: u8,
+    instructions_width: u8,
+    /// Whether any reading ever arrived, for the card to say so.
+    counted: bool,
+}
+
+/// `b - a` for a counter `width` bits wide, across at most one wrap.
+fn counter_delta(a: u64, b: u64, width: u8) -> u64 {
+    let d = b.wrapping_sub(a);
+    if width == 0 || width >= 64 { d } else { d & ((1u64 << width) - 1) }
+}
+
+impl PmuTally {
+    /// # Safety
+    /// Ring 0 / EL1; the PMU was enabled by `CorePmu::enable`.
+    unsafe fn read(pmu: &CorePmu) -> (Option<u64>, Option<u64>) {
+        if pmu.route == CounterRoute::None {
+            return (None, None);
+        }
+        // SAFETY: forwarded from this function's own contract.
+        unsafe { (pmu.read_cycles().map(|r| r.value), pmu.read_instructions().map(|r| r.value)) }
+    }
+
+    /// # Safety
+    /// As [`read`](Self::read).
+    unsafe fn start(&mut self, pmu: &CorePmu) {
+        // SAFETY: forwarded.
+        let (c, i) = unsafe { Self::read(pmu) };
+        self.last_cycles = c;
+        self.last_instructions = i;
+        self.cycles_width = match pmu.route {
+            CounterRoute::General(_) => pmu.leaf.general_width,
+            _ => pmu.leaf.fixed_width,
+        };
+        self.instructions_width =
+            if cfg!(target_arch = "aarch64") { 32 } else { pmu.leaf.fixed_width };
+        self.running = true;
+    }
+
+    /// Adds what was counted since the last read.
+    ///
+    /// # Safety
+    /// As [`read`](Self::read).
+    unsafe fn fold(&mut self, pmu: &CorePmu) {
+        if !self.running {
+            return;
+        }
+        // SAFETY: forwarded.
+        let (c, i) = unsafe { Self::read(pmu) };
+        if let (Some(a), Some(b)) = (self.last_cycles, c) {
+            self.cycles += counter_delta(a, b, self.cycles_width);
+            self.counted = true;
+        }
+        if let (Some(a), Some(b)) = (self.last_instructions, i) {
+            self.instructions += counter_delta(a, b, self.instructions_width);
+        }
+        self.last_cycles = c;
+        self.last_instructions = i;
+    }
+
+    /// # Safety
+    /// As [`read`](Self::read).
+    unsafe fn stop(&mut self, pmu: &CorePmu) {
+        // SAFETY: forwarded.
+        unsafe { self.fold(pmu) };
+        self.running = false;
+    }
+
+    fn reset(&mut self) {
+        *self = PmuTally::default();
+    }
+}
+
+/// The counter checked against two clocks that do not share its failure
+/// modes. See [`nanochrono_core::crosscheck`].
+///
+/// - The ACPI PM timer: its own counter at 3.579545 MHz. Read back to back
+///   with the counter once a second, so a pairing is good to a microsecond
+///   or two and a rate is judged within a minute.
+/// - The RTC: its own 32.768 kHz crystal, the one clock here that shares no
+///   oscillator with anything else. It only says when a second changes, so
+///   its seconds register is polled — and only in a window around the
+///   expected change, not all the time. Coarser, so it takes longer to judge
+///   a rate; it catches steps from the first seconds.
+struct ClockChecks {
+    pm: Option<(CrossCheck, Unwrap, (u16, bool))>,
+    rtc: CrossCheck,
+    rtc_last: Option<u8>,
+    rtc_edges: u64,
+    /// When to start polling for the next RTC edge (ns since start).
+    rtc_poll_from: u64,
+}
+
+/// How early before the expected RTC edge polling starts.
+const RTC_WINDOW_NS: u64 = 50_000_000;
+/// The pacing loop's longest idle slice: the RTC edge's timing uncertainty.
+const RTC_POLL_NS: u64 = 2_000_000;
+
+impl ClockChecks {
+    fn new(hz: u64, acpi: Option<&acpi::PowerRegisters>) -> ClockChecks {
+        ClockChecks {
+            // The ACPI PM timer is an x86 fixture; elsewhere there is none.
+            #[cfg(x86_any)]
+            pm: acpi.and_then(|a| a.pm_timer).map(|timer| {
+                (
+                    CrossCheck::new(hz, acpi::PM_TIMER_HZ, 200, 2_000),
+                    Unwrap::new(if timer.1 { 32 } else { 24 }),
+                    timer,
+                )
+            }),
+            #[cfg(not(x86_any))]
+            pm: {
+                let _ = (hz, acpi);
+                None
+            },
+            rtc: CrossCheck::new(hz, 1, 500, RTC_POLL_NS),
+            rtc_last: None,
+            rtc_edges: 0,
+            rtc_poll_from: 0,
+        }
+    }
+
+    /// One PM-timer pairing. Once a second: the 24-bit timer wraps every
+    /// 4.7 s, and nothing is gained by more.
+    ///
+    /// # Safety
+    /// Port I/O; requires ring 0.
+    unsafe fn sample_pm(&mut self) -> Option<Verdict> {
+        let (check, unwrap, timer) = self.pm.as_mut()?;
+        let before = crate::arch::counter_ordered();
+        // SAFETY: forwarded from this function's own contract.
+        #[cfg(x86_any)]
+        let raw = unsafe { acpi::read_pm_timer(*timer) };
+        #[cfg(not(x86_any))]
+        let raw: u32 = {
+            let _ = timer;
+            0
+        };
+        let after = crate::arch::counter_ordered();
+        let reference = unwrap.feed(raw as u64);
+        Some(check.sample(before + after.wrapping_sub(before) / 2, reference))
+    }
+
+    /// Looks for an RTC edge, if one is due. Returns whether it sampled.
+    ///
+    /// # Safety
+    /// Port I/O; requires ring 0.
+    unsafe fn poll_rtc(&mut self, now_ns: u64) -> bool {
+        if now_ns < self.rtc_poll_from {
+            return false;
+        }
+        // SAFETY: forwarded from this function's own contract.
+        let Some(second) = (unsafe { crate::clock::rtc_second_raw() }) else {
+            return false;
+        };
+        let counter = crate::arch::counter_ordered();
+        let changed = self.rtc_last.is_some_and(|last| last != second);
+        self.rtc_last = Some(second);
+        if !changed {
+            return false;
+        }
+        self.rtc_edges += 1;
+        self.rtc.sample(counter, self.rtc_edges);
+        self.rtc_poll_from = now_ns + 1_000_000_000 - RTC_WINDOW_NS;
+        true
+    }
+}
+
+/// The instruction set this kernel was built for, with the name people
+/// search for next to the formal one.
+const ARCHITECTURE: &str = if cfg!(target_arch = "x86_64") {
+    "x86_64 (x64)"
+} else if cfg!(target_arch = "x86") {
+    "i386 (x86, 32-bit)"
+} else if cfg!(target_arch = "aarch64") {
+    "aarch64 (arm64)"
+} else if cfg!(target_arch = "arm") {
+    "arm32 (armv7-a)"
+} else if cfg!(all(target_arch = "powerpc64", target_endian = "little")) {
+    "ppc64le (power, little-endian)"
+} else if cfg!(target_arch = "powerpc64") {
+    "ppc64 (power, big-endian)"
+} else if cfg!(target_arch = "powerpc") {
+    "ppc (32-bit)"
+} else if cfg!(target_arch = "riscv64") {
+    "riscv64 (rv64gc)"
+} else if cfg!(target_arch = "riscv32") {
+    "riscv32 (rv32imac)"
+} else {
+    "unknown"
+};
+
+/// How this architecture turns itself off, for the machine card.
+const POWER_MECHANISM: &str = if cfg!(x86_any) {
+    "acpi"
+} else if cfg!(any(target_arch = "aarch64", target_arch = "arm")) {
+    "psci"
+} else if cfg!(any(target_arch = "riscv32", target_arch = "riscv64")) {
+    "sbi srst"
+} else {
+    "opal"
+};
+
+/// What the TASKS panel shows: the last second, per [`crate::cpuload`].
+#[derive(Default, Clone, Copy)]
+struct TaskStats {
+    load: crate::cpuload::Load,
+    ticks: [u64; 5],
 }
 
 impl Ui {
@@ -687,8 +1008,8 @@ impl Ui {
             precision: Precision::Nano,
             stopwatch: Stopwatch::new(),
             timer: Timer::new(),
-            tabs: [Control::new(); 3],
-            chips: [Control::new(); 6],
+            tabs: [Control::new(); 4],
+            chips: [Control::new(); 8],
             precision_chip: Control::new(),
             restart: Control::new(),
             shutdown: Control::new(),
@@ -711,6 +1032,30 @@ impl Ui {
             last_readout: Text::new(),
             last_header_clock: Text::new(),
             last_load: Text::new(),
+            stats: TaskStats::default(),
+            reprobe_status: Text::new(),
+            power: Confirm::new(),
+            space: SpaceMode::new(),
+            checks: None,
+            stopwatch_pmu: PmuTally::default(),
+            bench: crate::bench::Results::new(),
+            bench_requested: false,
+            bench_dirty: true,
+            hint_state: 0,
+        }
+    }
+
+    /// Feeds a verified read's (or a scrub's) verdict to the space-mode
+    /// policy, and repaints what reports it when the mode changes.
+    fn note_integrity(&mut self, verdict: Integrity, now_ns: u64) {
+        self.record_integrity(verdict, now_ns, false);
+    }
+
+    fn record_integrity(&mut self, verdict: Integrity, now_ns: u64, was_scrub: bool) {
+        let before = (self.space.mode(), self.space.unrecoverable(), self.space.detections());
+        self.space.record(verdict, now_ns, was_scrub);
+        if before != (self.space.mode(), self.space.unrecoverable(), self.space.detections()) {
+            self.cards_dirty = true;
         }
     }
 
@@ -809,12 +1154,13 @@ pub unsafe fn run(fb: &Framebuffer, memory: Memory) -> ! {
     ui.pointer_y = fb.height as i32 / 2;
     ui.cursor.move_to(ui.pointer_x, ui.pointer_y);
     ui.window_started = clock.elapsed_ticks();
+    ui.checks = Some(ClockChecks::new(clock.calibration.hz, machine.acpi.as_ref()));
 
     // The first frame is a full repaint; everything after it is regional.
     fb.clear(p.background);
     header(fb, &p, &layout, &mut ui, &machine);
     tab_bar(fb, &p, &layout, &mut ui);
-    hint_bar(fb, &p, &layout, &ui);
+    hint_bar(fb, &p, &layout, &mut ui, clock.elapsed_ns());
     status_frame(fb, &p, &layout);
 
     // **Painted before the input stacks are brought up, not after.**
@@ -850,7 +1196,7 @@ pub unsafe fn run(fb: &Framebuffer, memory: Memory) -> ! {
         ui.input_note = Some(input.trouble());
         // The legend was drawn before the probe, when there was nothing yet
         // to say about it.
-        hint_bar(fb, &p, &layout, &ui);
+        hint_bar(fb, &p, &layout, &mut ui, clock.elapsed_ns());
         fb.present_damage();
     }
 
@@ -861,10 +1207,20 @@ pub unsafe fn run(fb: &Framebuffer, memory: Memory) -> ! {
     ui.transition_readout();
     ui.transition_cards();
 
+    // The task manager's data: activity counters (APERF/MPERF where the CPU
+    // has them), the PMU the machine probe already enabled, and a real idle
+    // wait between frames — see `cpuload`.
+    // SAFETY: ring 0, once, on the only running core.
+    unsafe { crate::cpuload::init() };
+    let pmu_for_load = (machine.route != CounterRoute::None).then_some(&machine.pmu);
+    // SAFETY: as above.
+    let mut load_sample = unsafe { crate::cpuload::sample(pmu_for_load) };
+
     let mut next_frame = 0u64;
 
     loop {
         // --- input, bounded so a moving pointer cannot starve the draw
+        crate::cpuload::switch_to(crate::cpuload::Task::Input);
         for _ in 0..EVENTS_PER_FRAME {
             // SAFETY: forwarded from this function's own contract.
             let Some(event) = (unsafe { input.poll() }) else {
@@ -876,8 +1232,21 @@ pub unsafe fn run(fb: &Framebuffer, memory: Memory) -> ! {
 
         // --- pacing
         let now_ns = clock.elapsed_ns();
+        // The RTC edge search runs at the pacing loop's rate, not the frame
+        // rate, so the edge is placed to within one idle slice.
+        if let Some(checks) = ui.checks.as_mut() {
+            // SAFETY: CPL 0.
+            if unsafe { checks.poll_rtc(now_ns) } && ui.panel == Panel::Counter {
+                ui.cards_dirty = true;
+            }
+        }
         if now_ns < next_frame {
-            core::hint::spin_loop();
+            // A real wait (TPAUSE where the CPU has WAITPKG), in slices of at
+            // most 2 ms so input is still polled promptly.
+            let wait = (next_frame - now_ns).min(2_000_000);
+            crate::cpuload::idle_until(
+                crate::arch::counter_ordered().wrapping_add(clock.calibration.ns_to_ticks(wait)),
+            );
             continue;
         }
         // Set from the current time rather than incremented, so a frame that
@@ -885,49 +1254,106 @@ pub unsafe fn run(fb: &Framebuffer, memory: Memory) -> ! {
         // frames it cannot draw either.
         next_frame = now_ns + FRAME_NS;
 
+        // --- the space-mode scrub: once a second in Normal mode, never inside
+        // a measurement (every counter read above has already happened).
+        if ui.stopwatch_pmu.running {
+            // SAFETY: ring 0; the PMU was enabled at probe.
+            unsafe { ui.stopwatch_pmu.fold(&machine.pmu) };
+        }
+        if core::mem::take(&mut ui.bench_requested) {
+            // Said before the few seconds of silence the run takes.
+            let top = layout.tabs_y + layout.tabs_h + 8;
+            fb.fill(0, top, layout.width, layout.cards_y.saturating_sub(top + 8), p.background);
+            draw::text_centred(fb, &HEADING, layout.readout_x, layout.readout_w,
+                (top + layout.cards_y) / 2, "running the benchmarks...", p.muted);
+            fb.present_damage();
+            // SAFETY: ring 0 / EL1 / supervisor, which the kernels and PMU need.
+            unsafe { crate::bench::run_all(clock.calibration.hz, &machine.pmu, &mut ui.bench) };
+            ui.bench_dirty = true;
+            ui.refresh_cards();
+        }
+        if ui.space.scrub_due(now_ns) {
+            let worst = ui.stopwatch.scrub().max(ui.timer.scrub());
+            ui.record_integrity(worst, now_ns, true);
+        }
+
         let frame_start = clock.elapsed_ticks();
+        crate::cpuload::switch_to(crate::cpuload::Task::Render);
 
         // --- the frame
         if input.has_pointer() {
             ui.cursor.erase(fb);
-            fb.present_damage();
+            present(fb);
         }
 
         header_clock(fb, &p, &layout, &mut ui, &clock);
-        fb.present_damage();
+        present(fb);
 
         if tab_bar(fb, &p, &layout, &mut ui) {
-            fb.present_damage();
+            present(fb);
         }
 
         readout(fb, &p, &layout, &mut ui, &clock);
-        fb.present_damage();
+        present(fb);
 
         if core::mem::take(&mut ui.cards_dirty) | !ui.cards_fade.settled() {
             ui.cards_fade.step();
             cards(fb, &p, &layout, &mut ui, &machine, &clock, &input);
-            fb.present_damage();
+            present(fb);
         }
 
         status_bar(fb, &p, &layout, &mut ui, &machine, &clock, &input);
-        fb.present_damage();
+        present(fb);
+
+        if hint_signature(&ui, clock.elapsed_ns()) != ui.hint_state {
+            hint_bar(fb, &p, &layout, &mut ui, clock.elapsed_ns());
+            present(fb);
+        }
 
         if input.has_pointer() {
             ui.cursor.draw(fb, &p);
-            fb.present_damage();
+            present(fb);
         }
 
         // --- how much of the frame was spent drawing
         let spent = clock.elapsed_ticks().wrapping_sub(frame_start);
         ui.busy_ticks += spent;
         let elapsed = clock.elapsed_ticks().wrapping_sub(ui.window_started);
+        crate::cpuload::switch_to(crate::cpuload::Task::Measure);
         if elapsed >= clock.calibration.hz {
+            // SAFETY: as at `cpuload::init`.
+            let sample = unsafe { crate::cpuload::sample(pmu_for_load) };
+            ui.stats = TaskStats {
+                load: crate::cpuload::between(&load_sample, &sample, clock.calibration.hz),
+                ticks: crate::cpuload::take_task_ticks(),
+            };
+            load_sample = sample;
+            if let Some(checks) = ui.checks.as_mut() {
+                // SAFETY: CPL 0.
+                unsafe { checks.sample_pm() };
+            }
+            // The re-probe countdown ticks once a second too, and so do the
+            // clock cross-checks.
+            if ui.panel == Panel::Tasks
+                || ui.panel == Panel::Counter
+                || (ui.panel == Panel::Hypervisor
+                    && crate::hypervisor::reprobe_wait_s(clock.calibration.hz) > 0)
+            {
+                ui.cards_dirty = true;
+            }
             ui.window_ticks = elapsed;
             ui.load_permille = (ui.busy_ticks * 1000 / elapsed.max(1)).min(1000) as u32;
             ui.busy_ticks = 0;
             ui.window_started = clock.elapsed_ticks();
         }
     }
+}
+
+/// Copies the damaged region out, charged to the "present" task.
+fn present(fb: &Framebuffer) {
+    crate::cpuload::switch_to(crate::cpuload::Task::Present);
+    fb.present_damage();
+    crate::cpuload::switch_to(crate::cpuload::Task::Render);
 }
 
 /// Acts on one input event.
@@ -953,38 +1379,75 @@ unsafe fn handle(
         ui.refresh_cards();
     }
 
+    // Every event's arrival time goes into the confirmation's pool: the
+    // nanosecond a human or a USB poll lands on is not something a script
+    // typing blind can choose.
+    ui.power.stir(crate::arch::counter_ordered() ^ hw_entropy());
+    let now_ns = clock.elapsed_ns();
+
+    // While a code is on screen every key belongs to it: digits answer, Esc
+    // cancels, anything else cancels too — a script that fires its next
+    // binding has not answered, and must not reach that binding either.
+    if ui.power.is_pending(now_ns) {
+        if let Event::Key(k) = event {
+            if k.pressed {
+                match digit_of(k.scancode) {
+                    Some(d) => match ui.power.digit(d, now_ns) {
+                        // SAFETY: forwarded from this function's own contract.
+                        Outcome::Confirmed(action) => unsafe { carry_out(action, fb, p, layout, machine) },
+                        Outcome::Pending | Outcome::Rejected | Outcome::Idle => {}
+                    },
+                    None => ui.power.cancel(),
+                }
+            }
+            return;
+        }
+    }
+
     match event {
         Event::Key(k) if k.pressed => match k.scancode {
-            SCAN_R => {
-                // SAFETY: forwarded from this function's own contract.
-                unsafe { acpi::reboot(machine.acpi.as_ref()) }
-            }
-            SCAN_S => {
-                // SAFETY: as above.
-                unsafe { power_off(fb, p, layout, machine.acpi.as_ref()) }
-            }
+            SCAN_R => request_power(ui, Action::Restart, now_ns),
+            SCAN_S => request_power(ui, Action::Shutdown, now_ns),
+            SCAN_ESC => ui.power.cancel(),
             SCAN_1 | SCAN_C => ui.select_tab(Tab::Clock),
             SCAN_2 => ui.select_tab(Tab::Stopwatch),
             SCAN_3 => ui.select_tab(Tab::Timer),
+            SCAN_4 => ui.select_tab(Tab::Bench),
             SCAN_SPACE | SCAN_P => {
-                match ui.tab {
+                let verdict = match ui.tab {
                     Tab::Stopwatch => ui.stopwatch.toggle(now),
                     Tab::Timer => ui.timer.toggle(now),
-                    Tab::Clock => {}
-                }
+                    Tab::Clock => Integrity::Clean,
+                    Tab::Bench => {
+                        ui.bench_requested = true;
+                        Integrity::Clean
+                    }
+                };
+                // SAFETY: ring 0; the PMU was enabled at probe.
+                unsafe { sync_stopwatch_pmu(ui, machine) };
+                ui.note_integrity(verdict, now_ns);
                 ui.refresh_cards();
             }
             SCAN_L if ui.tab == Tab::Stopwatch => {
-                ui.stopwatch.lap(now);
+                let verdict = ui.stopwatch.lap(now);
+                ui.note_integrity(verdict, now_ns);
                 ui.transition_cards();
             }
             SCAN_Z => match ui.tab {
                 Tab::Stopwatch => {
                     ui.stopwatch.reset();
+                    ui.stopwatch_pmu.reset();
+                    // The damaged state is gone; so is the reason to latch.
+                    ui.space.clear_unrecoverable();
                     ui.transition_cards();
                 }
                 Tab::Timer => {
                     ui.timer.reset();
+                    ui.refresh_cards();
+                }
+                Tab::Bench => {
+                    ui.bench = crate::bench::Results::new();
+                    ui.bench_dirty = true;
                     ui.refresh_cards();
                 }
                 Tab::Clock => {}
@@ -1003,6 +1466,28 @@ unsafe fn handle(
             SCAN_M => ui.select_panel(Panel::Memory),
             SCAN_U => ui.select_panel(Panel::Usb),
             SCAN_H => ui.select_panel(Panel::Hypervisor),
+            SCAN_T => ui.select_panel(Panel::Tasks),
+            SCAN_G => ui.select_panel(Panel::Settings),
+            // Re-probe the hypervisor: the one way to repeat the boot-time
+            // negotiation, behind the cooldown. See `crate::hypervisor`.
+            SCAN_V => {
+                ui.reprobe_status.clear();
+                // SAFETY: forwarded from this function's own contract (ring 0).
+                match unsafe { crate::hypervisor::reprobe(clock.calibration.hz) } {
+                    Ok(_) => {
+                        ui.reprobe_status.str("re-probed");
+                    }
+                    Err(left) => {
+                        ui.reprobe_status.str("wait ").num(left as u64).str(" s (cooldown)");
+                    }
+                }
+                ui.select_panel(Panel::Hypervisor);
+                ui.refresh_cards();
+            }
+            SCAN_K if ui.panel == Panel::Settings => {
+                crate::hypervisor::set_cooldown_enabled(!crate::hypervisor::cooldown_enabled());
+                ui.refresh_cards();
+            }
             SCAN_TAB => {
                 let next = Panel::ALL
                     .iter()
@@ -1014,29 +1499,25 @@ unsafe fn handle(
         },
         Event::Key(_) => {}
         Event::Motion(m) => {
-            // SAFETY: forwarded from this function's own contract.
-            unsafe { pointer(m, ui, fb, p, layout, clock, machine) }
+            pointer(m, ui, fb, layout, clock, machine)
         }
     }
 }
 
-/// Moves the cursor and acts on a click.
-///
-/// # Safety
-/// May restart or power off the machine; requires ring 0.
-unsafe fn pointer(
-    m: Motion,
-    ui: &mut Ui,
-    fb: &Framebuffer,
-    p: &Palette,
-    layout: &Layout,
-    clock: &Clock,
-    machine: &Machine,
-) {
+/// Moves the cursor and acts on a click. The power buttons only ask for a
+/// code; nothing here restarts or powers off.
+fn pointer(m: Motion, ui: &mut Ui, fb: &Framebuffer, layout: &Layout, clock: &Clock, machine: &Machine) {
     // Clamped rather than wrapped: a cursor that leaves one edge and appears
     // at the other is not a cursor.
-    ui.pointer_x = (ui.pointer_x + m.dx).clamp(0, fb.width as i32 - 1);
-    ui.pointer_y = (ui.pointer_y + m.dy).clamp(0, fb.height as i32 - 1);
+    //
+    // Saturating: the delta is whatever the device put in its report — a
+    // 32-bit HID field from a hostile device can hold i32::MAX — and the
+    // bounds are floored at zero so a zero-sized mode cannot hand `clamp`
+    // an inverted range, which panics.
+    let max_x = (fb.width as i32).saturating_sub(1).max(0);
+    let max_y = (fb.height as i32).saturating_sub(1).max(0);
+    ui.pointer_x = ui.pointer_x.saturating_add(m.dx).clamp(0, max_x);
+    ui.pointer_y = ui.pointer_y.saturating_add(m.dy).clamp(0, max_y);
     ui.cursor.move_to(ui.pointer_x, ui.pointer_y);
 
     if !m.left {
@@ -1044,14 +1525,19 @@ unsafe fn pointer(
     }
     let (x, y) = (ui.pointer_x, ui.pointer_y);
 
+    // A click is as easy to inject as a key — a BadUSB can be a mouse and
+    // the buttons sit at fixed places — so it asks for the code too.
+    let now_ns = clock.elapsed_ns();
     if ui.restart.box_.contains(x, y) {
-        // SAFETY: forwarded from this function's own contract.
-        unsafe { acpi::reboot(machine.acpi.as_ref()) }
+        request_power(ui, Action::Restart, now_ns);
+        return;
     }
     if ui.shutdown.box_.contains(x, y) {
-        // SAFETY: as above.
-        unsafe { power_off(fb, p, layout, machine.acpi.as_ref()) }
+        request_power(ui, Action::Shutdown, now_ns);
+        return;
     }
+    // Clicking anywhere else walks away from a pending code.
+    ui.power.cancel();
     for (i, tab) in Tab::ALL.iter().enumerate() {
         if ui.tabs[i].box_.contains(x, y) {
             ui.select_tab(*tab);
@@ -1076,13 +1562,349 @@ unsafe fn pointer(
     };
     if readout_box.contains(x, y) {
         let now = clock.elapsed_ticks();
-        match ui.tab {
+        let verdict = match ui.tab {
             Tab::Stopwatch => ui.stopwatch.toggle(now),
             Tab::Timer => ui.timer.toggle(now),
-            Tab::Clock => {}
-        }
+            Tab::Clock => Integrity::Clean,
+            Tab::Bench => {
+                ui.bench_requested = true;
+                Integrity::Clean
+            }
+        };
+        // SAFETY: ring 0; the PMU was enabled at probe.
+        unsafe { sync_stopwatch_pmu(ui, machine) };
+        ui.note_integrity(verdict, now_ns);
         ui.refresh_cards();
     }
+}
+
+/// What the key legend would show at `now_ns`, reduced to a number: equal
+/// numbers draw the same pixels. Bit 63: a code is pending (with its action,
+/// digits typed and seconds left); bit 62: locked out (with seconds left).
+fn hint_signature(ui: &Ui, now_ns: u64) -> u64 {
+    if let Some((action, _, typed)) = ui.power.shown(now_ns) {
+        let left = ui.power.remaining_ns(now_ns).unwrap_or(0).div_ceil(1_000_000_000);
+        return 1 << 63 | (action as u64) << 40 | (typed as u64) << 32 | left;
+    }
+    let locked = ui.power.lockout_remaining_ns(now_ns).div_ceil(1_000_000_000);
+    if locked > 0 {
+        return 1 << 62 | locked;
+    }
+    0
+}
+
+/// "agree +3 ppm", "DRIFT -812 ppm", "STEP +5000 us (2 steps)", "absent".
+fn cross_label(check: Option<CrossCheck>) -> Text<40> {
+    let mut out = Text::<40>::new();
+    let Some(check) = check else {
+        out.str("absent");
+        return out;
+    };
+    let signed = |out: &mut Text<40>, v: i64| {
+        out.str(if v < 0 { "-" } else { "+" }).num(v.unsigned_abs());
+    };
+    match check.verdict() {
+        Verdict::Warming => {
+            out.str("warming up");
+        }
+        Verdict::Agree { ppm } | Verdict::Drift { ppm } => {
+            out.str(check.verdict().name()).str(" ");
+            signed(&mut out, ppm);
+            out.str(" ppm");
+        }
+        Verdict::Step { ns } => {
+            out.str("STEP ");
+            signed(&mut out, ns / 1000);
+            out.str(" us");
+        }
+    }
+    if check.steps() > 0 {
+        out.str(" (").num(check.steps() as u64).str(" steps)");
+    }
+    out
+}
+
+/// The PMU's part of the stopwatch card: what the core did during the runs.
+#[allow(clippy::too_many_arguments)]
+fn pmu_rows(
+    fb: &Framebuffer,
+    p: &Palette,
+    x: u32,
+    w: u32,
+    y: &mut u32,
+    ui: &mut Ui,
+    clock: &Clock,
+    machine: &Machine,
+) {
+    let t = ui.stopwatch_pmu;
+    if machine.route == CounterRoute::None {
+        // Said plainly: no architected PMU (TCG), or a hypervisor that does
+        // not pass one through (KVM with enable_pmu=N).
+        *y = row(fb, p, x, w, *y, "pmu", "unavailable - time only");
+        return;
+    }
+    if !t.counted {
+        *y = row(fb, p, x, w, *y, "pmu", "counts cycles while running");
+        return;
+    }
+    let mut cycles = Text::<24>::new();
+    cycles.num(t.cycles);
+    *y = row(fb, p, x, w, *y, "core cycles", cycles.as_str());
+    if t.instructions > 0 {
+        let mut instr = Text::<24>::new();
+        instr.num(t.instructions);
+        *y = row(fb, p, x, w, *y, "instructions", instr.as_str());
+        let mut ipc = Text::<16>::new();
+        ipc.fixed(t.instructions * 100 / t.cycles.max(1), 2);
+        *y = row(fb, p, x, w, *y, "ipc", ipc.as_str());
+    }
+    // Cycles over the time the stopwatch shows: the clock the core actually
+    // ran at during the runs, turbo and throttling included.
+    let now = clock.elapsed_ticks();
+    let (ticks, _) = ui.stopwatch.ticks(now, false);
+    let ns = clock.calibration.ticks_to_ns(ticks);
+    if ns > 0 {
+        let mut ghz = Text::<16>::new();
+        ghz.fixed((t.cycles as u128 * 1000 / ns as u128) as u64, 3).str(" GHz");
+        *y = row(fb, p, x, w, *y, "effective clock", ghz.as_str());
+    }
+}
+
+/// The benchmark results, in the space the readout uses, three groups side
+/// by side. Redrawn only when they change.
+fn bench_view(fb: &Framebuffer, p: &Palette, layout: &Layout, ui: &mut Ui) {
+    if !ui.bench_dirty && ui.last_readout.as_str() == "bench" {
+        return;
+    }
+    ui.bench_dirty = false;
+    ui.last_readout.clear();
+    ui.last_readout.str("bench");
+    let top = layout.tabs_y + layout.tabs_h + 8;
+    let bottom = layout.cards_y.saturating_sub(8);
+    fb.fill(0, top, layout.width, bottom.saturating_sub(top), p.background);
+    let line = BODY.line_height as u32 + 3;
+    if ui.bench.len == 0 {
+        draw::text_centred(
+            fb,
+            &HEADING,
+            layout.readout_x,
+            layout.readout_w,
+            (top + bottom) / 2,
+            "SPACE runs the benchmarks - ISA kernels, crypto raw speed, RustCrypto",
+            p.muted,
+        );
+        return;
+    }
+    use crate::bench::Group;
+    let groups = [(Group::Isa, "ISA KERNELS"), (Group::Instruction, "CRYPTO RAW SPEED"), (Group::Crypto, "RUSTCRYPTO (16 KiB)")];
+    let col_w = (layout.width - 2 * layout.margin) / 3;
+    for (c, (group, title)) in groups.iter().enumerate() {
+        let x = layout.margin + c as u32 * col_w;
+        let mut y = top;
+        draw::text(fb, &BODY, x, y, title, p.accent);
+        y += line + 2;
+        for r in ui.bench.iter().filter(|r| r.group == *group) {
+            if y + line > bottom {
+                break;
+            }
+            draw::text(fb, &BODY, x, y, r.name, p.text);
+            if !r.path.is_empty() {
+                let nx = x + BODY.width_of(r.name) + BODY.width_of(" ");
+                draw::text(fb, &BODY, nx, y, r.path, if r.path == "soft" { p.danger } else { p.accent });
+            }
+            // Values are held x1000; shown to one decimal (rates) and two
+            // (cycles), so the thousandths are dropped before formatting.
+            let mut v = Text::<48>::new();
+            v.fixed(r.rate_milli / 100, 1).str(" ").str(group.unit());
+            match (r.cycles_per_op_milli, *group) {
+                (Some(c), _) => {
+                    v.str("  ").fixed(c / 10, 2).str(" cyc");
+                }
+                // A crypto operation is one 16 KiB buffer: microseconds.
+                (None, Group::Crypto) => {
+                    v.str("  ").fixed(r.ns_per_op_milli / 100_000, 1).str(" us");
+                }
+                (None, _) => {
+                    v.str("  ").fixed(r.ns_per_op_milli, 3).str(" ns");
+                }
+            }
+            let vw = BODY.width_of(v.as_str());
+            draw::text(fb, &BODY, (x + col_w).saturating_sub(vw + 16), y, v.as_str(), p.muted);
+            y += line;
+        }
+    }
+}
+
+/// Whether the vector state the benchmarks use was switched on by the boot
+/// stub: on x86 the CR4 bits and XCR0 components, read back, not assumed.
+fn simd_state_rows(fb: &Framebuffer, p: &Palette, x: u32, w: u32, y: &mut u32) {
+    #[cfg(x86_any)]
+    {
+        let cr4: usize;
+        // SAFETY: reading CR4 at CPL 0 has no side effects.
+        unsafe { core::arch::asm!("mov {}, cr4", out(reg) cr4, options(nomem, nostack, preserves_flags)) };
+        let bit = |b: usize| if cr4 & (1 << b) != 0 { "on" } else { "off" };
+        let mut t = Text::<48>::new();
+        t.str("osfxsr ").str(bit(9)).str(" xmmexcpt ").str(bit(10)).str(" osxsave ").str(bit(18));
+        *y = row(fb, p, x, w, *y, "cr4", t.as_str());
+        if cr4 & (1 << 18) != 0 {
+            // SAFETY: CR4.OSXSAVE is set, so XGETBV is legal.
+            let xcr0 = unsafe { nanochrono_core::arch::x86::xgetbv0() };
+            let comp = |b: u64| if xcr0 & (1 << b) != 0 { "on" } else { "off" };
+            let mut t = Text::<48>::new();
+            t.str("sse ").str(comp(1)).str(" avx ").str(comp(2)).str(" avx-512 ").str(if xcr0 & 0xE0 == 0xE0 { "on" } else { "off" });
+            *y = row(fb, p, x, w, *y, "xcr0", t.as_str());
+        }
+    }
+    #[cfg(not(x86_any))]
+    {
+        *y = row(fb, p, x, w, *y, "fp/simd", "enabled by the boot stub");
+    }
+}
+
+/// Starts or stops the PMU tally to match the stopwatch, right after a toggle.
+///
+/// # Safety
+/// Ring 0; the PMU was enabled at probe.
+unsafe fn sync_stopwatch_pmu(ui: &mut Ui, machine: &Machine) {
+    match (ui.stopwatch.running, ui.stopwatch_pmu.running) {
+        // SAFETY: forwarded from this function's own contract.
+        (true, false) => unsafe { ui.stopwatch_pmu.start(&machine.pmu) },
+        // SAFETY: as above.
+        (false, true) => unsafe { ui.stopwatch_pmu.stop(&machine.pmu) },
+        _ => {}
+    }
+}
+
+/// Shows a code for `action`, or leaves the lockout on the legend.
+fn request_power(ui: &mut Ui, action: Action, now_ns: u64) {
+    // Refused means locked out; the legend already counts that down.
+    let _ = ui.power.request(action, now_ns, hw_entropy());
+}
+
+/// Does what a confirmed code asked for.
+///
+/// # Safety
+/// Requires ring 0.
+unsafe fn carry_out(action: Action, fb: &Framebuffer, p: &Palette, layout: &Layout, machine: &Machine) {
+    match action {
+        // SAFETY: forwarded from this function's own contract.
+        Action::Restart => unsafe { acpi::reboot(machine.acpi.as_ref()) },
+        // SAFETY: as above.
+        Action::Shutdown => unsafe { power_off(fb, p, layout, machine.acpi.as_ref()) },
+    }
+}
+
+/// The digit a set 1 scancode types on the top row, if it is one.
+fn digit_of(scancode: u8) -> Option<u8> {
+    match scancode {
+        0x02..=0x0A => Some(scancode - 0x01),
+        0x0B => Some(0),
+        _ => None,
+    }
+}
+
+/// Bits from every independent source this CPU has, folded together.
+///
+/// No single generator is trusted. RDRAND is a DRBG whose design cannot be
+/// audited from here; RDSEED taps the noise source before that DRBG; the
+/// counter's jitter across a short busy loop depends on the cache, the bus
+/// and SMM, none of which the instruction set controls. The confirmation's
+/// pool folds this through a non-linear mix, so a source that is broken — or
+/// hostile, and trying to cancel the others — cannot undo them without
+/// knowing the pool, which it never sees.
+fn hw_entropy() -> u64 {
+    // Off x86 there is no RDRAND/RDSEED to consult (ARMv8.5's RNDR is
+    // optional and absent on the parts this runs on); the counter's jitter
+    // is the source, alongside the event timings already stirred in.
+    #[cfg(not(x86_any))]
+    {
+        counter_jitter()
+    }
+    #[cfg(x86_any)]
+    hw_entropy_x86()
+}
+
+/// x86: jitter, RDRAND and RDSEED, folded.
+#[cfg(x86_any)]
+fn hw_entropy_x86() -> u64 {
+    let leaf1 = crate::arch::x86::cpuid(1, 0);
+    // Leaf 7 reads as zeros where it is not implemented.
+    let leaf7 = crate::arch::x86::cpuid(7, 0);
+    let mut acc = counter_jitter();
+    if leaf1[2] & (1 << 30) != 0 {
+        // SAFETY: CPUID said RDRAND exists.
+        acc = acc.rotate_left(21) ^ unsafe { rdrand() };
+    }
+    if leaf7[1] & (1 << 18) != 0 {
+        // SAFETY: CPUID said RDSEED exists.
+        acc = acc.rotate_left(21) ^ unsafe { rdseed() };
+    }
+    acc
+}
+
+#[cfg(x86_any)]
+/// RDRAND, or 0 if it reported failure (CF clear).
+///
+/// # Safety
+/// The CPU must implement RDRAND.
+unsafe fn rdrand() -> u64 {
+    // One register's worth per read: 64 bits on x86_64, 32 on i386, where
+    // two reads fill the word.
+    let mut acc = 0u64;
+    for _ in 0..(8 / core::mem::size_of::<usize>()) {
+        let (value, ok): (usize, u8);
+        // SAFETY: the caller checked CPUID; it only writes the named registers.
+        unsafe {
+            core::arch::asm!("rdrand {v}", "setc {ok}", v = out(reg) value, ok = out(reg_byte) ok,
+                options(nomem, nostack));
+        }
+        if ok == 0 {
+            return 0;
+        }
+        acc = acc.rotate_left(32) ^ value as u64;
+    }
+    acc
+}
+
+#[cfg(x86_any)]
+/// RDSEED, or 0 if the noise source had nothing ready (CF clear).
+///
+/// # Safety
+/// The CPU must implement RDSEED.
+unsafe fn rdseed() -> u64 {
+    // One register's worth per read: 64 bits on x86_64, 32 on i386, where
+    // two reads fill the word.
+    let mut acc = 0u64;
+    for _ in 0..(8 / core::mem::size_of::<usize>()) {
+        let (value, ok): (usize, u8);
+        // SAFETY: the caller checked CPUID; it only writes the named registers.
+        unsafe {
+            core::arch::asm!("rdseed {v}", "setc {ok}", v = out(reg) value, ok = out(reg_byte) ok,
+                options(nomem, nostack));
+        }
+        if ok == 0 {
+            return 0;
+        }
+        acc = acc.rotate_left(32) ^ value as u64;
+    }
+    acc
+}
+
+/// The low bits of how long each of a few tiny intervals took, packed.
+/// Only called on an input event or a power request, never per frame.
+fn counter_jitter() -> u64 {
+    let mut acc = 0u64;
+    let mut last = crate::arch::counter_ordered();
+    for _ in 0..16 {
+        for _ in 0..64 {
+            core::hint::spin_loop();
+        }
+        let now = crate::arch::counter_ordered();
+        acc = acc.rotate_left(4) ^ now.wrapping_sub(last);
+        last = now;
+    }
+    acc ^ last
 }
 
 /// # Safety
@@ -1116,9 +1938,8 @@ unsafe fn power_off(
 
 /// Where the live clock sits in the header, so only that box is repainted.
 fn header_clock_box(layout: &Layout) -> Hitbox {
-    let logo = layout.header_h * 2 / 3;
-    let mut x = layout.margin + logo + 12;
-    x += TITLE.width_of("NanoChrono").min(layout.width / 3);
+    let mark = header_wordmark(layout);
+    let mut x = layout.margin + mark.width.min(layout.width / 3) + 10;
     x += BODY.width_of(" v") + BODY.width_of(crate::VERSION) + 26;
     // Wide enough for the longest form this can draw, suffix included.
     // Reserving less leaves the tail of the previous string on screen when a
@@ -1132,6 +1953,11 @@ fn header_clock_box(layout: &Layout) -> Hitbox {
     }
 }
 
+/// The wordmark size that fits the header with some air above and below.
+fn header_wordmark(layout: &Layout) -> &'static crate::logo::Image {
+    crate::logo::wordmark(layout.header_h.saturating_sub(16))
+}
+
 /// The title bar: identity on the left, restart and shut down on the right.
 fn header(fb: &Framebuffer, p: &Palette, layout: &Layout, ui: &mut Ui, machine: &Machine) {
     let h = layout.header_h;
@@ -1140,29 +1966,11 @@ fn header(fb: &Framebuffer, p: &Palette, layout: &Layout, ui: &mut Ui, machine: 
     draw::gradient(fb, 0, 0, layout.width, h, p.header_from, p.header_to);
     fb.fill(0, h - 1, layout.width, 1, p.divider);
 
-    // The mark: a disc with the application's initial, drawn rather than
-    // decoded. `assets/` holds an `.ico` and an `.svg`, and parsing either
-    // would mean a PNG or SVG decoder in a kernel — far more code, and more
-    // attack surface, than a plotted circle.
-    let logo = h * 2 / 3;
-    let cx = layout.margin + logo / 2;
-    let cy = h / 2;
-    disc(fb, cx, cy, logo / 2, p.accent);
-    disc(fb, cx, cy, logo / 2 - 2, p.header_from);
-    draw::text_centred(
-        fb,
-        &BODY,
-        layout.margin,
-        logo,
-        cy - BODY.line_height as u32 / 2,
-        "N",
-        p.accent,
-    );
-
-    let mut x = layout.margin + logo + 12;
-    let title_y = h.saturating_sub(TITLE.line_height as u32) / 2;
-    draw::text(fb, &TITLE, x, title_y, "NanoChrono", p.title);
-    x += TITLE.width_of("NanoChrono") + 10;
+    // The logo itself — stopwatch, green "Nano", white "Chronometer" —
+    // rasterised at build time (see `logo`), vertically centred.
+    let mark = header_wordmark(layout);
+    crate::logo::draw(fb, mark, layout.margin, h.saturating_sub(mark.height) / 2);
+    let x = layout.margin + mark.width + 10;
 
     let small_y = h.saturating_sub(BODY.line_height as u32) / 2;
     let mut version = Text::<16>::new();
@@ -1288,22 +2096,6 @@ fn header_clock(fb: &Framebuffer, p: &Palette, layout: &Layout, ui: &mut Ui, clo
     let moved = ui.restart.step(hovered_restart, false) | ui.shutdown.step(hovered_off, false);
     if moved {
         header_buttons(fb, p, ui);
-    }
-}
-
-/// A filled circle.
-fn disc(fb: &Framebuffer, cx: u32, cy: u32, r: u32, colour: Colour) {
-    let r = r as i32;
-    for dy in -r..=r {
-        for dx in -r..=r {
-            if dx * dx + dy * dy > r * r {
-                continue;
-            }
-            let (x, y) = (cx as i32 + dx, cy as i32 + dy);
-            if x >= 0 && y >= 0 {
-                fb.set(x as u32, y as u32, colour);
-            }
-        }
     }
 }
 
@@ -1488,21 +2280,29 @@ fn tab_bar(fb: &Framebuffer, p: &Palette, layout: &Layout, ui: &mut Ui) -> bool 
 
 /// The large elapsed-time display, and the one line of context under it.
 fn readout(fb: &Framebuffer, p: &Palette, layout: &Layout, ui: &mut Ui, clock: &Clock) {
+    if ui.tab == Tab::Bench {
+        bench_view(fb, p, layout, ui);
+        return;
+    }
     let now = clock.elapsed_ticks();
     let running;
     let value_ns = match ui.tab {
+        Tab::Bench => return,
         Tab::Clock => {
             running = true;
             clock.wall_ns().unwrap_or_else(|| clock.elapsed_ns())
         }
         Tab::Stopwatch => {
             running = ui.stopwatch.running;
-            let ticks = ui.stopwatch.ticks(now);
+            let (ticks, verdict) = ui.stopwatch.ticks(now, ui.space.verify_reads());
+            ui.note_integrity(verdict, clock.elapsed_ns());
             clock.calibration.ticks_to_ns(ticks)
         }
         Tab::Timer => {
             running = ui.timer.running;
-            ui.timer.remaining_ns(now, clock)
+            let (left, verdict) = ui.timer.remaining_ns(now, clock, ui.space.verify_reads());
+            ui.note_integrity(verdict, clock.elapsed_ns());
+            left
         }
     };
 
@@ -1546,6 +2346,7 @@ fn readout(fb: &Framebuffer, p: &Palette, layout: &Layout, ui: &mut Ui, clock: &
     // One line of context, so the number is not left to speak for itself.
     let mut note = Text::<64>::new();
     match ui.tab {
+        Tab::Bench => {}
         Tab::Clock => {
             note.str("wall clock · rtc + counter · ")
                 .str(clock.calibration.source.name());
@@ -1564,7 +2365,7 @@ fn readout(fb: &Framebuffer, p: &Palette, layout: &Layout, ui: &mut Ui, clock: &
                 note.str("elapsed · Z resets");
             } else {
                 note.str("counting down from ")
-                    .str(text::duration(ui.timer.target_ns, false).as_str())
+                    .str(text::duration(ui.timer.target_ns.get(), false).as_str())
                     .str(" · UP and DOWN adjust");
             }
         }
@@ -1646,9 +2447,22 @@ fn cards(
             },
         );
         match column {
-            0 => panel_rows(fb, p, x, card_w, &mut y, ui.panel, machine, clock, input),
+            0 => panel_rows(
+                fb,
+                p,
+                x,
+                card_w,
+                &mut y,
+                ui.panel,
+                &ui.stats,
+                ui.reprobe_status.as_str(),
+                ui.checks.as_ref(),
+                machine,
+                clock,
+                input,
+            ),
             1 => {
-                session_rows(fb, p, x, card_w, &mut y, ui, clock);
+                session_rows(fb, p, x, card_w, &mut y, ui, clock, machine);
                 // On a mode too narrow for three cards the machine summary
                 // moves in under the session rather than disappearing. There
                 // is room: the cards are sized by the layout, not by their
@@ -1684,12 +2498,76 @@ fn panel_rows(
     w: u32,
     y: &mut u32,
     panel: Panel,
+    stats: &TaskStats,
+    status: &str,
+    checks: Option<&ClockChecks>,
     machine: &Machine,
     clock: &Clock,
     input: &Input,
 ) {
     let f = &machine.features;
     match panel {
+        Panel::Tasks => {
+            let total: u64 = stats.ticks.iter().sum::<u64>().max(1);
+            let permille = |t: u64| (t as u128 * 1000 / total as u128) as u64;
+            let mut v = Text::<48>::new();
+            let idle = permille(stats.ticks[crate::cpuload::Task::Idle as usize]);
+            match stats.load.active_permille {
+                Some(a) => {
+                    v.fixed(a as u64, 1).str("% ").str(crate::cpuload::source().name());
+                }
+                None => {
+                    v.fixed(1000 - idle.min(1000), 1).str("% (loop accounting)");
+                }
+            }
+            *y = row(fb, p, x, w, *y, "CPU active", v.as_str());
+            v.clear();
+            match stats.load.frequency_khz {
+                Some(k) => v.num(k / 1000).str(" MHz"),
+                None => v.str("n/a"),
+            };
+            *y = row(fb, p, x, w, *y, "frequency", v.as_str());
+            v.clear();
+            match stats.load.ipc_x100 {
+                Some(i) => v.fixed(i as u64, 2),
+                None => v.str("n/a"),
+            };
+            *y = row(fb, p, x, w, *y, "IPC", v.as_str());
+            *y = row(fb, p, x, w, *y, "idle wait", crate::cpuload::idle_method());
+            for task in crate::cpuload::Task::ALL {
+                let share = permille(stats.ticks[task as usize]);
+                v.clear();
+                v.fixed(share, 1).str("% ");
+                for _ in 0..(share as usize * 12).div_ceil(1000).min(12) {
+                    v.push(b'|');
+                }
+                *y = row(fb, p, x, w, *y, task.name(), v.as_str());
+            }
+        }
+        Panel::Settings => {
+            // x86 reads one counter, the TSC: there is no physical/virtual
+            // pair to switch. The setting is shown, disabled, so it is clear
+            // why — the AArch64 build has it, on its serial console.
+            *y = row(fb, p, x, w, *y, "physical counter", "n/a: x86 has one TSC");
+            *y = row(fb, p, x, w, *y, "counter in use", crate::arch::counter_source().name_here());
+            *y = row(fb, p, x, w, *y, "on AArch64", "Settings > Enable Physical Counter");
+            *y = row(fb, p, x, w, *y, "warning", "CNTPCT in VMs: trapped; nested: unstable");
+            *y = row(fb, p, x, w, *y, "recommended", "real hardware, not VMs, for timing");
+            let on = crate::hypervisor::cooldown_enabled();
+            *y = row(
+                fb,
+                p,
+                x,
+                w,
+                *y,
+                "[K] re-probe wait",
+                if on { "ON: 10 s between re-probes" } else { "OFF: provider-ban risk is YOURS" },
+            );
+            *y = row(fb, p, x, w, *y, "why", "cloud hosts read repeated VM exits as abuse");
+            if !on {
+                *y = row(fb, p, x, w, *y, "warning", "throttling or a ban: user assumes it");
+            }
+        }
         Panel::Cpu => {
             *y = row(
                 fb,
@@ -1771,6 +2649,11 @@ fn panel_rows(
                 "rate from",
                 clock.calibration.source.name(),
             );
+            if let Some(checks) = checks {
+                let pm = checks.pm.as_ref().map(|(c, _, _)| *c);
+                *y = row(fb, p, x, w, *y, "vs PM timer", cross_label(pm).as_str());
+                *y = row(fb, p, x, w, *y, "vs RTC", cross_label(Some(checks.rtc)).as_str());
+            }
         }
         Panel::Memory => {
             let total = machine.memory.total;
@@ -1814,6 +2697,7 @@ fn panel_rows(
             // which is why the figure below the meter can be exact.
             *y = row(fb, p, x, w, *y, "paging", "identity, 1 GiB pages");
         }
+        #[cfg(x86_any)]
         Panel::Usb => {
             let found = input.found();
             // The touchpad first: on the machine this runs on it is the one
@@ -1948,8 +2832,23 @@ fn panel_rows(
             }
             *y = row(fb, p, x, w, *y, "  scancodes", set.as_str());
         }
+        #[cfg(not(x86_any))]
+        Panel::Usb => {
+            // No USB or I2C stack off x86: keys come over the serial line.
+            *y = row(fb, p, x, w, *y, "keyboard", input.console_name());
+            *y = row(fb, p, x, w, *y, "pointer", "none");
+            let mut bytes = Text::<32>::new();
+            for &b in input.recent_bytes() {
+                bytes.str(HEX_DIGITS[(b >> 4) as usize]).str(HEX_DIGITS[(b & 0x0F) as usize]).push(b' ');
+            }
+            *y = row(fb, p, x, w, *y, "last bytes", if bytes.as_str().is_empty() { "-" } else { bytes.as_str() });
+        }
         Panel::Hypervisor => {
-            let sig = machine.hypervisor.signature_str();
+            let _ = machine;
+            // The cached report: the boot negotiation or the last re-probe.
+            // SAFETY: cached since boot; reading it issues nothing.
+            let hv = unsafe { crate::hypervisor::detect() };
+            let sig = hv.signature_str();
             *y = row(
                 fb,
                 p,
@@ -1966,9 +2865,9 @@ fn panel_rows(
                 w,
                 *y,
                 "hypercall",
-                yes_no(machine.hypervisor.hypercall_ok),
+                yes_no(hv.hypercall_ok),
             );
-            match machine.hypervisor.pairing {
+            match hv.pairing {
                 Some(pair) => {
                     *y = value_row(fb, p, x, w, *y, "host ns", pair.host_ns);
                     *y = row(fb, p, x, w, *y, "paired", "yes");
@@ -1982,13 +2881,32 @@ fn panel_rows(
             // them, since what happens on the other side is another
             // scheduler. So the host clock is asked once, at boot, and the
             // stopwatch then reads the counter and nothing else. This row is
-            // how that stays true: it should read `1` here and `1` an hour
+            // how that stays true: it should read the same number here and an hour
             // into a session, and if it ever climbs while the stopwatch runs,
             // a hypercall has got into the frame loop.
             let mut calls = Text::<32>::new();
             calls.num(crate::hypervisor::hypercalls() as u64);
-            calls.str(" (once, at boot)");
+            calls.str(if hv.probes > 1 { " (boot + re-probes)" } else { " (at boot only)" });
             *y = row(fb, p, x, w, *y, "hypercalls", calls.as_str());
+            let wait = crate::hypervisor::reprobe_wait_s(clock.calibration.hz);
+            let mut v = Text::<32>::new();
+            if wait > 0 {
+                v.str("wait ").num(wait as u64).str(" s");
+            } else {
+                v.str("ready");
+            }
+            if !crate::hypervisor::cooldown_enabled() {
+                v.str(" (no cooldown!)");
+            }
+            *y = row(fb, p, x, w, *y, "[V] re-probe", v.as_str());
+            let mut hal = Text::<32>::new();
+            hal.str(hv.hypercall_insn.map_or("none", |i| i.name()));
+            #[cfg(x86_any)]
+            hal.str(" (").str(nanochrono_core::cpu::vendor().name()).str(")");
+            *y = row(fb, p, x, w, *y, "hypercall HAL", hal.as_str());
+            if !status.is_empty() {
+                *y = row(fb, p, x, w, *y, "last request", status);
+            }
         }
     }
 }
@@ -2001,8 +2919,18 @@ fn session_rows(
     y: &mut u32,
     ui: &mut Ui,
     clock: &Clock,
+    machine: &Machine,
 ) {
     match ui.tab {
+        Tab::Bench => {
+            let mut n = Text::<16>::new();
+            n.num(ui.bench.len as u64);
+            *y = row(fb, p, x, w, *y, "results", if ui.bench.len == 0 { "none - SPACE runs" } else { n.as_str() });
+            *y = row(fb, p, x, w, *y, "passes", "3 per row, best kept");
+            *y = row(fb, p, x, w, *y, "crypto", if cfg!(feature = "crypto") { "rustcrypto, 16 KiB" } else { "not in this build" });
+            simd_state_rows(fb, p, x, w, y);
+            let _ = (clock, machine);
+        }
         Tab::Clock => {
             match clock.date {
                 Some(d) => {
@@ -2038,14 +2966,21 @@ fn session_rows(
                 },
             );
             *y = row(fb, p, x, w, *y, "ecc", ui.stopwatch.integrity.name());
+            let mut space = Text::<40>::new();
+            space.str(ui.space.name());
+            if ui.space.detections() > 0 {
+                space.str(" (").num(ui.space.detections() as u64).str(" upsets)");
+            }
+            *y = row(fb, p, x, w, *y, "space mode", space.as_str());
+            pmu_rows(fb, p, x, w, y, ui, clock, machine);
             if ui.stopwatch.lap_count == 0 {
                 *y = row(fb, p, x, w, *y, "laps", "none — press L");
             }
-            for (i, &ticks) in ui.stopwatch.laps[..ui.stopwatch.lap_count]
+            for (i, lap) in ui.stopwatch.laps[..ui.stopwatch.lap_count]
                 .iter()
                 .enumerate()
             {
-                let ns = clock.calibration.ticks_to_ns(ticks);
+                let ns = clock.calibration.ticks_to_ns(lap.get());
                 let mut label = Text::<8>::new();
                 label.str("lap ").num(i as u64 + 1);
                 let value = text::duration(ns, false);
@@ -2060,7 +2995,7 @@ fn session_rows(
                 w,
                 *y,
                 "set to",
-                text::duration(ui.timer.target_ns, false).as_str(),
+                text::duration(ui.timer.target_ns.get(), false).as_str(),
             );
             *y = row(
                 fb,
@@ -2095,22 +3030,38 @@ fn machine_rows(
     composited: bool,
 ) {
     *y = row(fb, p, x, w, *y, "operating system", "none");
+    *y = row(fb, p, x, w, *y, "architecture", ARCHITECTURE);
+    let irq = crate::irq_priority::state();
+    let mut prio = Text::<48>::new();
+    prio.str(irq.register).str(" = ").str(irq.outcome);
+    *y = row(fb, p, x, w, *y, "irq priority", prio.as_str());
     // SAFETY: reads firmware memory only; the interface runs at ring 0.
-    let (source, xsdt) = unsafe { acpi::root_source() };
-    *y = row(fb, p, x, w, *y, "acpi root", source.name());
-    *y = row(
-        fb,
-        p,
-        x,
-        w,
-        *y,
-        "root table",
-        if xsdt {
-            "xsdt (64-bit)"
-        } else {
-            "rsdt (32-bit)"
-        },
-    );
+    #[cfg(x86_any)]
+    {
+        let (source, xsdt) = unsafe { acpi::root_source() };
+        *y = row(fb, p, x, w, *y, "acpi root", source.name());
+        *y = row(
+            fb,
+            p,
+            x,
+            w,
+            *y,
+            "root table",
+            if xsdt {
+                "xsdt (64-bit)"
+            } else {
+                "rsdt (32-bit)"
+            },
+        );
+    }
+    #[cfg(not(x86_any))]
+    {
+        #[cfg(target_arch = "powerpc")]
+        let firmware = if crate::arch::ppc::of::present() { "open firmware" } else { "devicetree" };
+        #[cfg(not(target_arch = "powerpc"))]
+        let firmware = "devicetree";
+        *y = row(fb, p, x, w, *y, "firmware", firmware);
+    }
     *y = row(
         fb,
         p,
@@ -2126,11 +3077,10 @@ fn machine_rows(
         x,
         w,
         *y,
-        "acpi",
-        if machine.acpi.is_some() {
-            "present"
-        } else {
-            "absent"
+        "power",
+        match (machine.acpi.is_some(), POWER_MECHANISM) {
+            (true, m) => m,
+            (false, _) => "none reachable",
         },
     );
     *y = row(
@@ -2243,12 +3193,42 @@ fn truncate_to_width(s: &str, width: u32) -> &str {
 /// keyboard did not come up: it is the most prominent line on screen telling
 /// the reader to press things that do nothing. When a stack came up short
 /// this says so there instead.
-fn hint_bar(fb: &Framebuffer, p: &Palette, layout: &Layout, ui: &Ui) {
+fn hint_bar(fb: &Framebuffer, p: &Palette, layout: &Layout, ui: &mut Ui, now_ns: u64) {
+    ui.hint_state = hint_signature(ui, now_ns);
     let y = layout.hint_y;
     let h = layout.status_y.saturating_sub(y);
     fb.fill(0, y, layout.width, h, p.background);
 
     let ty = y + h.saturating_sub(BODY.line_height as u32) / 2;
+
+    // A pending code outranks everything else on the line, the input note
+    // included: it is the one thing on screen that is waiting on the reader.
+    if let Some((action, code, typed)) = ui.power.shown(now_ns) {
+        let mut pen = layout.margin;
+        let put = |text: &str, colour: Colour, pen: &mut u32| {
+            draw::text(fb, &BODY, *pen, ty, text, colour);
+            *pen += BODY.width_of(text);
+        };
+        let mut title = Text::<16>::new();
+        for b in action.verb().bytes() {
+            title.push(b.to_ascii_uppercase());
+        }
+        put(title.as_str(), p.danger, &mut pen);
+        put("   type ", p.muted, &mut pen);
+        for (i, d) in code.iter().enumerate() {
+            let mut digit = Text::<4>::new();
+            digit.push(b'0' + d).str(" ");
+            put(digit.as_str(), if i < typed { p.muted } else { p.accent }, &mut pen);
+        }
+        put("to confirm   ", p.muted, &mut pen);
+        put("[ESC]", p.accent, &mut pen);
+        put(" cancel   ", p.muted, &mut pen);
+        let left_s = ui.power.remaining_ns(now_ns).unwrap_or(0).div_ceil(1_000_000_000);
+        let mut countdown = Text::<8>::new();
+        countdown.num(left_s).str(" s");
+        put(countdown.as_str(), p.muted, &mut pen);
+        return;
+    }
 
     if let Some(note) = ui.input_note {
         draw::text(fb, &BODY, layout.margin, ty, "INPUT", p.danger);
@@ -2264,19 +3244,32 @@ fn hint_bar(fb: &Framebuffer, p: &Palette, layout: &Layout, ui: &Ui) {
     }
     // Laid out one hint at a time and stopped when the row is full, rather
     // than as one string that would simply run off the edge on a narrow mode.
-    let hints: [(&str, &str); 8] = [
-        ("1-3", "Mode"),
+    let hints: [(&str, &str); 11] = [
+        ("1-4", "Mode"),
         ("SPACE", "Start"),
         ("L", "Lap"),
         ("Z", "Zero"),
         ("N", "Precision"),
         ("TAB", "Panel"),
+        ("T", "Tasks"),
+        ("G", "Settings"),
+        ("V", "Re-probe"),
         ("R", "Restart"),
         ("S", "Shut down"),
     ];
+    // Locked out after a wrong code: the two power keys say so, and for how
+    // long, in place of their usual labels.
+    let locked_s = ui.power.lockout_remaining_ns(now_ns).div_ceil(1_000_000_000);
+    let mut locked = Text::<24>::new();
+    locked.str("locked ").num(locked_s).str(" s");
 
     let mut pen = layout.margin;
     for (key, action) in hints {
+        let key = if locked_s > 0 && key == "R" { "R/S" } else { key };
+        let action = if locked_s > 0 && key == "R/S" { locked.as_str() } else { action };
+        if locked_s > 0 && key == "S" {
+            continue;
+        }
         let mut label = Text::<24>::new();
         label.str("[").str(key).str("] ").str(action);
         let w = BODY.width_of(label.as_str());
@@ -2433,7 +3426,9 @@ fn status_bar(
         .str("   jitter: ")
         .num(machine.worst_read.saturating_sub(machine.read_overhead))
         .str("   ecc: ")
-        .str(ui.stopwatch.integrity.name());
+        .str(ui.stopwatch.integrity.name())
+        .str("   seu: ")
+        .str(ui.space.name());
     draw::text(fb, &BODY, layout.margin, y2, left.as_str(), p.muted);
 
     let mut right = Text::<64>::new();

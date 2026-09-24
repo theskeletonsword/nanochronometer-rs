@@ -306,7 +306,11 @@ unsafe fn load_fenced_units(ptr: *const u64) -> u64 {
     {
         unsafe { arch::aarch64::probe_load_dsb_ticks(ptr) }
     }
-    #[cfg(not(target_arch = "aarch64"))]
+    #[cfg(any(target_arch = "powerpc", target_arch = "powerpc64"))]
+    {
+        unsafe { arch::powerpc::probe_load_sync_ticks(ptr) }
+    }
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "powerpc", target_arch = "powerpc64")))]
     {
         arch::memory_barrier();
         let units = unsafe { load_units(ptr) };
@@ -340,7 +344,29 @@ unsafe fn prefetch_reload_units(ptr: *const u64) -> u64 {
     {
         unsafe { arch::aarch64::probe_prefetch_load_ticks(ptr) }
     }
-    #[cfg(not(any(target_arch = "x86_64", target_arch = "x86", target_arch = "aarch64")))]
+    #[cfg(any(target_arch = "powerpc", target_arch = "powerpc64"))]
+    {
+        unsafe { arch::powerpc::probe_prefetch_load_ticks(ptr) }
+    }
+    #[cfg(any(target_arch = "riscv32", target_arch = "riscv64"))]
+    {
+        // No prefetch hint in the base ISA (Zicbop is optional): a reload.
+        unsafe { arch::riscv::probe_load_ticks(ptr) }
+    }
+    #[cfg(target_arch = "arm")]
+    {
+        unsafe { arch::arm32::probe_load(ptr) }
+    }
+    #[cfg(not(any(
+        target_arch = "x86_64",
+        target_arch = "x86",
+        target_arch = "aarch64",
+        target_arch = "powerpc",
+        target_arch = "powerpc64",
+        target_arch = "riscv32",
+        target_arch = "riscv64",
+        target_arch = "arm"
+    )))]
     {
         unsafe { load_units(ptr) }
     }
@@ -402,7 +428,28 @@ unsafe fn pointer_chase_units(first: *const *const u8, steps: usize) -> u64 {
     {
         unsafe { arch::aarch64::probe_pointer_chase_ticks(first, steps) }
     }
-    #[cfg(not(any(target_arch = "x86_64", target_arch = "x86", target_arch = "aarch64")))]
+    #[cfg(any(target_arch = "powerpc", target_arch = "powerpc64"))]
+    {
+        unsafe { arch::powerpc::probe_pointer_chase_ticks(first, steps) }
+    }
+    #[cfg(any(target_arch = "riscv32", target_arch = "riscv64"))]
+    {
+        unsafe { arch::riscv::probe_pointer_chase_ticks(first, steps) }
+    }
+    #[cfg(target_arch = "arm")]
+    {
+        unsafe { arch::arm32::probe_pointer_chase(first, steps) }
+    }
+    #[cfg(not(any(
+        target_arch = "x86_64",
+        target_arch = "x86",
+        target_arch = "aarch64",
+        target_arch = "powerpc",
+        target_arch = "powerpc64",
+        target_arch = "riscv32",
+        target_arch = "riscv64",
+        target_arch = "arm"
+    )))]
     {
         let _ = (first, steps);
         0
@@ -439,8 +486,13 @@ mod tests {
     fn cache_audit_reports_all_three_states() {
         let mut buf = vec![0x5Au8; 4096];
         let audit = cache_audit(&mut buf).expect("aligned 4 KiB buffer is probe-sized");
-        assert!(audit.cached_units > 0);
+        // No `cached_units > 0`: on a fixed-rate counter coarser than a load —
+        // a PowerPC Time Base or AArch64's CNTVCT at tens of MHz, one tick
+        // every ~40 ns against a cached load's ~1 ns — the best of two reads
+        // is legitimately zero ticks. What must hold on every counter is that
+        // the threshold sits between the two states it separates.
         assert!(audit.threshold_units >= audit.cached_units.min(audit.flushed_units));
+        assert!(audit.threshold_units <= audit.cached_units.max(audit.flushed_units));
     }
 
     /// A branch on the input is the textbook leak; the audit must see it.

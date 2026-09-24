@@ -13,7 +13,8 @@
 #![allow(clippy::needless_return)]
 
 #[no_mangle]
-pub unsafe extern "C" fn memcpy(dst: *mut u8, src: *const u8, n: usize) -> *mut u8 {
+pub unsafe extern "C" fn memcpy(dst: *mut core::ffi::c_void, src: *const core::ffi::c_void, n: usize) -> *mut core::ffi::c_void {
+    let (dst, src) = (dst as *mut u8, src as *const u8);
     let mut i = 0usize;
     while i < n {
         // SAFETY: caller guarantees dst/src valid for n bytes.
@@ -22,11 +23,12 @@ pub unsafe extern "C" fn memcpy(dst: *mut u8, src: *const u8, n: usize) -> *mut 
         }
         i += 1;
     }
-    dst
+    dst.cast()
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn memmove(dst: *mut u8, src: *const u8, n: usize) -> *mut u8 {
+pub unsafe extern "C" fn memmove(dst: *mut core::ffi::c_void, src: *const core::ffi::c_void, n: usize) -> *mut core::ffi::c_void {
+    let (dst, src) = (dst as *mut u8, src as *const u8);
     if dst as usize <= src as usize {
         let mut i = 0usize;
         while i < n {
@@ -46,11 +48,12 @@ pub unsafe extern "C" fn memmove(dst: *mut u8, src: *const u8, n: usize) -> *mut
             }
         }
     }
-    dst
+    dst.cast()
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn memset(s: *mut u8, c: i32, n: usize) -> *mut u8 {
+pub unsafe extern "C" fn memset(s: *mut core::ffi::c_void, c: i32, n: usize) -> *mut core::ffi::c_void {
+    let s = s as *mut u8;
     let v = c as u8;
     let mut i = 0usize;
     while i < n {
@@ -60,11 +63,12 @@ pub unsafe extern "C" fn memset(s: *mut u8, c: i32, n: usize) -> *mut u8 {
         }
         i += 1;
     }
-    s
+    s.cast()
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn memcmp(a: *const u8, b: *const u8, n: usize) -> i32 {
+pub unsafe extern "C" fn memcmp(a: *const core::ffi::c_void, b: *const core::ffi::c_void, n: usize) -> i32 {
+    let (a, b) = (a as *const u8, b as *const u8);
     let mut i = 0usize;
     while i < n {
         // SAFETY: caller guarantees ranges.

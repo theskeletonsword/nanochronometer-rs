@@ -258,6 +258,11 @@ struct PtpSysOffsetPrecise {
 ///
 /// Spelled out rather than computed, because the encoding is fixed ABI and a
 /// wrong value here is a call to some other driver's ioctl.
+///
+/// The same number on every Linux architecture, including the ones with a
+/// different `_IOC` layout: PowerPC, MIPS and SPARC put the direction in
+/// three bits at 29 with `READ|WRITE = 6`, which is `0xC000_0000` — the same
+/// bits as the generic `3 << 30` — and 64 bytes fits both size fields.
 #[cfg(target_os = "linux")]
 const PTP_SYS_OFFSET_PRECISE: libc::c_ulong = 0xc040_3d08;
 
@@ -277,7 +282,9 @@ fn read_precise_offset(index: u32) -> Option<ClockPairing> {
     let status = unsafe {
         libc::ioctl(
             file.as_raw_fd(),
-            PTP_SYS_OFFSET_PRECISE,
+            // glibc takes the request as `c_ulong`, musl as `c_int`; the bit
+            // pattern is what the kernel decodes, so it is cast, not converted.
+            PTP_SYS_OFFSET_PRECISE as _,
             &mut offset as *mut PtpSysOffsetPrecise,
         )
     };

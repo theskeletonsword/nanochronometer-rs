@@ -18,6 +18,8 @@ const CONFIG_DATA: u16 = 0x0CFC;
 /// PCI class 0x0C, subclass 0x03: a USB host controller.
 const CLASS_SERIAL_BUS: u8 = 0x0C;
 const SUBCLASS_USB: u8 = 0x03;
+/// PCI class 0x03: a display controller.
+const CLASS_DISPLAY: u8 = 0x03;
 
 /// Which host controller interface a device implements, from the prog-if
 /// byte. The three generations, and they are not interchangeable: each has
@@ -104,6 +106,152 @@ impl Device {
                 command | (1 << 1) | (1 << 2),
             );
         }
+    }
+
+    /// BAR0 as an address this kernel can use: `None` when unset, or when
+    /// it lies above what a pointer here reaches (a 64-bit BAR above 4 GiB on
+    /// i386) — cast blindly, it would name some other device's registers.
+    pub fn bar0_addr(&self) -> Option<usize> {
+        usize::try_from(self.bar0).ok().filter(|&a| a != 0)
+    }
+
+    /// Turns on memory decoding only, for a device driven by programmed I/O
+    /// that never needs to reach memory itself.
+    ///
+    /// Bus mastering is what lets a device write RAM on its own. Without an
+    /// IOMMU nothing limits *where*, so it is granted only to a device that
+    /// has rings or buffers in memory — see [`restrict_bus_masters`].
+    ///
+    /// # Safety
+    /// Writes PCI configuration space; requires ring 0.
+    pub unsafe fn enable_mmio(&self) {
+        // SAFETY: forwarded from this function's own contract.
+        unsafe {
+            let command = read32(self.bus, self.slot, self.function, 0x04);
+            write32(self.bus, self.slot, self.function, 0x04, command | (1 << 1));
+        }
+    }
+
+    /// Whether this device must keep bus mastering for the machine to work
+    /// while this kernel runs: a bridge (its bit gates DMA from everything
+    /// behind it, including the controllers this does use), a display
+    /// controller (scan-out can read system memory), or a USB host
+    /// controller (the firmware's legacy emulation may be driving one to
+    /// deliver the keyboard, and the xHCI is this kernel's own).
+    pub fn needs_bus_master(&self) -> bool {
+        self.header_type == HEADER_TYPE_BRIDGE
+            || self.class == CLASS_DISPLAY
+            || self.usb_kind().is_some()
+    }
+
+    /// How many bytes BAR0 decodes; 0 for an I/O or unimplemented BAR.
+    ///
+    /// Every offset a driver reads out of a device's own registers — a
+    /// capability chain, a doorbell offset — is the device's word, and a
+    /// defective or hostile device (anything on Thunderbolt is a PCIe device)
+    /// can point it past its BAR into another device's registers. The BAR's
+    /// size is the one bound that does not come from those registers: the
+    /// standard sizing handshake, with decoding off so the probe value is
+    /// never live as an address.
+    ///
+    /// Only for the device about to be driven — never in a bus sweep, where
+    /// switching decode off under a GPU would blank the framebuffer.
+    ///
+    /// # Safety
+    /// Writes PCI configuration space; requires ring 0 and nothing else using
+    /// the device while it runs.
+    pub unsafe fn bar0_size(&self) -> u64 {
+        let (b, s, f) = (self.bus, self.slot, self.function);
+        // SAFETY: forwarded from this function's own contract. Every register
+        // written is restored before returning.
+        unsafe {
+            let lo = read32(b, s, f, 0x10);
+            if lo & 1 != 0 {
+                return 0;
+            }
+            let wide = (lo >> 1) & 0x3 == 0x2;
+            let command = read32(b, s, f, 0x04);
+            write32(b, s, f, 0x04, command & !0b11);
+
+            write32(b, s, f, 0x10, u32::MAX);
+            let lo_mask = read32(b, s, f, 0x10) & 0xFFFF_FFF0;
+            write32(b, s, f, 0x10, lo);
+            let hi_mask = if wide {
+                let hi = read32(b, s, f, 0x14);
+                write32(b, s, f, 0x14, u32::MAX);
+                let mask = read32(b, s, f, 0x14);
+                write32(b, s, f, 0x14, hi);
+                mask
+            } else {
+                u32::MAX
+            };
+            write32(b, s, f, 0x04, command);
+
+            let mask = (hi_mask as u64) << 32 | lo_mask as u64;
+            if lo_mask == 0 {
+                return 0;
+            }
+            (!mask).wrapping_add(1)
+        }
+    }
+}
+
+/// What [`restrict_bus_masters`] did, for the self-test to report.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DmaLockdown {
+    /// Devices whose bus mastering was switched off.
+    pub revoked: u16,
+    /// Devices that keep it (see [`Device::needs_bus_master`]).
+    pub kept: u16,
+}
+
+/// Switches bus mastering off on every device that does not need it.
+///
+/// Without an IOMMU programmed, a device with bus mastering can write any
+/// physical address — this kernel's code, the stopwatch's state. Firmware
+/// commonly leaves the bit set on whatever it touched during boot: the NVMe
+/// it loaded from, the network card it could PXE-boot from, a Thunderbolt
+/// controller whose downstream port anything can be plugged into. This kernel
+/// drives none of those, so none of them keeps the ability.
+///
+/// This narrows the attack surface; it does not close it. A kept device
+/// (see [`Device::needs_bus_master`]) can still reach all of memory, and a
+/// device behind a kept bridge that turns its own bit back on is not stopped
+/// by anything here. Only an IOMMU does that.
+///
+/// # Safety
+/// Writes PCI configuration space; requires ring 0, before any device this
+/// kernel drives is brought up.
+pub unsafe fn restrict_bus_masters() -> DmaLockdown {
+    let mut report = DmaLockdown::default();
+    // SAFETY: forwarded from this function's own contract.
+    unsafe {
+        scan(|dev| {
+            let command = read32(dev.bus, dev.slot, dev.function, 0x04);
+            if command & (1 << 2) != 0 {
+                if dev.needs_bus_master() {
+                    report.kept = report.kept.saturating_add(1);
+                } else {
+                    write32(dev.bus, dev.slot, dev.function, 0x04, command & !(1 << 2));
+                    report.revoked = report.revoked.saturating_add(1);
+                }
+            }
+            true
+        });
+    }
+    LOCKDOWN_REVOKED.store(report.revoked, core::sync::atomic::Ordering::Relaxed);
+    LOCKDOWN_KEPT.store(report.kept, core::sync::atomic::Ordering::Relaxed);
+    report
+}
+
+static LOCKDOWN_REVOKED: core::sync::atomic::AtomicU16 = core::sync::atomic::AtomicU16::new(0);
+static LOCKDOWN_KEPT: core::sync::atomic::AtomicU16 = core::sync::atomic::AtomicU16::new(0);
+
+/// What the boot-time [`restrict_bus_masters`] did.
+pub fn dma_lockdown() -> DmaLockdown {
+    DmaLockdown {
+        revoked: LOCKDOWN_REVOKED.load(core::sync::atomic::Ordering::Relaxed),
+        kept: LOCKDOWN_KEPT.load(core::sync::atomic::Ordering::Relaxed),
     }
 }
 

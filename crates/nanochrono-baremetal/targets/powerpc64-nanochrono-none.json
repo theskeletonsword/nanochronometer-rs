@@ -1,0 +1,31 @@
+{
+  "abi": "elfv2",
+  "arch": "powerpc64",
+  "cpu": "pwr8",
+  "crt-static-default": false,
+  "crt-static-respected": false,
+  "data-layout": "E-m:e-Fn32-i64:64-i128:128-n32:64",
+  "disable-redzone": true,
+  "dynamic-linking": false,
+  "env": "",
+  "exe-suffix": "",
+  "executables": true,
+  "features": "+altivec,+vsx,+power8-vector",
+  "has-thread-local": false,
+  "linker": "rust-lld",
+  "linker-flavor": "ld.lld",
+  "llvm-abiname": "elfv2",
+  "llvm-target": "powerpc64-unknown-unknown",
+  "max-atomic-width": 64,
+  "os": "none",
+  "panic-strategy": "abort",
+  "position-independent-executables": false,
+  "relocation-model": "static",
+  "stack-probes": {
+    "kind": "inline"
+  },
+  "target-c-int-width": 32,
+  "target-endian": "big",
+  "target-pointer-width": 64,
+  "vendor": "unknown"
+}

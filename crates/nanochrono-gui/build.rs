@@ -17,11 +17,15 @@ fn main() {
     println!("cargo:rerun-if-changed=../../assets/nanochrono.ico");
     println!("cargo:rerun-if-changed=build.rs");
 
-    #[cfg(windows)]
-    embed_windows_resources();
+    // The target, not the host: `#[cfg(windows)]` in a build script is true
+    // only when *building on* Windows, so a cross-compiled .exe silently
+    // shipped with the generic icon. winresource finds `windres` itself, or
+    // takes it from `WINDRES` (llvm-mingw's `llvm-windres` works).
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
+        embed_windows_resources();
+    }
 }
 
-#[cfg(windows)]
 fn embed_windows_resources() {
     // The path is relative to this crate's manifest directory, which is where
     // the resource compiler is invoked from.

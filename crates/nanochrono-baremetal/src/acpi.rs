@@ -18,7 +18,7 @@
 //! That is stated plainly because "ACPI shutdown" usually means the full
 //! interpreter, and this is not that.
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(x86_any)]
 mod x86_acpi {
     use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -33,7 +33,13 @@ mod x86_acpi {
     /// this before it is dereferenced. A table can name anything, and this
     /// kernel has no IDT: a read outside the map is a page fault with no
     /// handler, which is a dead machine rather than an error.
+    ///
+    /// On i386 there is no paging at all and the limit is the 4 GiB a 32-bit
+    /// address can name; `512 << 30` would silently truncate to zero there.
+    #[cfg(target_pointer_width = "64")]
     const MAPPED_LIMIT: usize = 512 << 30;
+    #[cfg(target_pointer_width = "32")]
+    const MAPPED_LIMIT: usize = usize::MAX;
 
     /// Whether `length` bytes at `address` are inside the identity map.
     fn mapped(address: usize, length: usize) -> bool {
@@ -79,6 +85,31 @@ mod x86_acpi {
         /// The FADT's reset register, when it declares one.
         pub reset_port: Option<u16>,
         pub reset_value: u8,
+        /// The ACPI power-management timer: its I/O port, and whether it
+        /// counts 32 bits (`TMR_VAL_EXT`) rather than 24. It runs at
+        /// [`PM_TIMER_HZ`] from its own counter, which is what makes it
+        /// worth checking the TSC against.
+        pub pm_timer: Option<(u16, bool)>,
+    }
+
+    /// The ACPI PM timer's rate, fixed by the specification.
+    pub const PM_TIMER_HZ: u64 = 3_579_545;
+
+    /// Reads the PM timer: 24 or 32 bits, as the FADT says. The caller
+    /// unwraps.
+    ///
+    /// # Safety
+    /// Reads an I/O port; requires ring 0.
+    pub unsafe fn read_pm_timer(timer: (u16, bool)) -> u32 {
+        let (port, wide) = timer;
+        let value: u32;
+        // SAFETY: forwarded from this function's own contract; reading the
+        // PM timer has no side effects.
+        unsafe {
+            core::arch::asm!("in eax, dx", in("dx") port, out("eax") value,
+                             options(nomem, nostack, preserves_flags));
+        }
+        if wide { value } else { value & 0x00FF_FFFF }
     }
 
     /// Reads the firmware tables. `None` if no RSDP was found.
@@ -94,12 +125,25 @@ mod x86_acpi {
 
         let mut regs = PowerRegisters::default();
 
-        // SAFETY: the FADT pointer came from a table whose checksum verified, so
-        // its fixed-offset fields are present.
+        // SAFETY: the FADT pointer came from a table whose checksum verified,
+        // and every field below is read only when the length it declares
+        // covers it.
         unsafe {
+            // The ACPI 1.0 FADT is 116 bytes; a shorter one is truncated or
+            // not a FADT, and its "fields" are whatever memory follows it.
+            if (read_u32(fadt, 4) as usize) < 116 {
+                return Some(regs);
+            }
             // Offsets are from the ACPI specification's FADT layout.
             regs.pm1a_control = read_u32(fadt, 64) as u16;
             regs.pm1b_control = read_u32(fadt, 68) as u16;
+
+            // PM_TMR_BLK at 76, PM_TMR_LEN at 91 (always 4 when present), and
+            // TMR_VAL_EXT, bit 8 of the flags at 112.
+            let port = read_u32(fadt, 76);
+            if port != 0 && port <= 0xFFFF && read_u8(fadt, 91) == 4 {
+                regs.pm_timer = Some((port as u16, read_u32(fadt, 112) & (1 << 8) != 0));
+            }
 
             // RESET_REG is only valid from FADT revision 2 with the
             // RESET_REG_SUP flag (bit 10 of the Flags field at offset 112).
@@ -713,9 +757,15 @@ mod x86_acpi {
                 continue;
             }
 
+            // Two constants take at most four bytes. The scan guard above
+            // only covers the name, so a `_S5_` package near the end of a
+            // truncated table would otherwise be read past its length.
+            if p + 4 > length {
+                return (None, None);
+            }
             // Each element is either a byte constant (0x0A, value) or a
             // zero/one opcode (0x00 / 0x01) standing for that value.
-            // SAFETY: bounded by the table length.
+            // SAFETY: bounded by the table length, checked just above.
             let a = unsafe { read_constant(dsdt, &mut p) };
             // SAFETY: as above.
             let b = unsafe { read_constant(dsdt, &mut p) };
@@ -823,11 +873,173 @@ mod psci {
     }
 }
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(x86_any)]
 pub use x86_acpi::{
-    dsdt, for_each_ssdt, for_each_table_signature, legacy_scan_works, power_registers, reboot, root_source, set_root_table,
+    dsdt, for_each_ssdt, for_each_table_signature, legacy_scan_works, power_registers, read_pm_timer, reboot, root_source,
+    set_root_table, PM_TIMER_HZ,
     shutdown, ssdt_count, PowerRegisters, RootSource,
 };
 
 #[cfg(target_arch = "aarch64")]
 pub use psci::{power_registers, reboot, shutdown, PowerRegisters};
+
+// ---------------------------------------------------------------------------
+// 32-bit ARM: PSCI too, through r0
+// ---------------------------------------------------------------------------
+
+/// PSCI from AArch32: the same function IDs (SMC32 convention), the call in
+/// r0, and the conduit — `hvc` or `smc` — the devicetree's `/psci` node
+/// names, which the entry point records with [`set_psci_smc`].
+#[cfg(target_arch = "arm")]
+mod psci32 {
+    use core::sync::atomic::{AtomicBool, Ordering};
+
+    const PSCI_SYSTEM_OFF: u32 = 0x8400_0008;
+    const PSCI_SYSTEM_RESET: u32 = 0x8400_0009;
+
+    static USE_SMC: AtomicBool = AtomicBool::new(false);
+
+    /// Records the conduit: `method = "smc"` in the tree; `hvc` otherwise,
+    /// which is QEMU `virt`'s default without EL3.
+    pub fn set_psci_smc(smc: bool) {
+        USE_SMC.store(smc, Ordering::Relaxed);
+    }
+
+    #[derive(Debug, Clone, Copy, Default)]
+    pub struct PowerRegisters;
+
+    /// # Safety
+    /// PL1 or above.
+    pub unsafe fn power_registers() -> Option<PowerRegisters> {
+        Some(PowerRegisters)
+    }
+
+    /// # Safety
+    /// PL1 or above. Both functions are terminal.
+    unsafe fn call(function: u32) {
+        // SAFETY: caller guarantees the privilege level; a terminal call
+        // leaves nothing to observe a clobbered register.
+        unsafe {
+            if USE_SMC.load(Ordering::Relaxed) {
+                core::arch::asm!(".arch_extension sec", "smc #0", in("r0") function, options(nostack));
+            } else {
+                core::arch::asm!(".arch_extension virt", "hvc #0", in("r0") function, options(nostack));
+            }
+        }
+    }
+
+    /// # Safety
+    /// PL1 or above.
+    pub unsafe fn shutdown(_regs: Option<&PowerRegisters>) {
+        // SAFETY: forwarded from this function's own contract.
+        unsafe { call(PSCI_SYSTEM_OFF) };
+    }
+
+    /// # Safety
+    /// PL1 or above.
+    pub unsafe fn reboot(_regs: Option<&PowerRegisters>) -> ! {
+        // SAFETY: forwarded from this function's own contract.
+        unsafe { call(PSCI_SYSTEM_RESET) };
+        crate::arch::halt()
+    }
+}
+
+#[cfg(target_arch = "arm")]
+pub use psci32::{power_registers, reboot, set_psci_smc, shutdown, PowerRegisters};
+
+// ---------------------------------------------------------------------------
+// RISC-V: the SBI System Reset extension
+// ---------------------------------------------------------------------------
+
+/// Power control on RISC-V: SBI `SRST` (extension "SRST", `0x53525354`),
+/// function 0 with a reset type — 0 shut down, 1 cold reboot. OpenSBI and
+/// every SBI v0.3+ implementation provide it.
+#[cfg(any(target_arch = "riscv32", target_arch = "riscv64"))]
+mod sbi_power {
+    const EXT_SRST: usize = 0x5352_5354;
+
+    #[derive(Debug, Clone, Copy, Default)]
+    pub struct PowerRegisters;
+
+    /// # Safety
+    /// S-mode.
+    pub unsafe fn power_registers() -> Option<PowerRegisters> {
+        crate::arch::riscv::sbi_has(EXT_SRST).then_some(PowerRegisters)
+    }
+
+    /// # Safety
+    /// S-mode. Terminal if the SBI honours it.
+    unsafe fn reset(kind: usize) {
+        // SAFETY: forwarded; the arguments are what SRST defines.
+        let _ = unsafe { crate::arch::riscv::sbi_call(EXT_SRST, 0, kind, 0, 0) };
+    }
+
+    /// # Safety
+    /// S-mode.
+    pub unsafe fn shutdown(_regs: Option<&PowerRegisters>) {
+        // SAFETY: forwarded from this function's own contract.
+        unsafe { reset(0) };
+    }
+
+    /// # Safety
+    /// S-mode.
+    pub unsafe fn reboot(_regs: Option<&PowerRegisters>) -> ! {
+        // SAFETY: forwarded from this function's own contract.
+        unsafe { reset(1) };
+        crate::arch::halt()
+    }
+}
+
+#[cfg(any(target_arch = "riscv32", target_arch = "riscv64"))]
+pub use sbi_power::{power_registers, reboot, shutdown, PowerRegisters};
+
+// ---------------------------------------------------------------------------
+// POWER: OPAL on OpenPOWER; nothing on an e500 without firmware services
+// ---------------------------------------------------------------------------
+
+/// Power control on POWER. On `powernv` it is OPAL's `CEC_POWER_DOWN` and
+/// `CEC_REBOOT`; a 32-bit e500 or a G4 under Open Firmware offers neither to
+/// a kernel that has left the firmware, so there the calls return and the
+/// interface says the machine could not be turned off.
+#[cfg(any(target_arch = "powerpc", target_arch = "powerpc64"))]
+mod ppc_power {
+    #[derive(Debug, Clone, Copy, Default)]
+    pub struct PowerRegisters;
+
+    /// # Safety
+    /// Supervisor state.
+    pub unsafe fn power_registers() -> Option<PowerRegisters> {
+        #[cfg(target_arch = "powerpc64")]
+        if crate::arch::ppc::opal_present() {
+            return Some(PowerRegisters);
+        }
+        None
+    }
+
+    /// # Safety
+    /// Supervisor state.
+    pub unsafe fn shutdown(_regs: Option<&PowerRegisters>) {
+        #[cfg(target_arch = "powerpc64")]
+        if crate::arch::ppc::opal_present() {
+            // SAFETY: OPAL is present; the call is terminal when honoured.
+            unsafe { crate::arch::ppc::opal_call(crate::arch::ppc::OPAL_CEC_POWER_DOWN, 0, 0, 0) };
+        }
+    }
+
+    /// # Safety
+    /// Supervisor state.
+    pub unsafe fn reboot(_regs: Option<&PowerRegisters>) -> ! {
+        /// `OPAL_CEC_REBOOT`.
+        #[cfg(target_arch = "powerpc64")]
+        const OPAL_CEC_REBOOT: u64 = 6;
+        #[cfg(target_arch = "powerpc64")]
+        if crate::arch::ppc::opal_present() {
+            // SAFETY: as in `shutdown`.
+            unsafe { crate::arch::ppc::opal_call(OPAL_CEC_REBOOT, 0, 0, 0) };
+        }
+        crate::arch::halt()
+    }
+}
+
+#[cfg(any(target_arch = "powerpc", target_arch = "powerpc64"))]
+pub use ppc_power::{power_registers, reboot, shutdown, PowerRegisters};

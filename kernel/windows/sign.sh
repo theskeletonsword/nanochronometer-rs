@@ -4,7 +4,7 @@
 # Signs the built drivers with the test certificate using osslsigncode
 # (Linux side). Run `make all` first, then `make sign`.
 #
-# Output: build/signed/nanochrono_{x64,arm64}.sys
+# Output: build/signed/{x64,arm64}/nanochrono.sys
 #
 # The .pfx is created by certs/make-test-cert.sh and is never committed.
 
@@ -28,9 +28,11 @@ fi
 
 mkdir -p "$OUT"
 
-for f in build/nanochrono_x64.sys build/nanochrono_arm64.sys; do
+for a in x64 arm64; do
+    f="build/$a/nanochrono.sys"
     [[ -f "$f" ]] || { echo "missing $f — run 'make all' first" >&2; exit 1; }
-    base="$(basename "$f")"
+    base="$a/nanochrono.sys"
+    mkdir -p "$OUT/$a"
     echo "== signing $f"
     rm -f "$OUT/$base"
     osslsigncode sign \
@@ -44,7 +46,7 @@ for f in build/nanochrono_x64.sys build/nanochrono_arm64.sys; do
 done
 
 echo "== verifying signatures"
-for f in "$OUT"/*.sys; do
+for f in "$OUT"/*/nanochrono.sys; do
     echo "--- $f"
     osslsigncode verify -CAfile "$KEYS/nanochrono-test.pem" "$f" | grep -E "Signature verification|Verifying|error|ok" | head -n 6
 done

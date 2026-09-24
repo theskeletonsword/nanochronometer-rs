@@ -108,3 +108,87 @@ pub unsafe fn inb(port: u16) -> u8 {
     }
     value
 }
+
+#[cfg(target_arch = "x86_64")]
+/// Names of the architectural exception vectors, for the report.
+const EXCEPTION_NAMES: [&str; 32] = [
+    "#DE divide error",
+    "#DB debug",
+    "NMI",
+    "#BP breakpoint",
+    "#OF overflow",
+    "#BR bound range",
+    "#UD invalid opcode",
+    "#NM device not available",
+    "#DF double fault",
+    "coprocessor segment overrun",
+    "#TS invalid TSS",
+    "#NP segment not present",
+    "#SS stack fault",
+    "#GP general protection",
+    "#PF page fault",
+    "reserved",
+    "#MF x87 floating point",
+    "#AC alignment check",
+    "#MC machine check",
+    "#XM SIMD floating point",
+    "#VE virtualization",
+    "#CP control protection",
+    "reserved",
+    "reserved",
+    "reserved",
+    "reserved",
+    "reserved",
+    "reserved",
+    "#HV hypervisor injection",
+    "#VC VMM communication",
+    "#SX security",
+    "reserved",
+];
+
+#[cfg(target_arch = "x86_64")]
+/// Set on entry to the handler, so a fault *inside* the report — a bad
+/// framebuffer, a UART that is not there — halts instead of recursing.
+static IN_EXCEPTION: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+#[cfg(target_arch = "x86_64")]
+/// Entered from the IDT stubs in `boot32.S` with a pointer to
+/// `[vector, error, RIP, CS, RFLAGS, RSP, SS]`. Reports and never returns.
+///
+/// Goes through `panic!` so the report reaches the framebuffer's panic screen
+/// as well as the UART: on a laptop with no serial port the screen is the
+/// only place a fault can be seen.
+#[no_mangle]
+extern "C" fn nanochrono_x86_exception(frame: *const u64) -> ! {
+    if IN_EXCEPTION.swap(true, core::sync::atomic::Ordering::Relaxed) {
+        crate::arch::halt();
+    }
+    // SAFETY: the stub passes the seven quadwords it and the CPU just pushed.
+    let f = unsafe { core::slice::from_raw_parts(frame, 7) };
+    let vector = f[0] as usize;
+    let cr2: u64;
+    // SAFETY: reading CR2 at CPL 0 has no side effects.
+    unsafe {
+        core::arch::asm!("mov {v}, cr2", v = out(reg) cr2, options(nomem, nostack, preserves_flags));
+    }
+    extern "C" {
+        static nc_stack_guard: u8;
+    }
+    let guard = &raw const nc_stack_guard as u64;
+    if vector == 14 && (guard..guard + 4096).contains(&cr2) {
+        panic!(
+            "kernel stack overflow: write to the guard page at {:#x} from rip={:#x}",
+            cr2, f[2]
+        );
+    }
+    panic!(
+        "CPU exception {} ({}) error={:#x} rip={:#x} rsp={:#x} rflags={:#x} cr2={:#x}",
+        vector,
+        EXCEPTION_NAMES.get(vector).copied().unwrap_or("?"),
+        f[1],
+        f[2],
+        f[5],
+        f[4],
+        cr2
+    );
+}

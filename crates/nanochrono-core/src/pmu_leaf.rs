@@ -128,6 +128,20 @@ impl Reading {
             None
         }
     }
+
+    /// [`delta_since`](Self::delta_since) for a counter `width` bits wide.
+    ///
+    /// A 48-bit counter that wraps between the two reads gives an `after`
+    /// smaller than `before`, and a 64-bit subtraction turns that into a
+    /// number near 2⁶⁴ — a measurement of eighteen quintillion cycles
+    /// instead of a few thousand. Reducing the difference modulo 2^width is
+    /// the correct answer for any interval shorter than one full wrap.
+    pub const fn delta_since_width(self, earlier: Reading, width: u8) -> Option<u64> {
+        match self.delta_since(earlier) {
+            Some(delta) => Some(mask_to_width(delta, width)),
+            None => None,
+        }
+    }
 }
 
 /// Classifies a core from the `CPUID` values that describe it.
@@ -225,7 +239,7 @@ pub const fn mask_to_width(raw: u64, width: u8) -> u64 {
 #[inline]
 pub const fn amd_event_select(event: u16, unit_mask: u8) -> u64 {
     (event as u64 & 0xFF)
-        | (((event as u64 & 0xF00)) << 24)
+        | ((event as u64 & 0xF00) << 24)
         | ((unit_mask as u64) << 8)
 }
 
@@ -361,6 +375,14 @@ mod tests {
         // A 48-bit counter holding 1000, sign-extended by the CPU.
         let sign_extended = 0xFFFF_0000_0000_03E8u64;
         assert_eq!(mask_to_width(sign_extended, 48), 1000);
+
+        // Across a wrap, the width-aware delta is the short way round.
+        let before = Reading { value: (1u64 << 48) - 10, core_type: CoreType::Uniform };
+        let after = Reading { value: 5, core_type: CoreType::Uniform };
+        assert_eq!(after.delta_since_width(before, 48), Some(15));
+        let before32 = Reading { value: 0xFFFF_FFF0, core_type: CoreType::Uniform };
+        let after32 = Reading { value: 0x10, core_type: CoreType::Uniform };
+        assert_eq!(after32.delta_since_width(before32, 32), Some(0x20));
 
         // A width of zero or 64 means no masking is possible or needed.
         assert_eq!(mask_to_width(sign_extended, 64), sign_extended);

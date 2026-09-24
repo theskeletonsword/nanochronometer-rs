@@ -51,6 +51,15 @@ pub enum ClockRoute {
     LinuxPerfCycles,
     /// The counter read tagged to the widest available SIMD family.
     BestSimdCounter,
+    /// Bare PowerPC Time Base (`mftb`; `mftbu`/`mftb`/`mftbu` on 32-bit).
+    PpcTimebase,
+    /// `isync`-ordered PowerPC Time Base: the interval-boundary read.
+    PpcTimebaseIsync,
+    /// RISC-V `time` CSR (`rdtime`), fence-ordered.
+    RiscvRdtime,
+    /// 32-bit ARM: `ISB` + `CNTVCT` where user space may read the generic
+    /// timer, the monotonic clock otherwise.
+    Arm32Counter,
 }
 
 impl ClockRoute {
@@ -68,6 +77,10 @@ impl ClockRoute {
             ClockRoute::Arm64CntvctIsb => "arm64-isb-cntvct-el0",
             ClockRoute::LinuxPerfCycles => "linux-perf-cycles",
             ClockRoute::BestSimdCounter => "best-simd-counter",
+            ClockRoute::PpcTimebase => "ppc-mftb",
+            ClockRoute::PpcTimebaseIsync => "ppc-isync-mftb",
+            ClockRoute::RiscvRdtime => "riscv-rdtime",
+            ClockRoute::Arm32Counter => "arm32-isb-cntvct",
         }
     }
 
@@ -107,6 +120,11 @@ impl ClockRoute {
                 }
             }
             ClockRoute::BestSimdCounter => SimdFamily::best().is_some(),
+            ClockRoute::PpcTimebase | ClockRoute::PpcTimebaseIsync => {
+                cfg!(any(target_arch = "powerpc", target_arch = "powerpc64"))
+            }
+            ClockRoute::RiscvRdtime => cfg!(any(target_arch = "riscv32", target_arch = "riscv64")),
+            ClockRoute::Arm32Counter => cfg!(target_arch = "arm"),
         }
     }
 
@@ -131,7 +149,32 @@ impl ClockRoute {
             // fixed-frequency ticks.
             ClockRoute::Arm64CntvctIsb
         }
-        #[cfg(not(any(target_arch = "x86_64", target_arch = "x86", target_arch = "aarch64")))]
+        #[cfg(any(target_arch = "powerpc", target_arch = "powerpc64"))]
+        {
+            // The Time Base is one unprivileged instruction at a fixed rate:
+            // the PowerPC counterpart of CNTVCT_EL0, preferred over perf for
+            // the same reason.
+            ClockRoute::PpcTimebaseIsync
+        }
+        #[cfg(any(target_arch = "riscv32", target_arch = "riscv64"))]
+        {
+            // `rdtime` is the one counter Linux leaves readable in user space.
+            ClockRoute::RiscvRdtime
+        }
+        #[cfg(target_arch = "arm")]
+        {
+            ClockRoute::Arm32Counter
+        }
+        #[cfg(not(any(
+            target_arch = "x86_64",
+            target_arch = "x86",
+            target_arch = "aarch64",
+            target_arch = "powerpc",
+            target_arch = "powerpc64",
+            target_arch = "riscv32",
+            target_arch = "riscv64",
+            target_arch = "arm"
+        )))]
         {
             ClockRoute::MonotonicNs
         }
@@ -168,7 +211,11 @@ impl ClockRoute {
             | ClockRoute::Arm64Cntvct
             | ClockRoute::Arm64CntvctIsb
             | ClockRoute::LinuxPerfCycles
-            | ClockRoute::BestSimdCounter => {
+            | ClockRoute::BestSimdCounter
+            | ClockRoute::PpcTimebase
+            | ClockRoute::PpcTimebaseIsync
+            | ClockRoute::RiscvRdtime
+            | ClockRoute::Arm32Counter => {
                 let raw = read_counter(route);
                 (raw, chrono.units_to_ns(raw))
             }
@@ -197,6 +244,12 @@ impl ClockRoute {
         ClockRoute::Arm64CntvctIsb,
         ClockRoute::LinuxPerfCycles,
         ClockRoute::BestSimdCounter,
+        // Appended, never inserted: the FFI numbers routes by their position
+        // in this list.
+        ClockRoute::PpcTimebase,
+        ClockRoute::PpcTimebaseIsync,
+        ClockRoute::RiscvRdtime,
+        ClockRoute::Arm32Counter,
     ];
 }
 
@@ -231,7 +284,35 @@ fn read_counter(route: ClockRoute) -> u64 {
             _ => arch::counter_start(),
         }
     }
-    #[cfg(not(any(target_arch = "x86_64", target_arch = "x86", target_arch = "aarch64")))]
+    #[cfg(any(target_arch = "powerpc", target_arch = "powerpc64"))]
+    {
+        use arch::powerpc as p;
+        match route {
+            ClockRoute::PpcTimebase => p::timebase_raw(),
+            ClockRoute::PpcTimebaseIsync => p::timebase_end(),
+            _ => arch::counter_start(),
+        }
+    }
+    #[cfg(any(target_arch = "riscv32", target_arch = "riscv64"))]
+    {
+        let _ = route;
+        arch::riscv::rdtime_end()
+    }
+    #[cfg(target_arch = "arm")]
+    {
+        let _ = route;
+        arch::arm32::counter_isb()
+    }
+    #[cfg(not(any(
+        target_arch = "x86_64",
+        target_arch = "x86",
+        target_arch = "aarch64",
+        target_arch = "powerpc",
+        target_arch = "powerpc64",
+        target_arch = "riscv32",
+        target_arch = "riscv64",
+        target_arch = "arm"
+    )))]
     {
         let _ = route;
         arch::counter_start()

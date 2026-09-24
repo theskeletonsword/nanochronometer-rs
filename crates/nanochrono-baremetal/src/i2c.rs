@@ -243,12 +243,11 @@ impl I2cMaster {
     /// routinely above four gigabytes, which is why the map has to be as
     /// large as it is.
     pub unsafe fn new(device: &Device, speed: Speed, ticks_per_us: u64) -> Option<I2cMaster> {
-        let base = device.bar0 as usize;
-        if base == 0 {
-            return None;
-        }
+        let base = device.bar0_addr()?;
+        // Memory decoding only: this driver moves bytes through the FIFOs by
+        // programmed I/O, so the controller never needs to master the bus.
         // SAFETY: forwarded from this function's own contract.
-        unsafe { device.enable() };
+        unsafe { device.enable_mmio() };
 
         let mut master = I2cMaster {
             base,

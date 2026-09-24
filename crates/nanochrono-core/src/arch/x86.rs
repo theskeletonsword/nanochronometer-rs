@@ -12,13 +12,16 @@
 //! without it the target falls back to `clock_gettime`, which costs some
 //! 15,000 cycles per read pair against roughly 30 for `RDTSCP`.
 //!
-//! The SIMD probes and ISA kernels are 64-bit only: they are written against
-//! the 64-bit register file, and rewriting fifteen assembly blocks to buy
-//! microbenchmarks on an ABI that exists mainly for emulators is not a trade
-//! worth making. [`crate::backend::Backend`] reports those families as
-//! unavailable on 32-bit rather than silently substituting a scalar loop. There is no separate assembler source and no
-//! build-time assembler step: the ISA sequences live next to the code that
-//! dispatches them, so `cargo build` is the whole toolchain.
+//! The SIMD *probes* build for both widths: they take their pointers as
+//! register operands of the target's width and touch at most `xmm0`/`xmm1`
+//! (or `ymm`/`zmm` 0-1), all of which exist in 32-bit mode. The timer
+//! *kernels* do 64-bit arithmetic in `rax` and stay x86-64 only;
+//! [`crate::backend::Backend`] reports those families as having no kernel on
+//! 32-bit rather than silently substituting a scalar loop.
+//!
+//! There is no separate assembler source and no build-time assembler step:
+//! the ISA sequences live next to the code that dispatches them, so
+//! `cargo build` is the whole toolchain.
 //!
 //! Two invariants are preserved from the assembly originals:
 //!
@@ -325,6 +328,9 @@ pub unsafe fn prefetch_nta(ptr: *const u8) {
 ///
 /// # Safety
 /// Requires AVX.
+// Gated like every other `target_feature` here: the soft-float
+// `x86_64-unknown-none` fallback rejects enabling an SSE-family feature.
+#[cfg(feature = "simd")]
 #[inline]
 #[target_feature(enable = "avx")]
 pub unsafe fn vzeroupper() {
@@ -465,12 +471,13 @@ pub fn read_overhead_cycles() -> u64 {
 // Per-family SIMD probes
 // ---------------------------------------------------------------------------
 
-// The probes and kernels below name 64-bit registers (`rdi`, `rsi`, `rdx`,
-// `rax`) and move 64-bit values into vector registers, so the two macros that
-// generate them gate every item on `x86_64` *and* on the `simd` feature. On
-// i686 the counter layer above still works and the SIMD families report as
-// unavailable; the same is true of a freestanding build, where the target ABI
-// is soft-float and no XMM register can be allocated.
+// The probes take their pointers as register operands of whatever width the
+// target has, so they build for i686 as well as x86-64 (only `xmm0`-`xmm7`
+// exist in 32-bit mode, and no probe uses more than two). The kernels below
+// them do 64-bit arithmetic in `rax` and move it through vector registers,
+// so they stay x86-64 only; on i686 the timer backends run the scalar
+// kernel. Both are behind the `simd` feature, which a freestanding build with
+// a soft-float ABI turns off.
 
 /// Emits `counter`, `vector_load`, `vector_xor` and `barrier` probes for one
 /// ISA family, each timed with `LFENCE`+`RDTSC` .. `RDTSCP`+`LFENCE`.
@@ -487,7 +494,7 @@ macro_rules! simd_family {
         $(, clobber = ($($cl:tt)*))?
         $(,)?
     ) => {
-        #[cfg(all(target_arch = "x86_64", feature = "simd"))]
+        #[cfg(all(any(target_arch = "x86_64", target_arch = "x86"), feature = "simd"))]
         pub mod $module {
             use super::*;
 
@@ -509,7 +516,7 @@ macro_rules! simd_family {
                 unsafe {
                     asm!(
                         $($load,)+
-                        in("rdi") ptr,
+                        a = in(reg) ptr,
                         $($($cl)*,)?
                         options(nostack, preserves_flags, readonly),
                     );
@@ -530,9 +537,12 @@ macro_rules! simd_family {
                 unsafe {
                     asm!(
                         $($xor,)+
-                        in("rdi") a,
-                        in("rsi") b,
-                        in("rdx") out,
+                        // Not every family's sequence reads both inputs; the
+                        // comment marks every operand used for the checker.
+                        "/* {a} {b} {o} */",
+                        a = in(reg) a,
+                        b = in(reg) b,
+                        o = in(reg) out,
                         $($($cl)*,)?
                         options(nostack, preserves_flags),
                     );
@@ -557,76 +567,76 @@ macro_rules! simd_family {
 simd_family! {
     mmx,
     feature = "sse",
-    load = { "movq mm0, [rdi]", "emms" },
-    xor = { "movq mm0, [rdi]", "pxor mm0, [rsi]", "movq [rdx], mm0", "emms" },
+    load = { "movq mm0, [{a}]", "emms" },
+    xor = { "movq mm0, [{a}]", "pxor mm0, [{b}]", "movq [{o}], mm0", "emms" },
     clobber = (out("mm0") _)
 }
 
 simd_family! {
     sse,
     feature = "sse",
-    load = { "movups xmm0, [rdi]" },
-    xor = { "movups xmm0, [rdi]", "xorps xmm0, [rsi]", "movups [rdx], xmm0" },
+    load = { "movups xmm0, [{a}]" },
+    xor = { "movups xmm0, [{a}]", "xorps xmm0, [{b}]", "movups [{o}], xmm0" },
     clobber = (out("xmm0") _)
 }
 
 simd_family! {
     sse2,
     feature = "sse2",
-    load = { "movdqu xmm0, [rdi]" },
-    xor = { "movdqu xmm0, [rdi]", "pxor xmm0, [rsi]", "movdqu [rdx], xmm0" },
+    load = { "movdqu xmm0, [{a}]" },
+    xor = { "movdqu xmm0, [{a}]", "pxor xmm0, [{b}]", "movdqu [{o}], xmm0" },
     clobber = (out("xmm0") _)
 }
 
 simd_family! {
     sse3,
     feature = "sse3",
-    load = { "lddqu xmm0, [rdi]" },
-    xor = { "lddqu xmm0, [rdi]", "lddqu xmm1, [rsi]", "xorps xmm0, xmm1", "movdqu [rdx], xmm0" },
+    load = { "lddqu xmm0, [{a}]" },
+    xor = { "lddqu xmm0, [{a}]", "lddqu xmm1, [{b}]", "xorps xmm0, xmm1", "movdqu [{o}], xmm0" },
     clobber = (out("xmm0") _, out("xmm1") _)
 }
 
 simd_family! {
     ssse3,
     feature = "ssse3",
-    load = { "movdqu xmm0, [rdi]" },
-    xor = { "movdqu xmm0, [rdi]", "movdqu xmm1, [rsi]", "pshufb xmm0, xmm1", "movdqu [rdx], xmm0" },
+    load = { "movdqu xmm0, [{a}]" },
+    xor = { "movdqu xmm0, [{a}]", "movdqu xmm1, [{b}]", "pshufb xmm0, xmm1", "movdqu [{o}], xmm0" },
     clobber = (out("xmm0") _, out("xmm1") _)
 }
 
 simd_family! {
     sse41,
     feature = "sse4.1",
-    load = { "movdqu xmm0, [rdi]" },
-    xor = { "movdqu xmm0, [rdi]", "movdqu xmm1, [rsi]", "pblendw xmm0, xmm1, 0xAA", "movdqu [rdx], xmm0" },
+    load = { "movdqu xmm0, [{a}]" },
+    xor = { "movdqu xmm0, [{a}]", "movdqu xmm1, [{b}]", "pblendw xmm0, xmm1, 0xAA", "movdqu [{o}], xmm0" },
     clobber = (out("xmm0") _, out("xmm1") _)
 }
 
 simd_family! {
     sse42,
     feature = "sse4.2",
-    load = { "movdqu xmm0, [rdi]" },
-    xor = { "movdqu xmm0, [rdi]", "movdqu xmm1, [rsi]", "pcmpgtq xmm0, xmm1", "movdqu [rdx], xmm0" },
+    load = { "movdqu xmm0, [{a}]" },
+    xor = { "movdqu xmm0, [{a}]", "movdqu xmm1, [{b}]", "pcmpgtq xmm0, xmm1", "movdqu [{o}], xmm0" },
     clobber = (out("xmm0") _, out("xmm1") _)
 }
 
 simd_family! {
     f16c,
     feature = "f16c",
-    load = { "vcvtph2ps xmm0, qword ptr [rdi]", "vzeroupper" },
-    xor = { "vcvtph2ps xmm0, qword ptr [rdi]", "vmovups [rdx], xmm0", "vzeroupper" },
+    load = { "vcvtph2ps xmm0, qword ptr [{a}]", "vzeroupper" },
+    xor = { "vcvtph2ps xmm0, qword ptr [{a}]", "vmovups [{o}], xmm0", "vzeroupper" },
     clobber = (out("xmm0") _)
 }
 
 simd_family! {
     fma,
     feature = "fma",
-    load = { "vmovups ymm0, [rdi]", "vzeroupper" },
+    load = { "vmovups ymm0, [{a}]", "vzeroupper" },
     xor = {
-        "vmovups ymm0, [rdi]",
-        "vmovups ymm1, [rsi]",
+        "vmovups ymm0, [{a}]",
+        "vmovups ymm1, [{b}]",
         "vfmadd132ps ymm0, ymm1, ymm1",
-        "vmovups [rdx], ymm0",
+        "vmovups [{o}], ymm0",
         "vzeroupper",
     },
     clobber = (out("ymm0") _, out("ymm1") _)
@@ -635,16 +645,16 @@ simd_family! {
 simd_family! {
     avx,
     feature = "avx",
-    load = { "vmovups ymm0, [rdi]", "vzeroupper" },
-    xor = { "vmovups ymm0, [rdi]", "vxorps ymm0, ymm0, [rsi]", "vmovups [rdx], ymm0", "vzeroupper" },
+    load = { "vmovups ymm0, [{a}]", "vzeroupper" },
+    xor = { "vmovups ymm0, [{a}]", "vxorps ymm0, ymm0, [{b}]", "vmovups [{o}], ymm0", "vzeroupper" },
     clobber = (out("ymm0") _)
 }
 
 simd_family! {
     avx2,
     feature = "avx2",
-    load = { "vmovdqu ymm0, [rdi]", "vzeroupper" },
-    xor = { "vmovdqu ymm0, [rdi]", "vpxor ymm0, ymm0, [rsi]", "vmovdqu [rdx], ymm0", "vzeroupper" },
+    load = { "vmovdqu ymm0, [{a}]", "vzeroupper" },
+    xor = { "vmovdqu ymm0, [{a}]", "vpxor ymm0, ymm0, [{b}]", "vmovdqu [{o}], ymm0", "vzeroupper" },
     clobber = (out("ymm0") _)
 }
 
@@ -656,12 +666,12 @@ simd_family! {
 simd_family! {
     avx_vnni,
     feature = "avxvnni",
-    load = { "vmovdqu ymm0, [rdi]", "vzeroupper" },
+    load = { "vmovdqu ymm0, [{a}]", "vzeroupper" },
     xor = {
         "vpxor ymm0, ymm0, ymm0",
         "vpcmpeqb ymm1, ymm1, ymm1",
-        "{{vex}} vpdpbusd ymm0, ymm1, [rsi]",
-        "vmovdqu [rdx], ymm0",
+        "{{vex}} vpdpbusd ymm0, ymm1, [{b}]",
+        "vmovdqu [{o}], ymm0",
         "vzeroupper",
     },
     clobber = (out("ymm0") _, out("ymm1") _)
@@ -670,11 +680,11 @@ simd_family! {
 simd_family! {
     avx512,
     feature = "avx512f",
-    load = { "vmovdqu64 zmm0, [rdi]", "vzeroupper" },
+    load = { "vmovdqu64 zmm0, [{a}]", "vzeroupper" },
     xor = {
-        "vmovdqu64 zmm0, [rdi]",
-        "vpxord zmm0, zmm0, [rsi]",
-        "vmovdqu64 [rdx], zmm0",
+        "vmovdqu64 zmm0, [{a}]",
+        "vpxord zmm0, zmm0, [{b}]",
+        "vmovdqu64 [{o}], zmm0",
         "vzeroupper",
     },
     clobber = (out("zmm0") _)
@@ -683,13 +693,13 @@ simd_family! {
 simd_family! {
     avx512_vnni,
     feature = "avx512vnni",
-    load = { "vmovdqu64 zmm0, [rdi]", "vzeroupper" },
+    load = { "vmovdqu64 zmm0, [{a}]", "vzeroupper" },
     xor = {
         "vpxord zmm0, zmm0, zmm0",
         "mov eax, -1",
         "vpbroadcastd zmm1, eax",
-        "vpdpbusd zmm0, zmm1, [rsi]",
-        "vmovdqu64 [rdx], zmm0",
+        "vpdpbusd zmm0, zmm1, [{b}]",
+        "vmovdqu64 [{o}], zmm0",
         "vzeroupper",
     },
     clobber = (out("zmm0") _, out("zmm1") _, out("eax") _)
@@ -711,13 +721,17 @@ pub fn kernel_scalar(loops: usize) -> u64 {
         // `asm!` keeps the chain intact: an autovectoriser would otherwise be
         // free to turn a dependent scalar loop into something wider.
         unsafe {
+            // No `preserves_flags`: `rol`, `xor` and `add` all write EFLAGS.
+            // Claiming otherwise let the compiler keep the loop's own
+            // compare-and-branch flags live across this block, and on i686
+            // Android it did — the loop tested stale flags and never ended.
             asm!(
                 "rol {x}, 7",
                 "xor {x}, {c}",
                 "add {x}, {c}",
                 x = inout(reg) x,
                 c = in(reg) 0xD192_ED03usize,
-                options(nomem, nostack, preserves_flags),
+                options(nomem, nostack),
             );
         }
     }
@@ -978,6 +992,106 @@ pub unsafe fn kernel_pclmul(loops: usize) -> u64 {
             n = inout(reg) loops => _,
             out = out(reg) out,
             out("xmm0") _, out("xmm1") _, out("xmm2") _, out("xmm3") _, out("xmm4") _,
+            options(nomem, nostack),
+        );
+    }
+    out
+}
+
+/// `VAESENC`/`VAESENCLAST` on YMM: two AES blocks per instruction, four
+/// independent 256-bit chains — the VEX form of [`kernel_aesni`], so one
+/// iteration is the same instruction count on twice the blocks.
+///
+/// # Safety
+/// Requires VAES and AVX2 (every VAES part has both), with the YMM state
+/// enabled in XCR0.
+#[cfg(all(target_arch = "x86_64", feature = "simd"))]
+#[inline(never)]
+#[target_feature(enable = "vaes,avx2")]
+pub unsafe fn kernel_vaes(loops: usize) -> u64 {
+    let mut out: u64 = 0;
+    unsafe {
+        asm!(
+            "vmovq xmm4, {seed}",
+            "vpbroadcastq ymm4, xmm4",
+            "vmovdqa ymm0, ymm4",
+            "vpslld ymm1, ymm4, 1",
+            "vpslld ymm2, ymm4, 2",
+            "vpslld ymm3, ymm4, 3",
+            "test {n}, {n}",
+            "jz 3f",
+            "2:",
+            "vaesenc ymm0, ymm0, ymm4",
+            "vaesenc ymm1, ymm1, ymm4",
+            "vaesenc ymm2, ymm2, ymm4",
+            "vaesenc ymm3, ymm3, ymm4",
+            "vaesenclast ymm0, ymm0, ymm4",
+            "vaesenclast ymm1, ymm1, ymm4",
+            "vaesenclast ymm2, ymm2, ymm4",
+            "vaesenclast ymm3, ymm3, ymm4",
+            "dec {n}",
+            "jnz 2b",
+            "3:",
+            "vpxor ymm0, ymm0, ymm1",
+            "vpxor ymm2, ymm2, ymm3",
+            "vpxor ymm0, ymm0, ymm2",
+            // The seed is broadcast, so both 128-bit lanes carry the same
+            // state: XOR-folding them would cancel to zero. Add instead.
+            "vextracti128 xmm1, ymm0, 1",
+            "vpaddq xmm0, xmm0, xmm1",
+            "vmovq {out}, xmm0",
+            // Upper YMM state left dirty costs the next SSE instruction a
+            // transition penalty on some parts.
+            "vzeroupper",
+            seed = in(reg) 0x0F1E_2D3C_4B5A_6978u64,
+            n = inout(reg) loops => _,
+            out = out(reg) out,
+            out("ymm0") _, out("ymm1") _, out("ymm2") _, out("ymm3") _, out("ymm4") _,
+            options(nomem, nostack),
+        );
+    }
+    out
+}
+
+/// `VPCLMULQDQ` on YMM: two 64x64 carry-less products per instruction, in
+/// the same chain shape as [`kernel_pclmul`] (`vpaddq` keeps it from
+/// telescoping to zero, the lane swap feeds the high bits back).
+///
+/// # Safety
+/// Requires VPCLMULQDQ and AVX2, with the YMM state enabled in XCR0.
+#[cfg(all(target_arch = "x86_64", feature = "simd"))]
+#[inline(never)]
+#[target_feature(enable = "vpclmulqdq,avx2")]
+pub unsafe fn kernel_vpclmul(loops: usize) -> u64 {
+    let mut out: u64 = 0;
+    unsafe {
+        asm!(
+            "vmovq xmm0, {a}",
+            "vpbroadcastq ymm0, xmm0",
+            "vmovq xmm1, {b}",
+            "vpbroadcastq ymm1, xmm1",
+            "vmovdqa ymm4, ymm0",
+            "vpxor ymm2, ymm2, ymm2",
+            "test {n}, {n}",
+            "jz 3f",
+            "2:",
+            "vpclmulqdq ymm3, ymm0, ymm1, 0x00",
+            "vpaddq ymm2, ymm2, ymm3",
+            "vpshufd ymm3, ymm3, 0x4E",
+            "vpxor ymm0, ymm0, ymm3",
+            "vpaddq ymm0, ymm0, ymm4",
+            "dec {n}",
+            "jnz 2b",
+            "3:",
+            "vextracti128 xmm1, ymm2, 1",
+            "vpaddq xmm2, xmm2, xmm1",
+            "vmovq {out}, xmm2",
+            "vzeroupper",
+            a = in(reg) 0x0123_4567_89AB_CDEFu64,
+            b = in(reg) 0xFEDC_BA98_7654_3210u64,
+            n = inout(reg) loops => _,
+            out = out(reg) out,
+            out("ymm0") _, out("ymm1") _, out("ymm2") _, out("ymm3") _, out("ymm4") _,
             options(nomem, nostack),
         );
     }

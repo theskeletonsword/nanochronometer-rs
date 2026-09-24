@@ -69,14 +69,37 @@ pub mod aml;
 pub mod arch;
 pub mod backend;
 pub mod cpu;
+/// Checking the primary counter against an independent clock.
+///
+/// `no_std` and pure: the caller reads both clocks and passes the pair.
+pub mod crosscheck;
 /// Reading a HID report descriptor to find a pointer.
 ///
 /// `no_std` and pure: the freestanding kernel and a hosted test run it over
 /// the same bytes, which is what lets a real touchpad's descriptor be a test
 /// fixture rather than a hardware dependency.
 pub mod hid_report;
+pub mod hypercall_hal;
+/// The microbenchmark kernels per ISA family. `no_std`; shared by the
+/// hosted dispatcher and the freestanding benchmark tab.
+pub mod kernels;
 pub mod pmu_leaf;
+/// The typed code a restart or power-off waits for (BadUSB defence).
+///
+/// `no_std` and pure, like [`reprobe`]: the caller supplies time and entropy.
+pub mod power_confirm;
 pub mod redundancy;
+pub mod reprobe;
+/// When to scrub protected state, and when to escalate to verified reads.
+///
+/// `no_std` and pure: the caller supplies the clock and the outcomes.
+pub mod space_mode;
+/// Submersion, ingress ratings and temperature, for a phone under water.
+///
+/// Uses `f64` arithmetic, so it needs `std` (no `libm` in the freestanding
+/// build).
+#[cfg(feature = "std")]
+pub mod underwater;
 pub mod simd;
 
 #[cfg(feature = "std")]
@@ -106,6 +129,8 @@ pub mod pmu;
 #[cfg(feature = "std")]
 pub mod probe;
 #[cfg(feature = "std")]
+pub mod ring0_perf;
+#[cfg(feature = "std")]
 pub mod stats;
 #[cfg(feature = "std")]
 pub mod stopwatch;
@@ -129,6 +154,8 @@ pub use hypervisor::{Hypervisor, HypervisorReport, TimingImpact};
 pub use kvmclock::{ClockPairing, HostSync};
 #[cfg(feature = "std")]
 pub use pmu::{PmuBackend, PmuReading};
+#[cfg(feature = "std")]
+pub use ring0_perf::{Ring0Event, Ring0Perf};
 #[cfg(feature = "std")]
 pub use probe::{AuditConfig, CacheAudit, CacheProbe};
 pub use redundancy::{Integrity, IntegrityStats, Protected};

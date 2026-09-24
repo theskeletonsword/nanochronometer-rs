@@ -149,4 +149,14 @@ release layout.
                         the .exe. Nothing from it is linked into any binary,
                         so it is not redistributed.
 
+  sha2, hmac, aes-gcm,  Apache-2.0 OR MIT (RustCrypto)
+  chacha20poly1305      Bare-metal kernel only, for its RustCrypto benchmark.
+  cpufeatures 0.2.17    Apache-2.0 OR MIT (RustCrypto)
+                        Vendored and modified in
+                        crates/nanochrono-baremetal/vendor/cpufeatures/: it
+                        reports every feature absent when target_os is "none",
+                        and the copy detects them there instead (CPUID on x86,
+                        the EL1 ID registers on AArch64). Its LICENSE-APACHE
+                        and LICENSE-MIT are kept beside the source.
+
 Run `cargo tree --format "{p} {l}"` for the complete, version-exact list.

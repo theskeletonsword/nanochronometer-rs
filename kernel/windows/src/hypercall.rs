@@ -90,7 +90,91 @@ mod x64 {
     }
 
     pub fn svm_available() -> bool {
-        cpuid(CPUID_LEAF_FEATURES, 0)[2] & (1 << 2) != 0
+        // SVM is CPUID 8000_0001h ECX bit 2 (AMD APM vol. 3, "CPUID Fn8000_0001_ECX").
+        cpuid(0x8000_0000, 0)[0] >= 0x8000_0001 && cpuid(0x8000_0001, 0)[2] & (1 << 2) != 0
+    }
+
+    /// The x86-64 hypercall instruction of a vendor.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    pub enum HypercallInsn {
+        Vmcall,
+        Vmmcall,
+    }
+
+    impl HypercallInsn {
+        pub const fn name(self) -> &'static str {
+            match self {
+                HypercallInsn::Vmcall => "vmcall",
+                HypercallInsn::Vmmcall => "vmmcall",
+            }
+        }
+    }
+
+    /// The hypercall HAL — mandatory, and decided at run time.
+    ///
+    /// Intel, Zhaoxin and VIA/Centaur (VMX) define `VMCALL`; AMD and Hygon
+    /// (SVM) define `VMMCALL`. The other one is `#UD` under most hypervisors,
+    /// and an unhandled `#UD` in a driver is a bugcheck. The choice is made
+    /// from `CPUID.0H` at every driver start, never at build time: one
+    /// Windows installation (on an external SSD, say) boots on an Intel
+    /// machine and then an AMD one. An unknown vendor gets no hypercall.
+    ///
+    /// The same table as `nanochrono_core::hypercall_hal`, which a driver
+    /// built without `std` and without that crate carries itself.
+    pub fn hypercall_insn() -> Option<HypercallInsn> {
+        let v = vendor();
+        match &v[..12] {
+            b"GenuineIntel" | b"  Shanghai  " | b"CentaurHauls" => Some(HypercallInsn::Vmcall),
+            b"AuthenticAMD" | b"HygonGenuine" => Some(HypercallInsn::Vmmcall),
+            _ => None,
+        }
+    }
+
+    /// The 12-byte signature at `CPUID.40000000H`, or zeros when the
+    /// hypervisor bit is clear (the leaf is then not defined).
+    pub fn hv_signature() -> [u8; 12] {
+        let mut s = [0u8; 12];
+        if !hypervisor_present() {
+            return s;
+        }
+        let v = cpuid(0x4000_0000, 0);
+        s[..4].copy_from_slice(&v[1].to_le_bytes());
+        s[4..8].copy_from_slice(&v[2].to_le_bytes());
+        s[8..12].copy_from_slice(&v[3].to_le_bytes());
+        s
+    }
+
+    /// Whether this hypervisor is known to *return* from an unknown
+    /// hypercall rather than inject `#UD`.
+    ///
+    /// Without SEH (see the module docs) a `#UD` here is a bugcheck, so the
+    /// probe only runs where the answer is documented: KVM returns
+    /// `-KVM_ENOSYS` for an unknown number, Hyper-V (TLFS, with the
+    /// hypercall page Windows itself enables) returns
+    /// `HV_STATUS_INVALID_HYPERCALL_CODE`, Xen returns `-ENOSYS`.
+    pub fn hypercall_known_safe(sig: &[u8; 12]) -> bool {
+        sig == b"KVMKVMKVM\0\0\0" || sig == b"Microsoft Hv" || sig == b"XenVMMXenVMM"
+    }
+
+    /// Minimum TSC cycles of one `CPUID` over `rounds` tries: under VMX/SVM
+    /// every `CPUID` exits, so this is the exit round trip.
+    pub fn exit_cost_cycles(rounds: u32) -> u64 {
+        use core::arch::x86_64::{_mm_lfence, _rdtsc};
+        let mut best = u64::MAX;
+        for _ in 0..rounds.max(1) {
+            // SAFETY: LFENCE/RDTSC are unprivileged and always present on x86-64.
+            let (a, b) = unsafe {
+                _mm_lfence();
+                let a = _rdtsc();
+                _mm_lfence();
+                let _ = cpuid(0, 0);
+                _mm_lfence();
+                let b = _rdtsc();
+                (a, b)
+            };
+            best = best.min(b.wrapping_sub(a));
+        }
+        best
     }
 
     /// Hypercall number used by the ported Linux probe (RAX = 0xFFFF).
@@ -109,7 +193,11 @@ mod x64 {
             in("r8") 0u64,
             in("r9") 0u64,
             lateout("rax") ret,
-            options(nomem, nostack, preserves_flags)
+            // KVM clobbers only RAX; Hyper-V and Xen may write the input
+            // registers back. Declare them all lost.
+            lateout("rcx") _, lateout("rdx") _, lateout("r8") _, lateout("r9") _,
+            lateout("r10") _, lateout("r11") _,
+            options(nostack)
         );
         ret
     }
@@ -127,7 +215,9 @@ mod x64 {
             in("r8") 0u64,
             in("r9") 0u64,
             lateout("rax") ret,
-            options(nomem, nostack, preserves_flags)
+            lateout("rcx") _, lateout("rdx") _, lateout("r8") _, lateout("r9") _,
+            lateout("r10") _, lateout("r11") _,
+            options(nostack)
         );
         ret
     }
@@ -135,7 +225,10 @@ mod x64 {
 
 /// x86_64 re-exports.
 #[cfg(target_arch = "x86_64")]
-pub use self::x64::{hypervisor_present, probe_vmcall, probe_vmmcall, svm_available, vendor, vmx_available};
+pub use self::x64::{
+    exit_cost_cycles, hypercall_insn, HypercallInsn, hv_signature, hypercall_known_safe, hypervisor_present,
+    probe_vmcall, probe_vmmcall, svm_available, vendor, vmx_available,
+};
 
 /// arm64 module, ported from the Linux `hvc`/`mrs` probes.
 #[cfg(target_arch = "aarch64")]
@@ -174,7 +267,13 @@ mod arm64 {
             lateout("x1") out[1],
             lateout("x2") out[2],
             lateout("x3") out[3],
-            options(nomem, nostack, preserves_flags)
+            // SMCCC v1.0 lets the callee clobber x4-x17; v1.1 preserves
+            // them, but which one answers is not known in advance.
+            lateout("x4") _, lateout("x5") _, lateout("x6") _, lateout("x7") _,
+            lateout("x8") _, lateout("x9") _, lateout("x10") _, lateout("x11") _,
+            lateout("x12") _, lateout("x13") _, lateout("x14") _, lateout("x15") _,
+            lateout("x16") _, lateout("x17") _,
+            options(nostack)
         );
         out
     }

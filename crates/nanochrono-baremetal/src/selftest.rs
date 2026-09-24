@@ -8,11 +8,11 @@
 //! system.
 
 use crate::pmu::{CorePmu, CounterRoute};
-#[cfg(target_arch = "x86_64")]
+#[cfg(x86_any)]
 use crate::progress::{self, Phase};
 use crate::{arch, println};
 use nanochrono_core::arch as counters;
-#[cfg(target_arch = "x86_64")]
+#[cfg(x86_any)]
 use nanochrono_core::aml::{GpioInterrupt, Namespace, Provenance};
 use nanochrono_core::redundancy::Protected;
 
@@ -25,37 +25,39 @@ pub unsafe fn run() {
     println!("arch: {}", counters::ARCH.name());
     println!();
 
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(x86_any)]
     progress::phase(Phase::CpuFeatures, report_cpu);
-    #[cfg(not(target_arch = "x86_64"))]
+    #[cfg(not(x86_any))]
     report_cpu();
 
     // SAFETY: forwarded from this function's own contract.
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(x86_any)]
     progress::enter(Phase::Pmu);
     // SAFETY: forwarded from this function's own contract.
     unsafe { report_pmu() };
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(x86_any)]
     progress::leave(Phase::Pmu);
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(x86_any)]
     progress::phase(Phase::Counter, report_counter);
-    #[cfg(not(target_arch = "x86_64"))]
+    #[cfg(not(x86_any))]
     report_counter();
 
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(x86_any)]
     {
         progress::enter(Phase::Pci);
         // SAFETY: forwarded from this function's own contract.
         unsafe { report_usb() };
         // SAFETY: as above; reads firmware tables only.
+        unsafe { report_dma() };
+        // SAFETY: as above; reads firmware tables only.
         unsafe { report_acpi_namespace() };
         progress::leave(Phase::Pci);
     }
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(x86_any)]
     progress::enter(Phase::Hypervisor);
     // SAFETY: forwarded from this function's own contract.
     unsafe { report_hypervisor() };
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(x86_any)]
     progress::leave(Phase::Hypervisor);
 
     report_integrity();
@@ -73,7 +75,7 @@ pub unsafe fn run() {
 ///
 /// # Safety
 /// Reads PCI configuration space; requires ring 0.
-#[cfg(target_arch = "x86_64")]
+#[cfg(x86_any)]
 unsafe fn report_usb() {
     use crate::pci;
 
@@ -117,6 +119,32 @@ unsafe fn report_usb() {
     println!();
 }
 
+/// Who can write memory behind the CPU's back.
+///
+/// # Safety
+/// Reads ACPI tables; requires ring 0.
+#[cfg(x86_any)]
+unsafe fn report_dma() {
+    println!("== DMA protection ==");
+    let mut iommu = None;
+    // SAFETY: forwarded from this function's own contract.
+    unsafe {
+        crate::acpi::for_each_table_signature(|sig| {
+            match &sig {
+                b"DMAR" => iommu = Some("Intel VT-d (DMAR)"),
+                b"IVRS" => iommu = Some("AMD-Vi (IVRS)"),
+                _ => {}
+            }
+            iommu.is_none()
+        })
+    };
+    let lockdown = crate::pci::dma_lockdown();
+    println!("  iommu          : {} (not programmed by this kernel)", iommu.unwrap_or("none described"));
+    println!("  bus mastering  : revoked on {}, kept on {}", lockdown.revoked, lockdown.kept);
+    println!("  kept devices (bridges, display, USB hosts) can still reach all of memory");
+    println!();
+}
+
 /// What the firmware's AML says is on this machine.
 ///
 /// Printed because the namespace walk is the least verifiable thing in this
@@ -128,7 +156,7 @@ unsafe fn report_usb() {
 ///
 /// # Safety
 /// Reads firmware tables; requires ring 0 and an identity map.
-#[cfg(target_arch = "x86_64")]
+#[cfg(x86_any)]
 unsafe fn report_acpi_namespace() {
     use nanochrono_core::aml::{Namespace, I2C_HID_CID};
 
@@ -275,7 +303,7 @@ unsafe fn report_acpi_namespace() {
                     match found.interrupt {
                         Some(interrupt) => {
                             println!("    gpio pin     : {}", interrupt.pin);
-                            #[cfg(target_arch = "x86_64")]
+                            #[cfg(x86_any)]
                             report_gpio(&namespace, interrupt);
                         }
                         None => println!("    gpio pin     : none declared"),
@@ -300,7 +328,7 @@ unsafe fn report_acpi_namespace() {
 /// # Safety
 ///
 /// Reads firmware tables. Reads only, and every failure is a printed line.
-#[cfg(target_arch = "x86_64")]
+#[cfg(x86_any)]
 fn report_controller(namespace: &Namespace, wanted: &nanochrono_core::aml::Path) {
     use nanochrono_core::aml::Value;
 
@@ -368,7 +396,7 @@ fn report_controller(namespace: &Namespace, wanted: &nanochrono_core::aml::Path)
 ///
 /// Reads firmware-declared MMIO. Reads only, and every failure is a printed
 /// line rather than a fault.
-#[cfg(target_arch = "x86_64")]
+#[cfg(x86_any)]
 fn report_gpio(namespace: &Namespace, interrupt: GpioInterrupt) {
     let mut path = [0u8; 64];
     let used = interrupt.controller.render(&mut path);
@@ -438,10 +466,21 @@ unsafe fn report_hypervisor() {
         println!("  max hv leaf    : {}", Hex(report.max_leaf as u64));
     }
     println!("  hypercall      : {}", yes_no(report.hypercall_ok));
+    #[cfg(x86_any)]
+    println!(
+        "  hypercall HAL  : {} (by CPU vendor {})",
+        report.hypercall_insn.map_or("none (unknown vendor)", |i| i.name()),
+        nanochrono_core::cpu::vendor().name()
+    );
     // The number that has to stay small. See `hypervisor::hypercalls`.
     println!(
-        "  hypercalls     : {} (asked once; the stopwatch reads the counter)",
+        "  hypercalls     : {} (boot negotiation only; the stopwatch reads the counter)",
         report.hypercalls
+    );
+    println!(
+        "  probes run     : {} (boot negotiation; re-probe waits {} s between)",
+        report.probes,
+        nanochrono_core::reprobe::DEFAULT_COOLDOWN_S
     );
 
     match report.pairing {
@@ -478,9 +517,13 @@ impl core::fmt::Display for Hex {
 fn report_cpu() {
     let f = nanochrono_core::cpu::features();
     println!("== CPU ==");
+    let irq = crate::irq_priority::state();
+    println!("  irq priority   : {} = {}", irq.register, irq.outcome);
+    #[cfg(target_arch = "arm")]
+    println!("  AArch32 (ARMv7-A)  neon={}", f.neon);
     // Only the extensions this crate can dispatch to are listed; the full set
     // needs formatting machinery an allocator-free build does not have.
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(x86_any)]
     {
         // Who made the part, and what follows from it. Not decoration: the
         // vendor decides whether `CPUID.15H`/`16H` may be believed as a
@@ -529,6 +572,67 @@ fn report_cpu() {
         println!("  neon={} sve={} sve2={}", f.neon, f.sve, f.sve2);
         println!("  aes={} sha2={} sme={}", f.arm_aes, f.arm_sha2, f.sme);
         println!("  el={}", crate::arch::arm::current_el());
+        println!(
+            "  mmu            : {}",
+            if crate::arch::arm::mmu_enabled() {
+                "on (identity; image normal write-back, the rest device)"
+            } else {
+                "off (all memory device-nGnRnE)"
+            }
+        );
+    }
+    #[cfg(any(target_arch = "riscv32", target_arch = "riscv64"))]
+    {
+        use crate::arch::riscv;
+        println!("  rvv={}", f.rvv);
+        let sstatus = riscv::sstatus();
+        println!(
+            "  sstatus={} fs={} vs={}",
+            Hex(sstatus as u64),
+            (sstatus >> 13) & 3,
+            (sstatus >> 9) & 3
+        );
+        let (spec, id, version) = riscv::sbi_identity();
+        println!(
+            "  sbi            : {} {} (spec {}.{})",
+            riscv::sbi::impl_name(id),
+            Hex(version as u64),
+            (spec >> 24) & 0x7F,
+            spec & 0xFF_FFFF
+        );
+        println!(
+            "  counters       : cycle={} instret={} (mcounteren, as firmware left it)",
+            riscv::cycle_readable(),
+            riscv::instret_readable()
+        );
+    }
+    #[cfg(any(target_arch = "powerpc", target_arch = "powerpc64"))]
+    {
+        use crate::arch::ppc;
+        let pvr = ppc::pvr();
+        println!("  core           : {} (pvr {})", ppc::core_name(pvr), Hex(pvr as u64));
+        println!("  altivec={} vsx={} vec-crypto={}", f.altivec, f.vsx, f.ppc_vec_crypto);
+        println!(
+            "  isa 2.07={} 3.0={} 3.1={}",
+            f.ppc_isa207, f.ppc_isa300, f.ppc_isa31
+        );
+        let msr = ppc::msr();
+        println!(
+            "  msr={} fp={} vec={} vsx={}",
+            Hex(msr),
+            msr & ppc::MSR_FP != 0,
+            msr & ppc::MSR_VEC != 0,
+            msr & ppc::MSR_VSX != 0
+        );
+        #[cfg(target_arch = "powerpc64")]
+        println!(
+            "  state          : {}",
+            if msr & ppc::MSR_HV != 0 { "hypervisor (bare metal)" } else { "supervisor (guest)" }
+        );
+        println!(
+            "  byte order     : {}",
+            if cfg!(target_endian = "little") { "little-endian" } else { "big-endian" }
+        );
     }
     println!("  backend: {}", nanochrono_core::Backend::best().name());
     println!();
@@ -584,8 +688,10 @@ fn report_simd() {
 #[cfg(not(feature = "simd"))]
 fn report_simd() {
     println!("== SIMD ==");
-    println!("  not built: this target's ABI is soft-float");
-    println!("  (build with the x86_64-nanochrono-none target for SIMD)");
+    println!("  not built: the `simd` feature is off");
+    if cfg!(x86_any) {
+        println!("  (x86_64-unknown-none is soft-float; use x86_64-nanochrono-none)");
+    }
     println!();
 }
 
@@ -635,6 +741,11 @@ unsafe fn report_pmu() {
     // than how wide the machine is.
     const ITERATIONS: u64 = 100_000;
     let mut acc = 0u64;
+    // The instruction count is bracketed around the same run as the cycles,
+    // so both describe the same work; an instruction counter the route does
+    // not have simply reads `None`.
+    // SAFETY: as below.
+    let insns_before = unsafe { pmu.read_instructions() };
     // SAFETY: the PMU was just enabled on this core, at ring 0 / EL1.
     let (acc_out, cycles) = unsafe {
         pmu.measure(|| {
@@ -645,6 +756,8 @@ unsafe fn report_pmu() {
         })
     };
     core::hint::black_box(acc_out);
+    // SAFETY: as above.
+    let insns_after = unsafe { pmu.read_instructions() };
 
     match cycles {
         Some(cycles) => {
@@ -663,14 +776,27 @@ unsafe fn report_pmu() {
 
     // The instruction count is meaningful from more than the fixed counter:
     // on AMD it is a general-purpose counter programmed with the architectural
-    // retired-instructions event, read back over the same MSR route.
-    // SAFETY: as above; the method refuses a counter this did not program.
-    if let Some(insns) = unsafe { pmu.read_instructions() } {
-        println!("    instructions : {}", insns.value);
-    }
-    // SAFETY: as above.
-    if let Some(cyc) = unsafe { pmu.read_cycles() } {
-        println!("    core cycles  : {}", cyc.value);
+    // retired-instructions event, read back over the same MSR route. It used
+    // to be printed as the counter's absolute value after the run, next to a
+    // "core cycles" line that was the same kind of absolute reading — numbers
+    // that looked like this run's totals and were not. Both are now the
+    // difference over the run, width-aware like the cycle count.
+    let width = match route {
+        CounterRoute::General(_) => pmu.leaf.general_width,
+        _ => pmu.leaf.fixed_width,
+    };
+    if let (Some(before), Some(after)) = (insns_before, insns_after) {
+        if let Some(insns) = after.delta_since_width(before, width) {
+            println!("    instructions : {insns}");
+            if let Some(cycles) = cycles.filter(|&c| c > 0) {
+                // Instructions per cycle, two decimals, integer arithmetic.
+                println!(
+                    "    ipc          : {}.{:02}",
+                    insns / cycles,
+                    (insns % cycles) * 100 / cycles
+                );
+            }
+        }
     }
     println!();
 }
@@ -706,6 +832,20 @@ fn report_counter() {
     // build this number is dominated by the kernel.
     println!("  jitter         : {} units", max - min);
 
+    #[cfg(any(target_arch = "powerpc", target_arch = "powerpc64"))]
+    {
+        match counters::declared_counter_hz() {
+            Some(hz) => println!("  counter        : time base ({hz} Hz, from the device tree)"),
+            None => println!("  counter        : time base (rate unknown: no timebase-frequency)"),
+        }
+    }
+    #[cfg(any(target_arch = "riscv32", target_arch = "riscv64"))]
+    {
+        match counters::declared_counter_hz() {
+            Some(hz) => println!("  counter        : rdtime ({hz} Hz, from the device tree)"),
+            None => println!("  counter        : rdtime (rate unknown: no timebase-frequency)"),
+        }
+    }
     #[cfg(target_arch = "aarch64")]
     {
         println!(

@@ -47,4 +47,8 @@ windows-sys = { version = "0.61", features = [
     # the registry, which is the only identification path on ARM64 Windows
     # because there is no CPUID to ask.
     "Win32_System_Registry",
+    # AddVectoredExceptionHandler: probing whether CNTPCT_EL0 is readable from
+    # user space on Windows on Arm, without dying of the answer.
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_Kernel",
 ] }

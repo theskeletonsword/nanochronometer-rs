@@ -18,15 +18,28 @@ fn main() {
     println!("cargo:rerun-if-changed=boot/x86_64.ld");
     println!("cargo:rerun-if-changed=boot/aarch64.ld");
 
-    // Only for a freestanding x86 target. A host build must not link a second
-    // `_start`, and AArch64 enters directly in 64-bit mode with a stack the
-    // loader provides, so its entry stub is `global_asm!` in the crate.
-    if arch != "x86_64" || os != "none" {
-        return;
+    println!("cargo:rerun-if-changed=boot/boot_i386.S");
+    println!("cargo:rerun-if-changed=boot/i386.ld");
+
+    // `x86_any`: code that is the same on 32- and 64-bit x86 (port I/O,
+    // CPUID, the 8042, PCI, ACPI) says so once instead of listing both.
+    println!("cargo::rustc-check-cfg=cfg(x86_any)");
+    if arch == "x86_64" || arch == "x86" {
+        println!("cargo:rustc-cfg=x86_any");
     }
 
+    // Only for a freestanding x86 target. A host build must not link a second
+    // `_start`, and the other architectures enter with the ABI already valid,
+    // so their stubs are `global_asm!` in the crate. x86_64 needs long mode
+    // built for it; i386 is already in the flat protected mode it runs in.
+    let (stub, clang_target, script) = match (arch.as_str(), os.as_str()) {
+        ("x86_64", "none") => ("boot/boot32.S", "x86_64-unknown-none", "boot/x86_64.ld"),
+        ("x86", "none") => ("boot/boot_i386.S", "i686-unknown-none-elf", "boot/i386.ld"),
+        _ => return,
+    };
+
     let out = std::path::PathBuf::from(std::env::var("OUT_DIR").unwrap());
-    let obj = out.join("boot32.o");
+    let obj = out.join("boot.o");
 
     // `cc` is not used to compile C — there is none in this project. It is
     // used as a portable way to reach the host's assembler with the right
@@ -34,18 +47,19 @@ fn main() {
     let status = std::process::Command::new(cc_binary())
         .args(["-c", "-o"])
         .arg(&obj)
-        .args(["--target=x86_64-unknown-none", "-nostdlib"])
-        .arg("boot/boot32.S")
+        .arg(format!("--target={clang_target}"))
+        .arg("-nostdlib")
+        .arg(stub)
         .status()
-        .expect("failed to run the assembler for boot32.S");
-    assert!(status.success(), "assembling boot32.S failed");
+        .unwrap_or_else(|_| panic!("failed to run the assembler for {stub}"));
+    assert!(status.success(), "assembling {stub} failed");
 
     // `-bins` rather than plain `rustc-link-arg`: the boot object is 32-bit
     // non-PIC code and the linker script places a kernel image. Applying
     // either to the static archive or the shared object is wrong, and the
     // shared object refuses to link at all with them.
     println!("cargo:rustc-link-arg-bins={}", obj.display());
-    println!("cargo:rustc-link-arg-bins=-Tboot/x86_64.ld");
+    println!("cargo:rustc-link-arg-bins=-T{script}");
 }
 
 /// The assembler to drive. `clang` understands `--target` for any

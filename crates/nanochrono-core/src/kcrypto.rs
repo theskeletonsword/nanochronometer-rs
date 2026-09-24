@@ -193,6 +193,8 @@ pub enum Kind {
 }
 
 impl Kind {
+    // Only the Linux `AF_ALG` path binds a socket; elsewhere nothing asks.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     const fn salg_type(self) -> &'static [u8] {
         match self {
             Kind::Hash => b"hash",

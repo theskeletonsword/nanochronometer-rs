@@ -32,6 +32,12 @@ pub enum SimdFamily {
     Sve,
     Sve2,
     Sme,
+    /// PowerPC VMX (AltiVec).
+    Altivec,
+    /// PowerPC VSX.
+    Vsx,
+    /// RISC-V vector extension.
+    Rvv,
 }
 
 /// What a probe measures.
@@ -96,6 +102,9 @@ impl SimdFamily {
             SimdFamily::Sve => "sve",
             SimdFamily::Sve2 => "sve2",
             SimdFamily::Sme => "sme",
+            SimdFamily::Altivec => "altivec",
+            SimdFamily::Vsx => "vsx",
+            SimdFamily::Rvv => "rvv",
         }
     }
 
@@ -118,18 +127,15 @@ impl SimdFamily {
             SimdFamily::Fma | SimdFamily::Avx | SimdFamily::Avx2 | SimdFamily::AvxVnni => 32,
             SimdFamily::Avx512 | SimdFamily::Avx512Vnni => 64,
             SimdFamily::Sve | SimdFamily::Sve2 | SimdFamily::Sme => 16,
+            SimdFamily::Altivec | SimdFamily::Vsx | SimdFamily::Rvv => 16,
         }
     }
 
     /// Whether this CPU can execute the family *and* this build can probe it.
     ///
-    /// 32-bit x86 detects the SSE families through CPUID but has no probes for
-    /// them — they are written against the 64-bit register file — so it reports
-    /// none. See [`crate::backend::Backend::has_kernel`] for the same trade.
+    /// 32-bit x86 has the probes too; only the timer *kernels* are x86-64 only
+    /// (see [`crate::backend::Backend::has_kernel`]).
     pub fn is_available(self) -> bool {
-        if cfg!(target_arch = "x86") {
-            return false;
-        }
         let f = cpu::features();
         match self {
             SimdFamily::Mmx => f.mmx,
@@ -150,10 +156,29 @@ impl SimdFamily {
             SimdFamily::Sve => f.sve,
             SimdFamily::Sve2 => f.sve2,
             SimdFamily::Sme => f.sme,
+            SimdFamily::Altivec => f.altivec,
+            SimdFamily::Vsx => f.vsx,
+            SimdFamily::Rvv => f.rvv,
         }
     }
 
     /// Every family, in enum order.
+    /// Whether the family belongs to the architecture this was built for —
+    /// separate from [`is_available`](Self::is_available), which asks whether
+    /// this CPU has it. SVE on a Snapdragon is native but unavailable; AVX on
+    /// it is neither, and a list that shows it as "no" is only noise.
+    pub const fn is_native(self) -> bool {
+        match self {
+            SimdFamily::Neon => cfg!(any(target_arch = "aarch64", target_arch = "arm")),
+            SimdFamily::Sve | SimdFamily::Sve2 | SimdFamily::Sme => cfg!(target_arch = "aarch64"),
+            SimdFamily::Altivec | SimdFamily::Vsx => {
+                cfg!(any(target_arch = "powerpc", target_arch = "powerpc64"))
+            }
+            SimdFamily::Rvv => cfg!(any(target_arch = "riscv32", target_arch = "riscv64")),
+            _ => cfg!(any(target_arch = "x86", target_arch = "x86_64")),
+        }
+    }
+
     pub const ALL: &'static [SimdFamily] = &[
         SimdFamily::Mmx,
         SimdFamily::Sse,
@@ -173,6 +198,9 @@ impl SimdFamily {
         SimdFamily::Sve,
         SimdFamily::Sve2,
         SimdFamily::Sme,
+        SimdFamily::Altivec,
+        SimdFamily::Vsx,
+        SimdFamily::Rvv,
     ];
 
     /// Families this machine can actually run.
@@ -209,8 +237,17 @@ impl SimdFamily {
             SimdFamily::Sve,
             SimdFamily::Neon,
         ];
+        const PPC_ORDER: &[SimdFamily] = &[SimdFamily::Vsx, SimdFamily::Altivec];
+        const RISCV_ORDER: &[SimdFamily] = &[SimdFamily::Rvv];
+        const ARM32_ORDER: &[SimdFamily] = &[SimdFamily::Neon];
         let order = if cfg!(target_arch = "aarch64") {
             ARM_ORDER
+        } else if cfg!(any(target_arch = "powerpc", target_arch = "powerpc64")) {
+            PPC_ORDER
+        } else if cfg!(any(target_arch = "riscv32", target_arch = "riscv64")) {
+            RISCV_ORDER
+        } else if cfg!(target_arch = "arm") {
+            ARM32_ORDER
         } else {
             X86_ORDER
         };
@@ -321,7 +358,48 @@ unsafe fn scalar_load(ptr: *const u8) -> u64 {
     {
         unsafe { arch::aarch64::probe_load_ticks(ptr as *const u64) }
     }
-    #[cfg(not(any(target_arch = "x86_64", target_arch = "x86", target_arch = "aarch64")))]
+    #[cfg(any(target_arch = "powerpc", target_arch = "powerpc64"))]
+    {
+        // `ptr` is only guaranteed byte-aligned and the probe reads a whole
+        // `u64`, so an unaligned buffer falls back to the unaligned read.
+        if (ptr as usize) % core::mem::align_of::<u64>() == 0 {
+            unsafe { arch::powerpc::probe_load_ticks(ptr as *const u64) }
+        } else {
+            let a = arch::counter_start();
+            core::hint::black_box(unsafe { core::ptr::read_unaligned(ptr as *const u64) });
+            arch::counter_end().wrapping_sub(a)
+        }
+    }
+    #[cfg(target_arch = "arm")]
+    {
+        if (ptr as usize) % core::mem::align_of::<u64>() == 0 {
+            unsafe { arch::arm32::probe_load(ptr as *const u64) }
+        } else {
+            let a = arch::counter_start();
+            core::hint::black_box(unsafe { core::ptr::read_unaligned(ptr as *const u64) });
+            arch::counter_end().wrapping_sub(a)
+        }
+    }
+    #[cfg(any(target_arch = "riscv32", target_arch = "riscv64"))]
+    {
+        if (ptr as usize) % core::mem::align_of::<u64>() == 0 {
+            unsafe { arch::riscv::probe_load_ticks(ptr as *const u64) }
+        } else {
+            let a = arch::counter_start();
+            core::hint::black_box(unsafe { core::ptr::read_unaligned(ptr as *const u64) });
+            arch::counter_end().wrapping_sub(a)
+        }
+    }
+    #[cfg(not(any(
+        target_arch = "x86_64",
+        target_arch = "x86",
+        target_arch = "aarch64",
+        target_arch = "powerpc",
+        target_arch = "powerpc64",
+        target_arch = "riscv32",
+        target_arch = "riscv64",
+        target_arch = "arm"
+    )))]
     {
         let a = arch::counter_start();
         core::hint::black_box(unsafe { core::ptr::read_unaligned(ptr as *const u64) });
@@ -342,7 +420,43 @@ unsafe fn scalar_store(ptr: *mut u8) -> u64 {
     {
         unsafe { arch::aarch64::probe_store_ticks(ptr as *mut u64, PATTERN) }
     }
-    #[cfg(not(any(target_arch = "x86_64", target_arch = "x86", target_arch = "aarch64")))]
+    #[cfg(any(target_arch = "powerpc", target_arch = "powerpc64"))]
+    {
+        if (ptr as usize) % core::mem::align_of::<u64>() == 0 {
+            unsafe { arch::powerpc::probe_store_ticks(ptr as *mut u64, PATTERN) }
+        } else {
+            let a = arch::counter_start();
+            unsafe { core::ptr::write_unaligned(ptr as *mut u64, PATTERN) };
+            arch::counter_end().wrapping_sub(a)
+        }
+    }
+    #[cfg(target_arch = "arm")]
+    {
+        let a = arch::counter_start();
+        unsafe { core::ptr::write_unaligned(ptr as *mut u64, PATTERN) };
+        arch::memory_barrier();
+        arch::counter_end().wrapping_sub(a)
+    }
+    #[cfg(any(target_arch = "riscv32", target_arch = "riscv64"))]
+    {
+        if (ptr as usize) % core::mem::align_of::<u64>() == 0 {
+            unsafe { arch::riscv::probe_store_ticks(ptr as *mut u64, PATTERN) }
+        } else {
+            let a = arch::counter_start();
+            unsafe { core::ptr::write_unaligned(ptr as *mut u64, PATTERN) };
+            arch::counter_end().wrapping_sub(a)
+        }
+    }
+    #[cfg(not(any(
+        target_arch = "x86_64",
+        target_arch = "x86",
+        target_arch = "aarch64",
+        target_arch = "powerpc",
+        target_arch = "powerpc64",
+        target_arch = "riscv32",
+        target_arch = "riscv64",
+        target_arch = "arm"
+    )))]
     {
         let a = arch::counter_start();
         unsafe { core::ptr::write_unaligned(ptr as *mut u64, PATTERN) };
@@ -355,7 +469,7 @@ unsafe fn scalar_store(ptr: *mut u8) -> u64 {
 /// readable bytes.
 #[cfg(feature = "simd")]
 unsafe fn vector_load(family: SimdFamily, ptr: *const u8) -> u64 {
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
     unsafe {
         use arch::x86 as a;
         match family {
@@ -381,15 +495,54 @@ unsafe fn vector_load(family: SimdFamily, ptr: *const u8) -> u64 {
         use arch::aarch64 as a;
         match family {
             SimdFamily::Neon => a::neon::vector_load_ticks(ptr),
-            SimdFamily::Sve | SimdFamily::Sve2 | SimdFamily::Sme => {
+            SimdFamily::Sve | SimdFamily::Sve2 => a::sve::vector_load_ticks(ptr, family.vector_bytes()),
+            // SME does not imply SVE: a part can have the streaming matrix
+            // unit and no non-streaming SVE at all (Apple's M4 is one), and on
+            // it every SVE instruction outside streaming mode is illegal. The
+            // SME family is timed on the SVE path only when SVE exists too.
+            SimdFamily::Sme if cpu::features().sve => {
                 a::sve::vector_load_ticks(ptr, family.vector_bytes())
             }
+            SimdFamily::Sme => a::neon::vector_load_ticks(ptr),
             _ => scalar_load(ptr),
         }
     }
-    // 32-bit x86 reaches here: it detects no SIMD families (see `cpu.rs`), so
-    // this arm is unreachable in practice and exists to keep the match total.
-    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    #[cfg(target_arch = "arm")]
+    unsafe {
+        match family {
+            SimdFamily::Neon => arch::arm32::neon::vector_load_units(ptr),
+            _ => scalar_load(ptr),
+        }
+    }
+    #[cfg(any(target_arch = "riscv32", target_arch = "riscv64"))]
+    unsafe {
+        match family {
+            SimdFamily::Rvv => arch::riscv::rvv::vector_load_ticks(ptr),
+            _ => scalar_load(ptr),
+        }
+    }
+    #[cfg(any(target_arch = "powerpc", target_arch = "powerpc64"))]
+    unsafe {
+        use arch::powerpc as p;
+        match family {
+            SimdFamily::Altivec => p::altivec::vector_load_ticks(ptr),
+            SimdFamily::Vsx => p::vsx::vector_load_ticks(ptr),
+            _ => scalar_load(ptr),
+        }
+    }
+    // Targets with no vector probes of their own reach here. They report no
+    // SIMD family as available, so this arm is unreachable in practice and
+    // exists to keep the match total.
+    #[cfg(not(any(
+        target_arch = "x86_64",
+        target_arch = "x86",
+        target_arch = "aarch64",
+        target_arch = "powerpc",
+        target_arch = "powerpc64",
+        target_arch = "riscv32",
+        target_arch = "riscv64",
+        target_arch = "arm"
+    )))]
     unsafe {
         let _ = family;
         scalar_load(ptr)
@@ -401,7 +554,7 @@ unsafe fn vector_load(family: SimdFamily, ptr: *const u8) -> u64 {
 /// readable bytes and `out` that many writable bytes.
 #[cfg(feature = "simd")]
 unsafe fn vector_xor(family: SimdFamily, a: *const u8, b: *const u8, out: *mut u8) -> u64 {
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
     unsafe {
         use arch::x86 as x;
         match family {
@@ -427,13 +580,50 @@ unsafe fn vector_xor(family: SimdFamily, a: *const u8, b: *const u8, out: *mut u
         use arch::aarch64 as x;
         match family {
             SimdFamily::Neon => x::neon::vector_xor_ticks(a, b, out),
-            SimdFamily::Sve | SimdFamily::Sve2 | SimdFamily::Sme => {
+            SimdFamily::Sve | SimdFamily::Sve2 => {
                 x::sve::vector_xor_ticks(a, b, out, family.vector_bytes())
             }
+            // See `vector_load`: SME without SVE takes the NEON path.
+            SimdFamily::Sme if cpu::features().sve => {
+                x::sve::vector_xor_ticks(a, b, out, family.vector_bytes())
+            }
+            SimdFamily::Sme => x::neon::vector_xor_ticks(a, b, out),
             _ => scalar_load(a),
         }
     }
-    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    #[cfg(target_arch = "arm")]
+    unsafe {
+        match family {
+            SimdFamily::Neon => arch::arm32::neon::vector_xor_units(a, b, out),
+            _ => scalar_load(a),
+        }
+    }
+    #[cfg(any(target_arch = "riscv32", target_arch = "riscv64"))]
+    unsafe {
+        match family {
+            SimdFamily::Rvv => arch::riscv::rvv::vector_xor_ticks(a, b, out),
+            _ => scalar_load(a),
+        }
+    }
+    #[cfg(any(target_arch = "powerpc", target_arch = "powerpc64"))]
+    unsafe {
+        use arch::powerpc as p;
+        match family {
+            SimdFamily::Altivec => p::altivec::vector_xor_ticks(a, b, out),
+            SimdFamily::Vsx => p::vsx::vector_xor_ticks(a, b, out),
+            _ => scalar_load(a),
+        }
+    }
+    #[cfg(not(any(
+        target_arch = "x86_64",
+        target_arch = "x86",
+        target_arch = "aarch64",
+        target_arch = "powerpc",
+        target_arch = "powerpc64",
+        target_arch = "riscv32",
+        target_arch = "riscv64",
+        target_arch = "arm"
+    )))]
     unsafe {
         let _ = (family, b, out);
         scalar_load(a)

@@ -1,0 +1,18 @@
+[package]
+name = "nanochrono-android"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "JNI bridge for the NanoChronometer Android app"
+publish = false
+
+[lib]
+name = "nanochrono_jni"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+nanochrono-core.workspace = true
+nanochrono-bench.workspace = true
+libc = "0.2"

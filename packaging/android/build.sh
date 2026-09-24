@@ -98,25 +98,25 @@ for abi in "${abis[@]}"; do
     # Dynamically linked against bionic: the shared library an app loads, and
     # the static archive an NDK build links.
     env "${build_env[@]}" \
-        cargo build --release --target "${target}" \
+        cargo build --profile dist --target "${target}" \
             --manifest-path "${repo_root}/Cargo.toml" \
             -p nanochrono-ffi -p nanochrono-cli
 
     staging="${out_dir}/${abi}"
     mkdir -p "${staging}"
-    install -m644 "${repo_root}/target/${target}/release/libnanochrono.so" "${staging}/"
-    install -m644 "${repo_root}/target/${target}/release/libnanochrono.a"  "${staging}/"
-    install -m755 "${repo_root}/target/${target}/release/nanochrono"       "${staging}/"
+    install -m644 "${repo_root}/target/${target}/dist/libnanochrono.so" "${staging}/"
+    install -m644 "${repo_root}/target/${target}/dist/libnanochrono.a"  "${staging}/"
+    install -m755 "${repo_root}/target/${target}/dist/nanochrono"       "${staging}/"
 
     # A second, statically linked CLI. `adb push` plus `chmod +x` is enough to
     # run this on any device of the right ABI — no library path to arrange, and
     # no dependency on the device's bionic version.
     env "${build_env[@]}" RUSTFLAGS="-C target-feature=+crt-static" \
-        cargo build --release --target "${target}" \
+        cargo build --profile dist --target "${target}" \
             --manifest-path "${repo_root}/Cargo.toml" \
             --target-dir "${repo_root}/target/static-android" \
             -p nanochrono-cli
-    install -m755 "${repo_root}/target/static-android/${target}/release/nanochrono" \
+    install -m755 "${repo_root}/target/static-android/${target}/dist/nanochrono" \
         "${staging}/nanochrono-static"
 
     # The GUI is deliberately excluded: iced needs a windowing system, and

@@ -7,6 +7,7 @@ members = [
     "crates/nanochrono-cli",
     "crates/nanochrono-gui",
     "crates/nanochrono-ffi",
+    "crates/nanochrono-android",
 ]
 
 # Freestanding: it targets `x86_64-unknown-none`/`aarch64-unknown-none`, has no
@@ -28,12 +29,26 @@ nanochrono-core = { path = "crates/nanochrono-core", version = "3.0.0" }
 nanochrono-crypto = { path = "crates/nanochrono-crypto", version = "3.0.0" }
 nanochrono-bench = { path = "crates/nanochrono-bench", version = "3.0.0" }
 
+# Two optimised profiles.
+#
+# `release` is for building and running during development: thin LTO and 16
+# codegen units spread the optimiser over every core, so a GUI build (iced,
+# wgpu, ~650 crates) links in a fraction of the time. `dist` is what is
+# published: whole-program ("fat") LTO in one codegen unit, the smallest and
+# fastest binary, at the cost of a long single-threaded link. The packaging
+# scripts build `dist`; `cargo build --release` stays quick.
 [profile.release]
 opt-level = 3
+lto = "thin"
+codegen-units = 16
+
+[profile.dist]
+inherits = "release"
 lto = "fat"
 codegen-units = 1
 
 # Measurement code must not be folded away by the optimiser in ways a debug
-# build would hide, so the bench profile mirrors release.
+# build would hide, and the numbers a benchmark reports should be the numbers
+# the shipped binary would produce — so the bench profile mirrors `dist`.
 [profile.bench]
-inherits = "release"
+inherits = "dist"
