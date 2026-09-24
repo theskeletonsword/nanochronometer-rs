@@ -46,9 +46,10 @@ INK = "#111111"
 GREY = "#555555"
 # The same logo for dark backgrounds, where near-black lettering vanishes.
 INK_DARK_BG = "#FFFFFF"
-GREY_DARK_BG = "#8B98A5"
-# Bare metal draws on black, so nothing grey: the subtitle is green.
+# On dark backgrounds nothing is grey: white lettering, green subtitle —
+# the same logo the bare-metal interface draws on black.
 GREY_BAREMETAL = "#2FB83C"
+GREY_DARK_BG = GREY_BAREMETAL
 SUBTITLE = "OPEN SOURCE HIGH PRECISION TIMER"
 
 # The watch face: centre and bezel radius in the source drawing.
