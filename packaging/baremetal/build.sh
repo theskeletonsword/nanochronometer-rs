@@ -12,6 +12,13 @@
 #   packaging/baremetal/build.sh x86_64          # one
 #   packaging/baremetal/build.sh run x86_64      # build and boot under QEMU
 #   packaging/baremetal/build.sh test            # the host-side unit tests
+#   packaging/baremetal/build.sh debug [arch]    # -O0 -g + frame pointers
+#   packaging/baremetal/build.sh gdb x86_64 [crashtest=<de|pf|gp|ud|so|df|panic>]
+#                                                # debug build, QEMU stopped for GDB
+#
+# The release build (no mode) strips the kernel that goes into the ISO and
+# keeps the symbols in `nanochrono-kernel.sym.elf`, next to it, for
+# tools/nanodump.py to symbolise crash dumps against.
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -47,28 +54,64 @@ declare -A arch_features=(
 toolchain="+nightly"
 export RUST_TARGET_PATH="${crate}/targets"
 
+# Set once the mode is known, below: `release` for a shipping build, `debug`
+# for the `debug` and `gdb` modes.
+build_kind="release"
+
+# An objcopy that understands every target here. LLVM's does; the host's GNU
+# one may only know the host's formats.
+objcopy_tool() {
+    command -v llvm-objcopy || command -v rust-objcopy || command -v objcopy
+}
+
 build_one() {
     local arch="$1" target="${arch_target[$1]}"
-    echo "=== ${arch} (${target})"
+    local target_dir="${CARGO_TARGET_DIR:-${crate}/target}"
+    echo "=== ${arch} (${target}, ${build_kind})"
     rustup target add "${target}" >/dev/null 2>&1 || true
+
+    local profile_args=(--release) profile_dir="release"
+    if [[ "${build_kind}" == "debug" ]]; then
+        # Cargo's dev profile — `-O0` with full debug information — plus
+        # frame pointers, so GDB unwinds without CFI and the crash dump's
+        # stack trace can walk the RBP chain. Through `--config`, not
+        # RUSTFLAGS: the environment variable would *replace* the target's
+        # rustflags in .cargo/config.toml (no-redzone, unstable-options)
+        # where `--config` appends to them.
+        profile_args=(--config "target.${target}.rustflags=[\"-C\",\"force-frame-pointers=yes\"]")
+        profile_dir="debug"
+    fi
     # shellcheck disable=SC2086
-    (cd "${crate}" && cargo ${toolchain} build --release --target "${target}" \
+    (cd "${crate}" && cargo ${toolchain} build "${profile_args[@]}" --target "${target}" \
         ${arch_features[${arch}]})
 
     mkdir -p "${out_dir}/${arch}"
-    local elf="${crate}/target/${target}/release/nanochrono-kernel"
+    local elf="${target_dir}/${target}/${profile_dir}/nanochrono-kernel"
     cp "${elf}" "${out_dir}/${arch}/nanochrono-kernel.elf"
-    cp "${crate}/target/${target}/release/libnanochrono_baremetal.a" "${out_dir}/${arch}/"
+    cp "${target_dir}/${target}/${profile_dir}/libnanochrono_baremetal.a" "${out_dir}/${arch}/"
+
+    if [[ "${build_kind}" == "release" ]]; then
+        # The image that boots carries no symbol table; the copy beside it
+        # keeps one, which is what tools/nanodump.py resolves a crash dump's
+        # addresses against. Stripped after the copy, so both describe the
+        # same code.
+        local objcopy
+        objcopy="$(objcopy_tool || true)"
+        if [[ -n "${objcopy}" ]]; then
+            cp "${out_dir}/${arch}/nanochrono-kernel.elf" "${out_dir}/${arch}/nanochrono-kernel.sym.elf"
+            "${objcopy}" --strip-all "${out_dir}/${arch}/nanochrono-kernel.elf"
+        fi
+    fi
 
     # The shared object needs its own spec: position independent, dynamically
     # linkable, and without the kernel code model. It also needs a loader that
     # does not exist on bare metal — see docs/BAREMETAL_LIBRARIES.md.
-    if [[ "${arch}" == "x86_64" ]]; then
+    if [[ "${arch}" == "x86_64" && "${build_kind}" == "release" ]]; then
         # shellcheck disable=SC2086
         (cd "${crate}" && cargo ${toolchain} rustc --release --lib \
             --target "${target}-dylib" --crate-type cdylib \
             ${arch_features[${arch}]}) || true
-        local so="${crate}/target/${target}-dylib/release/libnanochrono_baremetal.so"
+        local so="${target_dir}/${target}-dylib/release/libnanochrono_baremetal.so"
         [[ -f "${so}" ]] && cp "${so}" "${out_dir}/${arch}/"
     fi
 
@@ -77,7 +120,8 @@ build_one() {
         # entry is 32-bit protected mode. The image is ELF64 with a 32-bit
         # entry stub, so the container is rewritten rather than the code: every
         # address is below 4 GiB, so nothing is lost. GRUB accepts either.
-        objcopy -O elf32-i386 "${elf}" "${out_dir}/${arch}/nanochrono-kernel.mb.elf"
+        objcopy -O elf32-i386 "${out_dir}/${arch}/nanochrono-kernel.elf" \
+            "${out_dir}/${arch}/nanochrono-kernel.mb.elf"
     fi
 }
 
@@ -253,10 +297,104 @@ run_one() {
     esac
 }
 
+# Boots the debug kernel under QEMU stopped at the reset vector (`-S`) with a
+# GDB stub on localhost:1234 (`-s`), and waits for
+#   gdb -x packaging/baremetal/gdb/x86_64.gdb
+# from the repository root. `-no-reboot` turns a triple fault into QEMU
+# exiting rather than a silent reboot loop, and `-d int,cpu_reset` logs every
+# exception and reset to qemu-int.log. The serial output goes to the terminal
+# and to serial.log, which is where a crash dump is read back from.
+#
+# The ISO is booted **as a USB stick** — a copy of it, so dist/ is not
+# written to — because that is how it runs on hardware, and because the stick
+# is then the crash dump's USB target as well: a fault writes CRASH.DMP into
+# the stick's own NANOCRASH partition, and this reads it back afterwards.
+# With `crashtest=<name>`, a one-off ISO whose default entry passes it is
+# built first. QEMU_DISPLAY (e.g. `none`) is passed to -display when set.
+run_gdb() {
+    local accel=()
+    accel_for x86_64 max
+    local iso="${out_dir}/nanochronometer_x86_64.iso"
+    if [[ -n "${crashtest}" ]]; then
+        iso="${out_dir}/gdb-${crashtest#crashtest=}.iso"
+        build_iso_x86 x86_64 "${iso}" "${crashtest}"
+    fi
+    if [[ ! -f "${iso}" ]]; then
+        echo "error: no ISO to boot (is grub-mkrescue installed?)" >&2
+        return 1
+    fi
+    local stick="${out_dir}/gdb-stick.img"
+    cp "${iso}" "${stick}"
+    local display=()
+    [[ -n "${QEMU_DISPLAY:-}" ]] && display=(-display "${QEMU_DISPLAY}")
+
+    local log="${out_dir}/qemu-int.log" serial="${out_dir}/serial.log"
+    rm -f "${log}" "${serial}" "${out_dir}/CRASH.DMP" "${out_dir}/CRASH-usb.DMP"
+    echo "=== QEMU is stopped at the reset vector, GDB stub on localhost:1234"
+    echo "    in another terminal, from ${repo_root}:"
+    echo "        gdb -x packaging/baremetal/gdb/x86_64.gdb"
+    echo "    booting ${iso##*/} as a USB stick (copy: ${stick##*/})"
+    echo "    exceptions and resets: ${log}"
+    echo "    serial (and any crash dump): ${serial}"
+    if [[ "${accel[1]}" == "kvm" ]]; then
+        # Not a reason to leave KVM: the guest is this host's ISA. What changes
+        # is how a triple fault shows — QEMU exits (-no-reboot) and the log
+        # has a "CPU Reset" after the two at power-on.
+        echo "    (KVM: -d int logs nothing, the exceptions happen in the kernel's"
+        echo "     hands; a triple fault shows as QEMU exiting and a CPU Reset line)"
+    fi
+    qemu-system-x86_64 "${accel[@]}" -m 512 -vga std "${display[@]}" \
+        -device qemu-xhci,id=xhci \
+        -drive "if=none,id=stick,file=${stick},format=raw" \
+        -device usb-storage,bus=xhci.0,drive=stick,bootindex=0 \
+        -s -S -no-reboot -d int,cpu_reset -D "${log}" \
+        -chardev "stdio,id=com1,logfile=${serial}" -serial chardev:com1 || true
+
+    if grep -q "BEGIN NANOCHRONO DUMP" "${serial}" 2>/dev/null; then
+        echo
+        echo "=== crash dump found in ${serial}"
+        "${repo_root}/tools/nanodump.py" extract "${serial}" -o "${out_dir}/CRASH.DMP"
+        "${repo_root}/tools/nanodump.py" show "${out_dir}/CRASH.DMP" \
+            --elf "${out_dir}/x86_64/nanochrono-kernel.elf"
+    fi
+    if "${repo_root}/tools/nanodump.py" extract-image "${stick}" \
+        -o "${out_dir}/CRASH-usb.DMP" >/dev/null 2>&1; then
+        echo
+        echo "=== and read back from the stick's CRASH.DMP: ${out_dir}/CRASH-usb.DMP"
+        if cmp -s "${out_dir}/CRASH.DMP" "${out_dir}/CRASH-usb.DMP"; then
+            echo "    identical to the serial copy"
+        fi
+    fi
+}
+
 mode="build"
-if [[ "${1:-}" == "run" || "${1:-}" == "test" ]]; then
+if [[ "${1:-}" == "run" || "${1:-}" == "test" || "${1:-}" == "debug" || "${1:-}" == "gdb" ]]; then
     mode="$1"
     shift
+fi
+
+crashtest=""
+if [[ "${mode}" == "debug" || "${mode}" == "gdb" ]]; then
+    build_kind="debug"
+    # Beside the release output, not over it: a debug kernel is 8 MiB of
+    # DWARF and never ships.
+    out_dir="${repo_root}/dist/baremetal-debug"
+    if [[ "${mode}" == "gdb" ]]; then
+        args=()
+        for a in "$@"; do
+            case "${a}" in
+                crashtest=*) crashtest="${a}" ;;
+                *) args+=("${a}") ;;
+            esac
+        done
+        set -- "${args[@]:-x86_64}"
+        if [[ "$*" != "x86_64" ]]; then
+            echo "error: gdb mode supports x86_64 only (packaging/baremetal/gdb/x86_64.gdb)" >&2
+            exit 1
+        fi
+    fi
+    # One architecture unless told otherwise: the debugging flow is x86_64's.
+    [[ $# -eq 0 ]] && set -- x86_64
 fi
 
 if [[ "${mode}" == "test" ]]; then
@@ -311,8 +449,52 @@ build_iso_ppc_of() {
 # on real hardware. grub-mkrescue produces a hybrid ISO: an MBR with a boot
 # signature plus El Torito images for both BIOS and UEFI, which is what makes
 # it work with dd, Rufus, Ventoy, YUMI and UNetbootin alike.
+# The crash dump's partition, for the x86_64 ISO: a 4 MiB FAT16 volume
+# labelled NANOCRASH holding a pre-allocated CRASH.DMP. Appended to the hybrid
+# ISO as a GPT partition, it makes a stick written from the ISO with `dd` its
+# own dump target: the kernel finds the file at boot, and a fault writes the
+# dump into its blocks. FAT16 because FAT32 needs at least 65525 clusters —
+# some 33 MiB — where FAT16 fits in four; the kernel reads both.
+#
+# $1: the image to write. Returns non-zero, with a note, when the tools are
+# missing; the ISO is then built without the partition.
+make_crash_partition() {
+    local img="$1"
+    if ! command -v mkfs.vfat >/dev/null || ! command -v mcopy >/dev/null; then
+        echo "note: no mkfs.vfat/mtools; the ISO carries no CRASH.DMP partition"
+        return 1
+    fi
+    rm -f "${img}"
+    dd if=/dev/zero of="${img}" bs=1M count=4 status=none
+    mkfs.vfat -F 16 -s 1 -n NANOCRASH "${img}" >/dev/null
+    local files
+    files="$(mktemp -d)"
+    # 64 KiB: four times the largest dump (crashdump.rs, CAPACITY), zeroed so
+    # that a stick that never crashed holds no stale-looking dump.
+    head -c 65536 /dev/zero > "${files}/CRASH.DMP"
+    cat > "${files}/README.TXT" <<'TXT'
+NanoChronometer crash dump partition.
+
+CRASH.DMP is written by the bare-metal kernel when it faults: raw writes into
+the blocks this file already occupies, nothing else on this volume is touched.
+Do not delete, move or shrink it - the kernel finds it by name at boot and
+never allocates space for it. All zeros means nothing has crashed since.
+
+Read it with:  tools/nanodump.py show CRASH.DMP --elf nanochrono-kernel.sym.elf
+TXT
+    MTOOLS_SKIP_CHECK=1 mcopy -i "${img}" "${files}/CRASH.DMP" "${files}/README.TXT" ::/
+    rm -rf "${files}"
+}
+
+# Builds a GRUB hybrid ISO for x86_64 or i386.
+#
+# $1: arch; $2: the ISO to write (default: the release name in out_dir);
+# $3: extra kernel arguments for the default entries (the `gdb` mode passes a
+# crashtest this way).
 build_iso_x86() {
     local arch="$1"
+    local iso="${2:-${out_dir}/nanochronometer_${arch}.iso}"
+    local kernel_args="${3:-}"
     local grub_mkrescue
     grub_mkrescue="$(command -v grub-mkrescue || command -v grub2-mkrescue || true)"
     if [[ -z "${grub_mkrescue}" ]]; then
@@ -325,7 +507,7 @@ build_iso_x86() {
     rm -rf "${staging}"
     mkdir -p "${staging}/boot/grub"
     cp "${out_dir}/${arch}/nanochrono-kernel.elf" "${staging}/boot/nanochrono-kernel"
-    sed "s/@ARCH@/${arch}/g" > "${staging}/boot/grub/grub.cfg" <<'CFG'
+    sed -e "s/@ARCH@/${arch}/g" -e "s/@ARGS@/${kernel_args}/g" > "${staging}/boot/grub/grub.cfg" <<'CFG'
 set timeout=3
 set default=0
 
@@ -337,19 +519,55 @@ terminal_output gfxterm
 set gfxpayload=keep
 
 menuentry "NanoChronometer @ARCH@ (freestanding)" {
-    multiboot2 /boot/nanochrono-kernel
+    multiboot2 /boot/nanochrono-kernel @ARGS@
     set gfxpayload=keep
     boot
 }
 
 menuentry "NanoChronometer @ARCH@ (text mode)" {
     set gfxpayload=text
-    multiboot2 /boot/nanochrono-kernel
+    multiboot2 /boot/nanochrono-kernel @ARGS@
     boot
 }
 CFG
-    "${grub_mkrescue}" -o "${out_dir}/nanochronometer_${arch}.iso" "${staging}" >/dev/null 2>&1
-    rm -rf "${staging}"
+    # The debug ISO boots straight into each forced fault as well, to check
+    # on real hardware that a fault ends in a crash dump and the stop screen
+    # rather than a reset (see crashdump::CrashTest).
+    if [[ "${build_kind}" == "debug" && "${arch}" == "x86_64" ]]; then
+        local t
+        for t in de pf gp ud so df panic; do
+            cat >> "${staging}/boot/grub/grub.cfg" <<CFG
+
+menuentry "Crash test: crashtest=${t}" {
+    multiboot2 /boot/nanochrono-kernel crashtest=${t}
+    set gfxpayload=keep
+    boot
+}
+CFG
+        done
+    fi
+    # x86_64 only, where the crash dumper exists. Arguments after `--` reach
+    # xorriso in its native dialect, where `appended_part_as=gpt` keeps the
+    # MBR purely protective, as UEFI expects; the partition is in the GPT,
+    # which is where the kernel looks when it sees the protective entry.
+    local xorriso_args=()
+    if [[ "${arch}" == "x86_64" ]]; then
+        local fat="${staging}.crashfat.img"
+        if make_crash_partition "${fat}"; then
+            xorriso_args=(-- -append_partition 3 0x0e "${fat}"
+                -boot_image any appended_part_as=gpt)
+        fi
+    fi
+    # Its output is kept rather than discarded: a failure here used to end
+    # the script with nothing said.
+    if ! "${grub_mkrescue}" -o "${iso}" "${staging}" "${xorriso_args[@]}" \
+        >"${staging}.log" 2>&1; then
+        echo "error: grub-mkrescue failed for ${arch}:" >&2
+        grep -iE "failure|error|sorry" "${staging}.log" >&2 || cat "${staging}.log" >&2
+        rm -rf "${staging}" "${staging}.crashfat.img" "${staging}.log"
+        return 1
+    fi
+    rm -rf "${staging}" "${staging}.crashfat.img" "${staging}.log"
 }
 
 # Build a PE/COFF EFI application out of the AArch64 kernel.
@@ -509,6 +727,18 @@ if [[ "${mode}" == "run" ]]; then
     for arch in "${run_requested[@]}"; do
         run_one "${arch}"
     done
+    exit 0
+fi
+
+if [[ "${mode}" == "gdb" ]]; then
+    run_gdb
+    exit 0
+fi
+
+if [[ "${mode}" == "debug" ]]; then
+    echo
+    echo "=== ${out_dir}"
+    find "${out_dir}" -type f -printf '%p  %s bytes\n' | sort
     exit 0
 fi
 

@@ -1,16 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 //! The NanoChronometer logo, as pixels the kernel can blit.
 //!
-//! Decoding a PNG or rendering the SVG in a kernel would mean an inflate
-//! implementation or a vector rasteriser — far more code, and more attack
-//! surface, than the picture is worth. So `tools/gen-icons.py` rasterises the
-//! logo at build time into raw RGBA (an 8-byte header, width and height as
-//! little-endian `u32`, then straight, non-premultiplied pixels) and the
-//! kernel embeds those bytes as they are. Drawing is a per-pixel blend over
-//! what is already on screen.
-//!
-//! The variant is the bare-metal one: "Nano" green, "Chronometer" white, the
-//! subtitle green, for the black interface. Nothing in it is grey.
+//! The picture is `assets/nanochronometer_logo_dark.png` itself — the logo
+//! made for dark backgrounds. A PNG decoder in a kernel would be an inflate
+//! implementation in ring 0, so `build.rs` decodes it on the host and scales
+//! it to the heights drawn here, writing raw RGBA (an 8-byte header, width
+//! and height as little-endian `u32`, then straight, non-premultiplied
+//! pixels) that the kernel embeds as it is. Drawing is a per-pixel blend
+//! over what is already on screen.
 
 use crate::draw;
 use crate::framebuffer::{Colour, Framebuffer};
@@ -39,30 +36,21 @@ impl Image {
 }
 
 macro_rules! asset {
-    ($file:literal) => {
-        Image::parse(include_bytes!(concat!("../../../assets/icons/baremetal/", $file)))
+    ($h:literal) => {
+        Image::parse(include_bytes!(concat!(env!("OUT_DIR"), "/logo_", $h, ".rgba")))
     };
 }
 
-/// The stopwatch and "NanoChronometer", no subtitle: for the header, where
-/// the subtitle would be two pixels tall.
-static WORDMARKS: [Image; 3] = [
-    asset!("nanochronometer_wordmark_24.rgba"),
-    asset!("nanochronometer_wordmark_32.rgba"),
-    asset!("nanochronometer_wordmark_40.rgba"),
-];
+/// The header sizes, smallest first (see `LOGO_HEIGHTS` in build.rs).
+static HEADER: [Image; 4] = [asset!("28"), asset!("36"), asset!("44"), asset!("52")];
 
-/// The whole logo, subtitle included: for the boot screen.
-pub static LOGO: Image = asset!("nanochronometer_logo_96.rgba");
+/// The boot screen's size.
+pub static LOGO: Image = asset!("128");
 
-/// The tallest wordmark no taller than `max_height`, or the smallest one
+/// The tallest header logo no taller than `max_height`, or the smallest one
 /// when none fits.
-pub fn wordmark(max_height: u32) -> &'static Image {
-    WORDMARKS
-        .iter()
-        .rev()
-        .find(|i| i.height <= max_height)
-        .unwrap_or(&WORDMARKS[0])
+pub fn for_height(max_height: u32) -> &'static Image {
+    HEADER.iter().rev().find(|i| i.height <= max_height).unwrap_or(&HEADER[0])
 }
 
 /// Blends `image` onto the framebuffer with its top-left corner at `(x, y)`,

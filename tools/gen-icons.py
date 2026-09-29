@@ -263,22 +263,10 @@ def main():
         )
     save_ico(d / "nanochrono.ico")
 
-    # The logo the kernel draws: white "Chronometer", green subtitle, on the
-    # black interface. The header gets the wordmark without the subtitle
-    # (at 40 px it would be two pixels tall); the boot screen gets it whole.
-    # Straight (not premultiplied) RGBA, blended over the screen at draw time.
-    def rgba(svg, w, h, name):
-        im = png(svg, w, h)
-        (d / name).write_bytes(struct.pack("<II", w, h) + im.tobytes())
-        im.save(d / name.replace(".rgba", ".png"))
-
+    # The kernel embeds assets/nanochronometer_logo_dark.png itself, decoded
+    # and scaled by crates/nanochrono-baremetal/build.rs; nothing to write
+    # for it here beyond the wordmark the desktop GUI and Android use.
     mark, _, mw, mh = write_svgs(t, INK_DARK_BG, GREY_BAREMETAL, subtitle=False)
-    full, _, fw, fh = write_svgs(t, INK_DARK_BG, GREY_BAREMETAL)
-    (d / "nanochronometer_wordmark_baremetal.svg").write_text(mark)
-    (d / "nanochronometer_logo_baremetal.svg").write_text(full)
-    for h in [24, 32, 40]:
-        rgba(mark, round(mw * h / mh), h, f"nanochronometer_wordmark_{h}.rgba")
-    rgba(full, round(fw * 96 / fh), 96, "nanochronometer_logo_96.rgba")
 
     # The desktop GUI's header (dark theme): the wordmark, white lettering.
     png(mark, round(mw * 80 / mh), 80).save(ASSETS / "nanochronometer_wordmark_dark.png")

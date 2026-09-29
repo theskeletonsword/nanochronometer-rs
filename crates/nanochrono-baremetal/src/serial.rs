@@ -127,6 +127,21 @@ impl fmt::Write for Serial {
     }
 }
 
+/// Writes bytes to COM1 alone, not to the VGA text console, and without the
+/// `\n` to `\r\n` expansion: for bulk data such as a crash dump, which on
+/// a text-mode screen would scroll the reason away.
+#[cfg(x86_any)]
+pub fn write_uart_only(bytes: &[u8]) {
+    for &byte in bytes {
+        if !LIVE.load(Ordering::Relaxed) {
+            return;
+        }
+        if !x86_uart::put(byte) {
+            LIVE.store(false, Ordering::Relaxed);
+        }
+    }
+}
+
 /// One byte from the console, if one is waiting. Never blocks.
 ///
 /// The input half of whichever console [`Serial::init`] set up: COM1 on x86,

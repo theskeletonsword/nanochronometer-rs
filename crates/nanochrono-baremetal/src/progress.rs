@@ -176,7 +176,7 @@ impl Layout {
         let logo = if fb.width >= crate::logo::LOGO.width + 32 {
             &crate::logo::LOGO
         } else {
-            crate::logo::wordmark(40)
+            crate::logo::for_height(52)
         };
         let bar_w = (fb.width / 4).clamp(220, 460);
         let bar_h = 6;
@@ -318,8 +318,22 @@ fn show(phase: Phase, done: bool) {
     update(&fb, &p, &layout, phase, done);
 }
 
-/// Marks `phase` as started.
+/// Marks `phase` as started, and names it as the running driver for a
+/// crash dump.
 pub fn enter(phase: Phase) {
+    use crate::crashdump::Driver;
+    match phase {
+        Phase::Entered => Driver::Boot,
+        Phase::CpuFeatures => Driver::CpuFeatures,
+        Phase::Pmu => Driver::Pmu,
+        Phase::Counter => Driver::Counter,
+        Phase::Pci => Driver::Pci,
+        Phase::Hypervisor => Driver::Hypervisor,
+        Phase::Acpi => Driver::Acpi,
+        Phase::Input => Driver::Ps2,
+        Phase::Interface => Driver::Interface,
+    }
+    .set();
     show(phase, false);
 }
 

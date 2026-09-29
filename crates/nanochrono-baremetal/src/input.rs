@@ -32,7 +32,9 @@
 //! names that file uses, so the two can be read side by side. No code was
 //! copied; this is a much smaller driver with no interrupts and no queueing.
 
-use crate::arch::x86::{inb, outb};
+use crate::arch::x86::{inb, io_wait, outb};
+use crate::crashdump::Driver;
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 /// Data port. Reads take a byte from whichever device the controller last
 /// steered; writes go to the keyboard unless preceded by `WRITE_TO_AUX`.
@@ -166,13 +168,20 @@ fn hid_to_scancode(usage: u8) -> u8 {
 /// Device replies.
 const ACK: u8 = 0xFA;
 const RESET_DONE: u8 = 0xAA;
+const RESEND: u8 = 0xFE;
+const ECHO: u8 = 0xEE;
 
-/// How long to spin waiting for the controller.
-///
-/// The 8042 is slow and a real one can take milliseconds. This is a bounded
-/// spin rather than a timer because there is no timer yet, and a driver that
-/// hangs forever on absent hardware is worse than one that gives up.
-const SPIN_LIMIT: u32 = 1_000_000;
+/// Scancode prefixes, the same in set 1 and set 2.
+const EXTENDED_PREFIX: u8 = 0xE0;
+const PAUSE_PREFIX: u8 = 0xE1;
+
+/// Set 1 Shift keys, which the keyboard also sends as "fake" extended codes.
+const SCAN_LEFT_SHIFT: u8 = 0x2A;
+const SCAN_RIGHT_SHIFT: u8 = 0x36;
+
+/// How many PS/2 bytes one `poll` reads before giving USB and I2C a turn.
+/// Enough for a whole Pause sequence plus a four-byte mouse packet.
+const PS2_BYTES_PER_POLL: usize = 12;
 
 /// What the auxiliary port turned out to be.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -257,6 +266,9 @@ pub struct Input {
     packet_len: usize,
     /// Whether the keyboard answered its reset.
     keyboard: bool,
+    /// Whether there is an 8042 to read. Off on a machine whose ports float,
+    /// so `poll` does not spend its turn on a controller that is not there.
+    ps2: bool,
     /// The USB stack, when it was brought up and found something.
     usb: Option<UsbInput>,
     /// The I2C-HID touchpad, when there is one and it could be reached.
@@ -293,6 +305,10 @@ pub struct Input {
     set2: bool,
     /// The next byte is a set 2 release.
     set2_break: bool,
+    /// An `0xE0` arrived: the next code is an extended key.
+    extended: bool,
+    /// Bytes of a Pause sequence (`0xE1 ...`) still to discard.
+    skip: u8,
 }
 
 /// How many raw bytes to remember.
@@ -307,10 +323,16 @@ const TOUCHPAD_POLL_HZ: u64 = 250;
 /// What each stack turned up, one field per question worth asking.
 #[derive(Debug, Clone, Copy)]
 pub struct Found {
+    /// Whether an 8042 answered at all — see `probe_controller`.
+    pub ps2_controller: bool,
     pub ps2_keyboard: bool,
     pub ps2_pointer: Option<PointerKind>,
     /// An xHCI controller was found on the PCI bus and brought up.
     pub usb_controller: bool,
+    /// A mass-storage stick was enumerated, for the crash dump.
+    pub usb_storage: bool,
+    /// The size of the CRASH.DMP resolved on it, in KiB, when there is one.
+    pub crash_file_kib: Option<u64>,
     pub usb_keyboard: bool,
     pub usb_pointer: bool,
     /// The I2C-HID touchpad, when one was brought up.
@@ -354,6 +376,12 @@ pub struct UsbInput {
     /// Which device to service next, so one that reports constantly cannot
     /// starve the other.
     next: usize,
+    /// Where `CRASH.DMP` was found on a USB stick, resolved to raw block
+    /// ranges at boot. `None` when no stick carries the file. Handed to the
+    /// crash dumper once this struct is at its final address — see
+    /// [`Input::install_crash_sink`].
+    #[cfg(target_arch = "x86_64")]
+    crash_file: Option<crate::usb_storage::CrashFile>,
 }
 
 impl Input {
@@ -377,67 +405,25 @@ impl Input {
             i2c_previous: [0; 8],
             set2: false,
             set2_break: false,
+            ps2: false,
+            extended: false,
+            skip: 0,
         };
 
-        // SAFETY: caller guarantees ring 0. Both ports are quiesced before
-        // the command byte is touched, so a device cannot inject a byte into
-        // the middle of the sequence — the order FreeBSD's `atkbdc` uses.
-        unsafe {
-            command(KBDC_DISABLE_KBD_PORT_CMD);
-            command(KBDC_DISABLE_AUX_PORT);
-            drain();
+        TICKS_PER_US.store(ticks_per_us.max(1), Ordering::Relaxed);
 
-            command(KBDC_GET_COMMAND_BYTE);
-            let existing = read_data();
-
-            // **Only written if it could be read.** A controller whose
-            // command byte did not come back is one this does not understand
-            // the state of, and writing a fabricated byte over a working
-            // configuration is how a keyboard that was fine stops being fine.
-            if let Some(current) = existing {
-                // Interrupts stay off — there is no IDT, and one that fired
-                // would be a triple fault. What matters is translation: with
-                // it set the controller converts set 2 scancodes to set 1,
-                // which is what every scancode table here assumes.
-                //
-                // The system flag is carried through untouched.
-                let byte = (current | KBD_TRANSLATION | KBD_SYSTEM_FLAG)
-                    & !(KBD_DISABLE_KBD_PORT | KBD_DISABLE_AUX_PORT_BIT)
-                    & !0x03;
-                command(KBDC_SET_COMMAND_BYTE);
-                write_data(byte);
-
-                // The self-test is worth running *after* the command byte,
-                // because several controllers reset it as part of the test —
-                // so the byte is written again if the test says it passed.
-                command(KBDC_SELF_TEST);
-                if read_data() == Some(SELF_TEST_PASSED) {
-                    command(KBDC_SET_COMMAND_BYTE);
-                    write_data(byte);
-                }
-            }
-
-            command(KBDC_ENABLE_KBD_PORT);
-            drain();
-            input.keyboard = if cfg!(feature = "force-usb") {
-                false
-            } else {
-                keyboard_up()
-            };
-
-            // The auxiliary port only exists on a controller that has one;
-            // testing it first avoids a long spin on a machine with none.
-            command(KBDC_TEST_AUX_PORT);
-            if !cfg!(feature = "force-usb") && read_data() == Some(0x00) {
-                command(KBDC_ENABLE_AUX_PORT);
-                if reset_device(true) {
-                    input.pointer = identify_pointer();
-                    aux_command(DEV_SET_DEFAULTS);
-                    aux_command(DEV_ENABLE);
-                }
-            }
-            drain();
+        // The order FreeBSD's `atkbdc` uses: both ports quiesced and the
+        // output buffer emptied (`probe_controller`), then the command byte,
+        // then the ports enabled one at a time — so a device cannot inject a
+        // byte into the middle of the sequence.
+        let crumb = Driver::Ps2.enter();
+        // SAFETY: caller guarantees ring 0.
+        input.ps2 = !cfg!(feature = "force-usb") && unsafe { probe_controller() };
+        if input.ps2 {
+            // SAFETY: as above; the controller answered the probe.
+            unsafe { input.bring_up_ps2() };
         }
+        drop(crumb);
 
         // USB whenever *either* device is missing, not only when both are.
         //
@@ -449,7 +435,16 @@ impl Input {
         // Where the 8042 already supplies a device, the USB one for the same
         // role is still enumerated but not read: `poll` prefers PS/2, so a
         // keypress that firmware translates is not delivered twice.
-        if !input.keyboard || input.pointer == PointerKind::None {
+        // USB is also brought up when input is already satisfied, on x86_64,
+        // so a machine with a working PS/2 keyboard still gets the crash
+        // dump's USB target. `bring_up` returns `Some` when it finds a
+        // keyboard, a pointer *or* a storage stick, so the controller is kept
+        // in that last case even though nothing reads it for input.
+        let want_usb = !input.keyboard
+            || input.pointer == PointerKind::None
+            || cfg!(target_arch = "x86_64");
+        if want_usb {
+            let _crumb = Driver::Xhci.enter();
             // SAFETY: forwarded from this function's own contract.
             input.usb = unsafe { UsbInput::bring_up() };
             if let Some(usb) = &input.usb {
@@ -467,6 +462,7 @@ impl Input {
         // bytecode to do so, which is worth not doing when a mouse is already
         // answering.
         if input.pointer == PointerKind::None {
+            let _crumb = Driver::I2cHid.enter();
             // SAFETY: forwarded from this function's own contract.
             match unsafe { crate::i2c_hid::I2cHid::probe(ticks_per_us) } {
                 Ok(touchpad) => {
@@ -477,6 +473,87 @@ impl Input {
             }
         }
         input
+    }
+
+    /// Hands the crash dumper the USB stick found at boot, now that `self` is
+    /// at its final address.
+    ///
+    /// The dumper keeps a raw pointer to the controller inside `self.usb`,
+    /// and that is only stable once `self` has stopped moving. The interface
+    /// loop never returns, so the `Input` it owns is such a home — this is
+    /// called from there, once, and not from `init`, whose `Input` is still
+    /// about to be moved to the caller.
+    #[cfg(target_arch = "x86_64")]
+    pub fn install_crash_sink(&mut self) {
+        if let Some(usb) = self.usb.as_mut() {
+            if let Some(file) = usb.crash_file {
+                let block_size = usb.controller.block_size();
+                // SAFETY: `self`, and so `usb.controller`, lives for the rest
+                // of the run; single core, interrupts masked.
+                unsafe {
+                    crate::crashdump::set_usb_sink(&raw mut usb.controller, file, block_size);
+                }
+            }
+        }
+    }
+
+    /// Programs the command byte and brings up both PS/2 devices, on a
+    /// controller `probe_controller` has just quiesced.
+    ///
+    /// # Safety
+    /// Drives I/O ports; requires ring 0 and exclusive use of the 8042.
+    unsafe fn bring_up_ps2(&mut self) {
+        // SAFETY: forwarded from this function's own contract.
+        unsafe {
+            // **Only written if it could be read.** A controller whose
+            // command byte did not come back is one this does not understand
+            // the state of, and writing a fabricated byte over a working
+            // configuration is how a keyboard that was fine stops being fine.
+            if command(KBDC_GET_COMMAND_BYTE) {
+                if let Some(current) = read_data() {
+                    // Translation on, so the keyboard delivers set 1 (and if
+                    // the controller ignores the bit, `keystroke` notices set
+                    // 2 and converts). The system flag is carried through.
+                    //
+                    // IRQ1 and IRQ12 (bits 0 and 1) stay **off**: this kernel
+                    // runs with IF clear and polls, because an interrupt
+                    // landing inside a measurement is exactly the noise it
+                    // exists to exclude. Enabling them in the controller would
+                    // only leave requests pending at the PIC.
+                    let byte = (current | KBD_TRANSLATION | KBD_SYSTEM_FLAG)
+                        & !(KBD_DISABLE_KBD_PORT | KBD_DISABLE_AUX_PORT_BIT)
+                        & !0x03;
+                    if command(KBDC_SET_COMMAND_BYTE) {
+                        write_data(byte);
+                    }
+
+                    // The self-test is worth running *after* the command
+                    // byte, because several controllers reset it as part of
+                    // the test — so the byte is written again if the test
+                    // says it passed.
+                    if command(KBDC_SELF_TEST) && read_data() == Some(SELF_TEST_PASSED) {
+                        command(KBDC_SET_COMMAND_BYTE);
+                        write_data(byte);
+                    }
+                }
+            }
+
+            command(KBDC_ENABLE_KBD_PORT);
+            drain();
+            self.keyboard = keyboard_up();
+
+            // The auxiliary port only exists on a controller that has one;
+            // testing it first avoids a long wait on a machine with none.
+            if command(KBDC_TEST_AUX_PORT) && read_data() == Some(0x00) {
+                command(KBDC_ENABLE_AUX_PORT);
+                if reset_device(true) {
+                    self.pointer = identify_pointer();
+                    aux_command(DEV_SET_DEFAULTS);
+                    aux_command(DEV_ENABLE);
+                }
+            }
+            drain();
+        }
     }
 
     /// What supplied the input, for the status bar.
@@ -541,6 +618,13 @@ impl Input {
     pub fn trouble(&self) -> &'static str {
         use crate::i2c_hid::Failure;
         match (self.has_keyboard(), self.has_pointer()) {
+            // Said first: "keys may still work" is untrue with no 8042 to
+            // read them from, and on a UEFI machine without legacy emulation
+            // only a USB (or I2C) keyboard can.
+            (false, _) if !self.ps2 => {
+                "no keyboard: there is no 8042 on this machine (UEFI without \
+                 legacy emulation) and no USB keyboard was enumerated"
+            }
             (false, false) => {
                 "no keyboard and no pointer answered. Keys are read from the \
                  8042 regardless, so they may still work"
@@ -591,12 +675,22 @@ impl Input {
     /// means nothing was plugged in.
     pub fn found(&self) -> Found {
         Found {
+            ps2_controller: self.ps2,
             ps2_keyboard: self.keyboard && !self.usb.as_ref().is_some_and(|u| u.keyboard.is_some()),
             ps2_pointer: match self.pointer {
                 PointerKind::Usb | PointerKind::None => None,
                 kind => Some(kind),
             },
             usb_controller: self.usb.is_some(),
+            usb_storage: self.usb.as_ref().is_some_and(|u| u.has_storage()),
+            #[cfg(target_arch = "x86_64")]
+            crash_file_kib: self
+                .usb
+                .as_ref()
+                .and_then(|u| u.crash_file)
+                .map(|f| f.capacity() / 1024),
+            #[cfg(not(target_arch = "x86_64"))]
+            crash_file_kib: None,
             usb_keyboard: self.usb.as_ref().is_some_and(|u| u.keyboard.is_some()),
             usb_pointer: self.usb.as_ref().is_some_and(|u| u.pointer.is_some()),
             i2c_abandoned: self.i2c.as_ref().is_some_and(|pad| pad.abandoned()),
@@ -631,25 +725,39 @@ impl Input {
     /// # Safety
     /// Reads I/O ports; requires ring 0.
     pub unsafe fn poll(&mut self) -> Option<Event> {
-        // SAFETY: reading the status port has no side effects.
-        let status = unsafe { inb(STATUS) };
-        if status & STATUS_OUTPUT_FULL == 0 {
-            // SAFETY: forwarded from this function's own contract.
-            if let Some(event) = unsafe { self.poll_usb() } {
-                return Some(event);
+        // **PS/2 no longer ends the turn.** A byte that completes no event —
+        // a prefix, half a mouse packet, a reply — used to return `None`
+        // here, and the draw loop stops polling at the first `None`: so a
+        // controller with bytes to give but no events in them kept USB and
+        // I2C from ever being read. On a machine whose ports float that was
+        // every frame, and the keyboard looked dead.
+        if self.ps2 {
+            let _crumb = Driver::Ps2.enter();
+            for _ in 0..PS2_BYTES_PER_POLL {
+                // SAFETY: reading the status port has no side effects.
+                let status = unsafe { inb(STATUS) };
+                if status == STATUS_FLOATING || status & STATUS_OUTPUT_FULL == 0 {
+                    break;
+                }
+                // SAFETY: the status bit says a byte is waiting.
+                let byte = unsafe { inb(DATA) };
+                self.remember(byte);
+                let event = if status & STATUS_AUX_DATA == 0 {
+                    self.keystroke(byte)
+                } else {
+                    self.accumulate(byte)
+                };
+                if event.is_some() {
+                    return event;
+                }
             }
-            // SAFETY: as above.
-            return unsafe { self.poll_i2c() };
         }
-        // SAFETY: the status bit says a byte is waiting.
-        let byte = unsafe { inb(DATA) };
-        self.remember(byte);
-
-        if status & STATUS_AUX_DATA == 0 {
-            return self.keystroke(byte);
+        // SAFETY: forwarded from this function's own contract.
+        if let Some(event) = unsafe { self.poll_usb() } {
+            return Some(event);
         }
-
-        self.accumulate(byte)
+        // SAFETY: as above.
+        unsafe { self.poll_i2c() }
     }
 
     /// Turns one keyboard byte into an event, in whichever set arrives.
@@ -659,32 +767,55 @@ impl Input {
     /// numbering this controller is delivering. Forcing the configuration
     /// instead — writing the command byte's translation bit and hoping — is
     /// what leaves a keyboard silent on a machine that ignored the write.
+    ///
+    /// Extended keys (`0xE0` prefix) are reported under their base code, the
+    /// numbering `HID_TO_SET1` uses too: the arrows are `0x48`/`0x4B`/`0x4D`/
+    /// `0x50` from either stack. The prefix used to be delivered as a key of
+    /// its own (`0x60`), and the "fake shifts" a keyboard wraps around the
+    /// arrows in Num Lock as real Shift presses.
     fn keystroke(&mut self, byte: u8) -> Option<Event> {
-        if self.set2_break {
-            self.set2_break = false;
-            return Some(Event::Key(Key {
-                scancode: translate_set2(byte),
-                pressed: false,
-            }));
-        }
-        if byte == SET2_BREAK {
-            self.set2 = true;
-            self.set2_break = true;
+        if self.skip > 0 {
+            self.skip -= 1;
             return None;
         }
-        if self.set2 {
-            return Some(Event::Key(Key {
-                scancode: translate_set2(byte),
-                pressed: true,
-            }));
+        match byte {
+            // Not keys: overrun (0x00, 0xFF), acknowledge, resend, echo.
+            // Replies to commands sent at init can arrive late, and each
+            // used to become a phantom release.
+            0x00 | 0xFF | ACK | RESEND | ECHO => return None,
+            // Pause has no release and a sequence of its own: E1 1D 45 E1 9D
+            // C5 in set 1, E1 14 77 E1 F0 14 F0 77 in set 2. Nothing binds
+            // it, so it is swallowed whole rather than half-decoded.
+            PAUSE_PREFIX => {
+                self.skip = if self.set2 { 7 } else { 5 };
+                self.extended = false;
+                self.set2_break = false;
+                return None;
+            }
+            EXTENDED_PREFIX => {
+                self.extended = true;
+                return None;
+            }
+            SET2_BREAK => {
+                self.set2 = true;
+                self.set2_break = true;
+                return None;
+            }
+            _ => {}
         }
-        // Set 1: bit 7 marks a release. Extended keys are prefixed with 0xE0,
-        // reported as its own event rather than merged — nothing here binds
-        // an extended key.
-        Some(Event::Key(Key {
-            scancode: byte & 0x7F,
-            pressed: byte & 0x80 == 0,
-        }))
+        let extended = core::mem::take(&mut self.extended);
+        let (scancode, pressed) = if self.set2 {
+            (translate_set2(byte), !core::mem::take(&mut self.set2_break))
+        } else {
+            // Set 1: bit 7 marks a release.
+            (byte & 0x7F, byte & 0x80 == 0)
+        };
+        // E0 2A / E0 36 (and their releases): not a Shift key, but the
+        // keyboard undoing Num Lock or Shift around an extended key.
+        if extended && matches!(scancode, SCAN_LEFT_SHIFT | SCAN_RIGHT_SHIFT) {
+            return None;
+        }
+        Some(Event::Key(Key { scancode, pressed }))
     }
 
     /// Which scan code set the keyboard turned out to be using.
@@ -764,6 +895,7 @@ impl Input {
     /// # Safety
     /// Drives the I2C controller; requires ring 0.
     unsafe fn poll_i2c(&mut self) -> Option<Event> {
+        let _crumb = Driver::I2cHid.enter();
         // Not yet due. Compared by wrapped difference, so a counter that
         // rolls over does not make every deadline fire at once.
         let now = crate::arch::counter_ordered();
@@ -813,6 +945,7 @@ impl Input {
     /// Drives the controller; requires ring 0.
     unsafe fn poll_usb(&mut self) -> Option<Event> {
         let usb = self.usb.as_mut()?;
+        let _crumb = Driver::Xhci.enter();
         // SAFETY: forwarded from this function's own contract.
         unsafe { usb.poll() }
     }
@@ -832,7 +965,7 @@ impl UsbInput {
     /// Drives PCI and the controller; requires ring 0 and an identity map.
     unsafe fn bring_up() -> Option<UsbInput> {
         use crate::pci;
-        use crate::xhci::HidKind;
+        use crate::xhci::{HidKind, PortDevice, Want};
 
         // Stops at the first xHCI rather than enumerating the rest of the
         // machine: this is the only device wanted, and every further slot
@@ -851,6 +984,8 @@ impl UsbInput {
             pointer: None,
             previous: [0; 8],
             next: 0,
+            #[cfg(target_arch = "x86_64")]
+            crash_file: None,
         };
 
         // Collected first: `connected_ports` borrows the controller, and the
@@ -867,8 +1002,21 @@ impl UsbInput {
             count += 1;
         }
 
+        // One pass, one enumeration per port: `enumerate_port` reads the
+        // interface class and keeps the device as HID or as storage, or
+        // disables its slot again. Enumerating a port twice — once looking
+        // for HID, once for storage — is what a controller refuses: the
+        // second Address Device on a port another slot still holds is a
+        // TRB Error.
         for &port in &ports[..count] {
-            if usb.keyboard.is_some() && usb.pointer.is_some() {
+            // What is still missing. On x86_64 a mass-storage stick is kept
+            // too — the crash dump's persistent home — but only the first.
+            let want = Want {
+                keyboard: usb.keyboard.is_none(),
+                pointer: usb.pointer.is_none(),
+                storage: cfg!(target_arch = "x86_64") && !usb.has_storage(),
+            };
+            if !want.keyboard && !want.pointer && !want.storage {
                 break;
             }
             // A device that fails its reset is skipped rather than abandoning
@@ -879,20 +1027,49 @@ impl UsbInput {
                 continue;
             }
             // SAFETY: as above.
-            let Some((index, hid)) = (unsafe { usb.controller.enumerate(port) }) else {
-                continue;
-            };
-            match hid.kind {
-                HidKind::Keyboard if usb.keyboard.is_none() => usb.keyboard = Some(index),
-                HidKind::Pointer if usb.pointer.is_none() => usb.pointer = Some(index),
-                // A device that is not a boot-protocol HID, or a second of a
-                // kind already held. Its slot stays addressed but nothing
-                // reads it.
+            match unsafe { usb.controller.enumerate_port(port, want) } {
+                // Only wanted kinds come back as `Hid`; see `Want`.
+                Some(PortDevice::Hid(index, hid)) => match hid.kind {
+                    HidKind::Keyboard => usb.keyboard = Some(index),
+                    HidKind::Pointer => usb.pointer = Some(index),
+                    HidKind::Other => {}
+                },
+                #[cfg(target_arch = "x86_64")]
+                Some(PortDevice::Storage) => {
+                    // Resolved now, while the machine is healthy: the crash
+                    // path only writes the blocks this finds.
+                    // SAFETY: as above; the stick is addressed and ready.
+                    usb.crash_file =
+                        unsafe { crate::usb_storage::find_crash_file(&mut usb.controller) };
+                    match &usb.crash_file {
+                        Some(file) => crate::println!(
+                            "crash dump target: USB stick, CRASH.DMP resolved ({} extent(s), {} KiB)",
+                            file.extent_count,
+                            file.capacity() / 1024
+                        ),
+                        None => crate::println!(
+                            "crash dump target: USB stick found, but no CRASH.DMP on a FAT32 volume; serial only"
+                        ),
+                    }
+                }
                 _ => {}
             }
         }
 
-        (usb.keyboard.is_some() || usb.pointer.is_some()).then_some(usb)
+        let found_storage = cfg!(target_arch = "x86_64") && usb.has_storage();
+        (usb.keyboard.is_some() || usb.pointer.is_some() || found_storage).then_some(usb)
+    }
+
+    /// Whether the mass-storage pass enumerated a stick.
+    fn has_storage(&self) -> bool {
+        #[cfg(target_arch = "x86_64")]
+        {
+            self.controller.has_storage()
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            false
+        }
     }
 
     /// Takes one event from whichever device has one waiting.
@@ -1018,69 +1195,198 @@ fn sign_extend(value: u8, negative: bool) -> i32 {
     }
 }
 
-/// Waits for the input buffer to drain, then sends a controller command.
+/// Whether an 8042 is there at all, decided once by [`probe_controller`].
+///
+/// A PC booted by UEFI with no CSM usually has no 8042 and no firmware
+/// emulating one, and the ports then float: every status read is `0xFF`,
+/// which says both "a byte is waiting" and "the input buffer is full". A
+/// driver that believes it spins its full timeout on every write and then
+/// reads `0xFF` bytes forever — the machine looks as though interrupts were
+/// masked and nothing will ever arrive, when in fact USB input is sitting
+/// unread behind a PS/2 loop that never yields.
+static PRESENT: AtomicBool = AtomicBool::new(false);
+
+/// Counter ticks per microsecond, for the timeouts below. Set by `init` from
+/// the calibrated clock; 3 GHz until then.
+static TICKS_PER_US: AtomicU64 = AtomicU64::new(3000);
+
+/// What a status read returns on a bus with nothing behind the port.
+const STATUS_FLOATING: u8 = 0xFF;
+
+/// Timeouts, in microseconds. FreeBSD's `atkbdc` sizes its retry loops to
+/// about 100 ms for the controller to take a byte and twice that for a byte
+/// to arrive, and so does this. A reset adds the keyboard's power-on
+/// self-test before its reply, so that one wait is longer.
+const CONTROLLER_US: u64 = 100_000;
+const RESPONSE_US: u64 = 200_000;
+const RESET_US: u64 = 1_000_000;
+
+/// How many bytes a drain reads before deciding the output buffer is stuck.
+/// A real controller holds one byte and a keyboard queues at most a few
+/// dozen; a status bit still set after this many reads is not a queue.
+const DRAIN_LIMIT: usize = 256;
+
+/// A deadline `us` microseconds from now, on the kernel's counter.
+fn deadline(us: u64) -> u64 {
+    crate::arch::counter_ordered().wrapping_add(us * TICKS_PER_US.load(Ordering::Relaxed))
+}
+
+/// Whether `deadline` has not yet passed. Compared by wrapped difference, as
+/// the touchpad's rate limit is.
+fn before(deadline: u64) -> bool {
+    (deadline.wrapping_sub(crate::arch::counter_ordered()) as i64) > 0
+}
+
+/// Waits until the controller can take a byte: status bit 1, input buffer
+/// full, clear. `false` if it never clears.
 ///
 /// # Safety
 /// Requires ring 0.
-unsafe fn command(byte: u8) {
-    // SAFETY: caller guarantees ring 0; polling the status port is harmless.
+unsafe fn wait_input_empty() -> bool {
+    let end = deadline(CONTROLLER_US);
+    // SAFETY: caller guarantees ring 0; reading the status port is harmless.
     unsafe {
-        for _ in 0..SPIN_LIMIT {
-            if inb(STATUS) & STATUS_INPUT_FULL == 0 {
-                break;
+        loop {
+            let status = inb(STATUS);
+            if status != STATUS_FLOATING && status & STATUS_INPUT_FULL == 0 {
+                return true;
             }
-            core::hint::spin_loop();
+            if !before(end) {
+                return false;
+            }
+            io_wait();
         }
-        outb(STATUS, byte);
     }
 }
 
+/// Waits up to `us` for a byte: status bit 0, output buffer full, set.
+///
 /// # Safety
 /// Requires ring 0.
-unsafe fn write_data(byte: u8) {
-    // SAFETY: as `command`.
+unsafe fn wait_output_full(us: u64) -> bool {
+    let end = deadline(us);
+    // SAFETY: as `wait_input_empty`.
     unsafe {
-        for _ in 0..SPIN_LIMIT {
-            if inb(STATUS) & STATUS_INPUT_FULL == 0 {
-                break;
+        loop {
+            let status = inb(STATUS);
+            if status != STATUS_FLOATING && status & STATUS_OUTPUT_FULL != 0 {
+                return true;
             }
-            core::hint::spin_loop();
+            if !before(end) {
+                return false;
+            }
+            io_wait();
         }
-        outb(DATA, byte);
     }
 }
 
-/// Reads a byte, or `None` if nothing arrives.
+/// Waits for the input buffer to drain, then sends a controller command.
+/// `false`, with nothing sent, if the controller is absent or never ready.
+///
+/// # Safety
+/// Requires ring 0.
+unsafe fn command(byte: u8) -> bool {
+    if !PRESENT.load(Ordering::Relaxed) {
+        return false;
+    }
+    // SAFETY: caller guarantees ring 0.
+    unsafe {
+        if !wait_input_empty() {
+            return false;
+        }
+        outb(STATUS, byte);
+        io_wait();
+    }
+    true
+}
+
+/// Writes a byte to the data port, as `command` does to the command port.
+///
+/// # Safety
+/// Requires ring 0.
+unsafe fn write_data(byte: u8) -> bool {
+    if !PRESENT.load(Ordering::Relaxed) {
+        return false;
+    }
+    // SAFETY: as `command`.
+    unsafe {
+        if !wait_input_empty() {
+            return false;
+        }
+        outb(DATA, byte);
+        io_wait();
+    }
+    true
+}
+
+/// Reads a byte, or `None` if nothing arrives within a device's reply time.
 ///
 /// # Safety
 /// Requires ring 0.
 unsafe fn read_data() -> Option<u8> {
-    // SAFETY: caller guarantees ring 0.
-    unsafe {
-        for _ in 0..SPIN_LIMIT {
-            if inb(STATUS) & STATUS_OUTPUT_FULL != 0 {
-                return Some(inb(DATA));
-            }
-            core::hint::spin_loop();
-        }
-    }
-    None
+    // SAFETY: forwarded from this function's own contract.
+    unsafe { read_data_within(RESPONSE_US) }
 }
 
-/// Discards anything already waiting.
+/// Reads a byte, or `None` if nothing arrives within `us`.
 ///
 /// # Safety
 /// Requires ring 0.
-unsafe fn drain() {
+unsafe fn read_data_within(us: u64) -> Option<u8> {
+    if !PRESENT.load(Ordering::Relaxed) {
+        return None;
+    }
+    // SAFETY: caller guarantees ring 0; the status bit says a byte is there.
+    unsafe { wait_output_full(us).then(|| inb(DATA)) }
+}
+
+/// Empties the output buffer: reads port `0x60` until status bit 0 clears.
+/// `false` if it never does, which no working controller does.
+///
+/// # Safety
+/// Requires ring 0.
+unsafe fn drain() -> bool {
     // SAFETY: caller guarantees ring 0.
     unsafe {
-        for _ in 0..64 {
-            if inb(STATUS) & STATUS_OUTPUT_FULL == 0 {
-                return;
+        for _ in 0..DRAIN_LIMIT {
+            let status = inb(STATUS);
+            if status == STATUS_FLOATING {
+                return false;
+            }
+            if status & STATUS_OUTPUT_FULL == 0 {
+                return true;
             }
             let _ = inb(DATA);
+            io_wait();
         }
     }
+    false
+}
+
+/// Decides whether an 8042 is there, and leaves it quiesced if it is: both
+/// ports disabled and the output buffer empty.
+///
+/// Three ways to fail, all of them a controller that is not there rather
+/// than one that is slow: the status port floats, the input buffer never
+/// empties for the disable commands, or the output buffer never empties
+/// however much is read from it. Any one of them and the whole PS/2 path is
+/// switched off, so `poll` goes straight to USB and I2C.
+///
+/// # Safety
+/// Requires ring 0.
+unsafe fn probe_controller() -> bool {
+    // SAFETY: caller guarantees ring 0; reading the status port is harmless.
+    if unsafe { inb(STATUS) } == STATUS_FLOATING {
+        return false;
+    }
+    PRESENT.store(true, Ordering::Relaxed);
+    // SAFETY: as above. Disabled before draining, so that a key pressed
+    // during the drain cannot refill the buffer behind it.
+    let quiet = unsafe {
+        command(KBDC_DISABLE_KBD_PORT_CMD) && command(KBDC_DISABLE_AUX_PORT) && drain()
+    };
+    PRESENT.store(quiet, Ordering::Relaxed);
+    quiet
 }
 
 /// Sends a command to the mouse rather than the keyboard.
@@ -1114,7 +1420,7 @@ unsafe fn reset_device(aux: bool) -> bool {
             return false;
         }
         // Self-test result. A device that fails it is not used.
-        if read_data() != Some(RESET_DONE) {
+        if read_data_within(RESET_US) != Some(RESET_DONE) {
             return false;
         }
         // A mouse follows with its device ID; a keyboard does not. Reading

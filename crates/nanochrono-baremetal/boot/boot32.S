@@ -615,7 +615,9 @@ setup_exceptions:
 /* One stub per vector, 16 bytes apart so the loop above can compute each
  * address. The CPU pushes an error code for 8, 10-14, 17, 21, 29 and 30;
  * the others push a zero so every frame has the same shape:
- *   [vector, error, RIP, CS, RFLAGS, RSP, SS] */
+ *   [vector, error, RIP, CS, RFLAGS, RSP, SS]
+ * `isr_common` then pushes the fifteen general registers below it, so the
+ * crash dump has the state at the fault rather than the handler's. */
 .balign 16
 isr_stubs:
 .irp v, 0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31
@@ -630,6 +632,23 @@ isr_stubs:
 
 isr_common:
     cld
+    /* In reverse, so that in memory they read RAX first: the layout of
+     * `crashdump::TrapFrame`. Nothing here returns, so nothing pops them. */
+    push %r15
+    push %r14
+    push %r13
+    push %r12
+    push %r11
+    push %r10
+    push %r9
+    push %r8
+    push %rbp
+    push %rdi
+    push %rsi
+    push %rdx
+    push %rcx
+    push %rbx
+    push %rax
     mov %rsp, %rdi                  /* the frame, as the first argument */
     and $-16, %rsp                  /* System V alignment for the call  */
     call nanochrono_x86_exception
@@ -695,10 +714,14 @@ guard_pt:
 .global nc_stack_guard
 nc_stack_guard:
     .skip 4096
+.global nc_stack_bottom
+nc_stack_bottom:
 stack_bottom:
     /* 64 KiB. The kernel makes no deep calls and allocates nothing, but the
      * measurement buffers are stack-resident. */
     .skip 65536
+.global nc_stack_top
+nc_stack_top:
 stack_top:
 
 .align 16
@@ -707,10 +730,17 @@ idt64:
 tss64:
     .skip 104
 .align 16
+/* Global so the crash dump can tell which stack a fault was on, and read
+ * only memory it knows is mapped. */
+.global nc_ist1_bottom, nc_ist1_top, nc_ist2_bottom, nc_ist2_top
+nc_ist1_bottom:
 ist1_bottom:
     .skip 32768
+nc_ist1_top:
 ist1_top:
 .align 16
+nc_ist2_bottom:
 ist2_bottom:
     .skip 32768
+nc_ist2_top:
 ist2_top:

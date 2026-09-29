@@ -59,6 +59,10 @@ pub mod bench;
 /// CPU load, effective frequency and the loop's own time accounting: the
 /// data behind the task-manager view.
 pub mod cpuload;
+/// x86: the driver breadcrumb everywhere, and on x86-64 the `.DMP` image a
+/// fault leaves over COM1.
+#[cfg(x86_any)]
+pub mod crashdump;
 /// The interactive serial console: menu, task manager, settings.
 pub mod console;
 pub mod draw;
@@ -139,6 +143,10 @@ pub mod vga;
 /// x86 only for now: the controller is found through PCI.
 #[cfg(x86_any)]
 pub mod xhci;
+/// x86_64 only: finds `CRASH.DMP` on a USB stick, for the crash dump to write
+/// to. Needs the xHCI mass-storage path, which is x86-only.
+#[cfg(target_arch = "x86_64")]
+pub mod usb_storage;
 
 pub use nanochrono_core::{arch as core_arch, cpu, Backend, Integrity, Protected, SimdFamily};
 

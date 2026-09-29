@@ -16,6 +16,9 @@ use crate::framebuffer::Framebuffer;
 /// concurrent access for the missing synchronisation to protect.
 static mut FRAMEBUFFER: Option<Framebuffer> = None;
 
+/// Set on entry to the panic handler. See its first lines.
+static PANICKING: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
 /// Records the framebuffer for the panic screen to draw on.
 ///
 /// Call once, during boot, before anything that could panic.
@@ -33,6 +36,14 @@ pub fn set_framebuffer(fb: Option<Framebuffer>) {
 /// forever — so this stops and offers the choice instead.
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo<'_>) -> ! {
+    // A panic inside this handler — a formatter, the dump writer, the stop
+    // screen — would otherwise re-enter it and recurse until the stack guard
+    // turns it into a page fault, burying the first reason under the last.
+    if PANICKING.swap(true, core::sync::atomic::Ordering::Relaxed) {
+        crate::println!("\npanic while panicking: {info}");
+        crate::arch::halt();
+    }
+
     // The serial port may not be initialised yet — a panic before `kmain`
     // reaches `Serial::init` prints nothing, which is the best available
     // outcome and better than faulting inside the handler.
@@ -43,6 +54,32 @@ fn panic(info: &core::panic::PanicInfo<'_>) -> ! {
     // which is better than losing all of it.
     let mut reason = ReasonBuffer::new();
     let _ = core::fmt::write(&mut reason, format_args!("{info}"));
+
+    // The crash dump, over COM1: the registers at the fault (or here, for a
+    // software panic), the driver that was running, a stack trace, and the
+    // stack and code bytes around it. Before the stop screen, which waits
+    // for a key and may never be answered.
+    #[cfg(target_arch = "x86_64")]
+    {
+        crate::println!("driver: {}", crate::crashdump::current().name());
+        // SAFETY: the panic handler, entered once (see `PANICKING`), on a
+        // single core with interrupts masked.
+        let dump = unsafe { crate::crashdump::build(reason.as_str()) };
+        crate::crashdump::emit_serial(dump);
+        crate::println!("crash dump: {} bytes above; extract with tools/nanodump.py", dump.len());
+
+        // The persistent copy: the pre-resolved CRASH.DMP on a USB stick, if
+        // one was found at boot. Raw block writes into blocks the file
+        // already owns — no filesystem is touched. The serial copy above is
+        // the record when there is no stick or the write fails.
+        if crate::crashdump::usb_sink_ready() {
+            // SAFETY: the panic handler, entered once, single core.
+            match unsafe { crate::crashdump::write_to_usb(dump) } {
+                Some(n) => crate::println!("crash dump: wrote {n} bytes to USB CRASH.DMP"),
+                None => crate::println!("crash dump: USB write failed (serial copy is the record)"),
+            }
+        }
+    }
 
     // The stop screen needs a framebuffer and a keyboard, both of which are
     // PC firmware. An AArch64 board has already had the reason over serial,

@@ -37,7 +37,7 @@ Reference sources for the bare-metal drivers
 The bare-metal target (crates/nanochrono-baremetal) talks to hardware that
 has no portable interface: the 8042 keyboard controller, the Synopsys
 DesignWare I2C master Intel ships in its LPSS block, I2C-HID touchpads and
-keyboards, and xHCI. Two existing driver trees were consulted while writing
+keyboards, xHCI, and USB mass storage for the crash dump. Two existing driver trees were consulted while writing
 those, and they are not consulted on the same terms.
 
   FreeBSD                BSD-2-Clause and BSD-3-Clause
@@ -66,8 +66,16 @@ those, and they are not consulted on the same terms.
                              semaphore handoff:
                              crates/nanochrono-baremetal/src/xhci.rs
                            sys/dev/atkbdc/atkbdc.c         BSD-3-Clause
-                             8042 controller command set and bring-up order:
+                             8042 controller command set and bring-up order,
+                             and the ~100 ms / ~200 ms sizing of its waits:
                              crates/nanochrono-baremetal/src/input.rs
+                           sys/dev/usb/storage/umass.c     BSD-2-Clause
+                             MAEKAWA Masahide and Nick Hibma. The Bulk-Only
+                             Transport command and status wrappers — their
+                             signatures, direction flags and sizes — and the
+                             handling of a wrong CSW signature, for the USB
+                             crash-dump target:
+                             crates/nanochrono-baremetal/src/xhci.rs
 sys/dev/hwpmc/hwpmc_amd.c       BSD-2-Clause
    sys/dev/hwpmc/hwpmc_amd.h       BSD-2-Clause
      AMD performance-counter register addresses, the
@@ -86,6 +94,14 @@ sys/dev/hwpmc/hwpmc_amd.c       BSD-2-Clause
                              pad register layout, the pin-to-pad arithmetic,
                              and the Alder Lake and Tiger Lake H pad-group
                              tables: crates/nanochrono-baremetal/src/gpio.rs
+
+                         Consulted, not reproduced: sys/fs/msdosfs
+                         (msdosfs_vfsops.c, fat.h; Wolfgang Solfrank, TooLs
+                         GmbH), BSD-4-Clause, to cross-check how a FAT32
+                         volume is recognised. The rule itself is Microsoft's
+                         FAT specification's, and no code, expression or
+                         comment from these files is in this project, so
+                         their advertising clause is not engaged.
 
                          Attribution is the condition these licenses attach,
                          and this section is it. The BSD-3-Clause files add a

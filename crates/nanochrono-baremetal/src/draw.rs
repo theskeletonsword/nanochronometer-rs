@@ -42,6 +42,22 @@ pub struct Palette {
     pub glow: Colour,
     /// A meter that has gone past what is comfortable.
     pub warn: Colour,
+    /// Panel titles (the desktop GUI's `LABEL`).
+    pub label: Colour,
+    /// Readout values, brighter than body text.
+    pub value: Colour,
+    /// Sunken surfaces: the readout face.
+    pub inset: Colour,
+    /// The navigation strip: header and tabs.
+    pub nav: Colour,
+    /// The status bar's surface and its text.
+    pub status_bg: Colour,
+    pub status: Colour,
+    /// A stopwatch stopped with time on it.
+    pub paused: Colour,
+    /// A benchmark row the machine can run, and one it cannot.
+    pub ok: Colour,
+    pub off: Colour,
 }
 
 impl Palette {
@@ -66,31 +82,48 @@ impl Palette {
         track: 0x0012_3225,
         glow: 0x0030_9C68,
         warn: 0x00FF_C36B,
+        label: 0x00E4_FFF1,
+        value: 0x00FF_FFFF,
+        inset: 0x000A_1F16,
+        nav: 0x0017_4A33,
+        status_bg: 0x000A_1F16,
+        status: 0x008F_CFA8,
+        paused: 0x00FF_C36B,
+        ok: 0x00E6_FFF0,
+        off: 0x008F_CFA8,
     };
 
-    /// The measurement interface: black, with the logo's two inks for the
-    /// lettering — white for what is read, the logo green for labels and
-    /// accents. No grey anywhere, so the embedded logo sits on its own
-    /// background.
+    /// The measurement interface: the desktop GUI's palette
+    /// (`nanochrono-gui/src/style.rs`), colour for colour, so the two read as
+    /// one application — terminal green on black.
     pub const APP: Palette = Palette {
         background: 0x0000_0000,
-        panel: 0x000A_0C0A,
+        panel: 0x000A_120A,
         shadow: 0x0000_0000,
         title: 0x00FF_FFFF,
-        text: 0x00F4_F7F4,
-        muted: 0x002F_B83C,
-        accent: 0x0039_E84A,
-        danger: 0x00FF_7A66,
-        button: 0x0010_1410,
-        button_edge: 0x001F_4A26,
-        divider: 0x0014_2A18,
-        header_from: 0x0000_0000,
-        header_to: 0x0000_0000,
-        hover: 0x0016_2E1A,
-        active: 0x001F_4A26,
-        track: 0x0012_1812,
-        glow: 0x0014_5C22,
-        warn: 0x00FF_C36B,
+        text: 0x00B7_B7B7,
+        muted: 0x006E_7A6E,
+        accent: 0x0000_FF4E,
+        danger: 0x00FF_5555,
+        button: 0x0005_0805,
+        button_edge: 0x001A_1A1A,
+        divider: 0x001A_1A1A,
+        header_from: 0x0005_0805,
+        header_to: 0x0005_0805,
+        hover: 0x000C_140C,
+        active: 0x0013_1E13,
+        track: 0x0013_1E13,
+        glow: 0x0000_521B,
+        warn: 0x00FF_AA00,
+        label: 0x0099_CC99,
+        value: 0x00FF_FFFF,
+        inset: 0x0004_0A04,
+        nav: 0x0005_0805,
+        status_bg: 0x0011_1111,
+        status: 0x0033_DD66,
+        paused: 0x00FF_AA00,
+        ok: 0x0088_FF33,
+        off: 0x0044_6644,
     };
 }
 
@@ -555,4 +588,44 @@ pub fn fade_region(fb: &Framebuffer, x: u32, y: u32, w: u32, h: u32, towards: Co
             fb.set(col, row, blend(towards, fb.get(col, row), alpha));
         }
     }
+}
+
+/// A desktop-GUI container: a fill with a one-pixel border and corners
+/// rounded by two pixels — `style::panel` / `style::inset` in
+/// `nanochrono-gui`. Four strips and four corner pixels rather than a
+/// per-pixel rounded test, so a full-width box costs what a fill costs.
+pub fn boxed(fb: &Framebuffer, x: u32, y: u32, w: u32, h: u32, fill: Colour, border: Colour) {
+    if w < 4 || h < 4 {
+        fb.fill(x, y, w, h, fill);
+        return;
+    }
+    fb.fill(x + 1, y + 1, w - 2, h - 2, fill);
+    fb.fill(x + 2, y, w - 4, 1, border);
+    fb.fill(x + 2, y + h - 1, w - 4, 1, border);
+    fb.fill(x, y + 2, 1, h - 4, border);
+    fb.fill(x + w - 1, y + 2, 1, h - 4, border);
+    for (cx, cy) in [(x + 1, y + 1), (x + w - 2, y + 1), (x + 1, y + h - 2), (x + w - 2, y + h - 2)] {
+        fb.set(cx, cy, border);
+    }
+}
+
+/// A desktop-GUI tab or toggle (`style::tab`): filled with the accent and
+/// lettered in black when active, outlined on the navigation strip when not.
+/// The fill, border and ink are passed in so a caller can tween between them.
+#[allow(clippy::too_many_arguments)]
+pub fn tab_button(
+    fb: &Framebuffer,
+    face: &Face,
+    x: u32,
+    y: u32,
+    w: u32,
+    h: u32,
+    label: &str,
+    fill: Colour,
+    border: Colour,
+    ink: Colour,
+) {
+    boxed(fb, x, y, w, h, fill, border);
+    let ty = y + h.saturating_sub(face.line_height as u32) / 2;
+    text_centred(fb, face, x, w, ty, label, ink);
 }

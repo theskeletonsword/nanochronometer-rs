@@ -36,13 +36,28 @@ QEMU has no KVM path for those machines.
 A kernel that reaches `selftest complete; halting` on the serial log has passed
 its boot self-test; it then idles until the QEMU timeout, which is expected.
 
+Faults (x86_64): `crashtest=<de|pf|gp|ud|so|df|panic>` on the kernel command
+line raises one on purpose; passing means a crash dump on COM1 and the stop
+screen, with QEMU still running — QEMU exiting under `-no-reboot` is a triple
+fault. `build.sh debug` builds `-O0 -g` with frame pointers into
+`dist/baremetal-debug/`; `build.sh gdb x86_64 [crashtest=…]` boots it stopped
+for `gdb -x packaging/baremetal/gdb/x86_64.gdb`. `tools/nanodump.py` reads the
+dumps. See `docs/CRASH_DUMPS.md`. A PC with no 8042 is `-machine q35,i8042=off`.
+
 ## Logo and icons
 
 `tools/gen-icons.py` (fontTools, cairosvg, Pillow) regenerates every logo and
 icon from `assets/src/stopwatch-artwork.svg` and `assets/font/Nanoplex.ttf`:
 `assets/icons/<platform>/`, the Android `res/` (launcher mipmaps and the
-header wordmark), the desktop GUI's `assets/nanochronometer_wordmark_dark.png`,
-and the bare-metal raw RGBA (`assets/icons/baremetal/*.rgba`, 8-byte
-width/height header) that `crates/nanochrono-baremetal/src/logo.rs` embeds —
-no image decoder in the kernel. Bare metal uses a black theme: lettering in
-white or the logo green, nothing grey.
+header wordmark) and the desktop GUI's `assets/nanochronometer_wordmark_dark.png`.
+
+Bare metal embeds `assets/nanochronometer_logo_dark.png` itself:
+`crates/nanochrono-baremetal/build.rs` decodes and scales it on the host into
+raw RGBA in `OUT_DIR`, and `src/logo.rs` includes those bytes — no image
+decoder in the kernel.
+
+The bare-metal GUI follows the desktop GUI's design (`nanochrono-gui`):
+`Palette::APP` in `draw.rs` is `style.rs` colour for colour, tabs are
+desktop tab buttons, the readout sits in an inset box, and the BENCH tab is
+the desktop benchmark panel (modes, feature rows, log) driven by
+`bench::run_one`. Keep the two in step when either changes.

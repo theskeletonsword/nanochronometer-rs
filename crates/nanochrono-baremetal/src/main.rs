@@ -126,6 +126,32 @@ pub unsafe extern "C" fn kmain(magic: usize, multiboot_info: usize) -> ! {
     progress::attach(fb);
     progress::leave(progress::Phase::Entered);
 
+    // `crashtest=<de|pf|gp|ud|so|df|panic>` on the command line raises that
+    // fault on purpose: the way to prove, on the machine in question, that a
+    // fault ends in a crash dump and a stop screen rather than a reset. It is
+    // *armed* here and fired later — after the interface has brought up USB
+    // and handed the dumper the stick — so the dump exercises the USB path
+    // too, not only serial. The no-framebuffer console path, which brings up
+    // no USB, fires it immediately before it starts. GRUB: press `e` on the
+    // entry and append it to the `multiboot2` line. QEMU: `-append`.
+    #[cfg(target_arch = "x86_64")]
+    {
+        // SAFETY: the magic says which structure `multiboot_info` is.
+        let line = unsafe {
+            match magic {
+                MULTIBOOT2_BOOTLOADER_MAGIC => multiboot::command_line(multiboot_info),
+                MULTIBOOT1_BOOTLOADER_MAGIC => multiboot::command_line_v1(multiboot_info),
+                _ => None,
+            }
+        };
+        if let Some(line) = line {
+            println!("command line: {line}");
+            if let Some(test) = nanochrono_baremetal::crashdump::CrashTest::from_command_line(line) {
+                nanochrono_baremetal::crashdump::arm_crashtest(test);
+            }
+        }
+    }
+
     match fb {
         // SAFETY: at CPL 0, with a framebuffer the loader described.
         Some(ref fb) => {
@@ -158,6 +184,13 @@ pub unsafe extern "C" fn kmain(magic: usize, multiboot_info: usize) -> ! {
             unsafe { selftest::run() };
             println!();
             println!("Boot with gfxpayload=keep for the interface.");
+            // The console brings up no USB, so an armed crashtest fires here,
+            // with only the serial dump available.
+            #[cfg(target_arch = "x86_64")]
+            // SAFETY: CPL 0, the IDT is installed; faulting is the point.
+            unsafe {
+                nanochrono_baremetal::crashdump::fire_pending_crashtest()
+            };
             // SAFETY: at CPL 0; the serial console needs no framebuffer.
             unsafe { nanochrono_baremetal::console::run() }
         }

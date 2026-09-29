@@ -109,6 +109,23 @@ pub unsafe fn inb(port: u16) -> u8 {
     value
 }
 
+/// A short, bus-speed delay: a write to the POST diagnostic port `0x80`.
+///
+/// Nothing decodes the port on a modern board, but the write still crosses
+/// the LPC/eSPI bus and takes about a microsecond whatever the CPU's clock —
+/// which is what a legacy device such as the 8042 needs between a command
+/// and the next status read. A spin loop's length depends on the CPU and is
+/// shorter on exactly the fast machines where the gap matters.
+///
+/// # Safety
+/// Privileged. Harmless on every PC: the port is the POST code latch.
+#[inline]
+pub unsafe fn io_wait() {
+    // SAFETY: the caller guarantees CPL 0; port 0x80 has no side effects
+    // beyond a POST display some boards have.
+    unsafe { outb(0x80, 0) };
+}
+
 #[cfg(target_arch = "x86_64")]
 /// Names of the architectural exception vectors, for the report.
 const EXCEPTION_NAMES: [&str; 32] = [
@@ -152,25 +169,40 @@ const EXCEPTION_NAMES: [&str; 32] = [
 static IN_EXCEPTION: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 #[cfg(target_arch = "x86_64")]
-/// Entered from the IDT stubs in `boot32.S` with a pointer to
-/// `[vector, error, RIP, CS, RFLAGS, RSP, SS]`. Reports and never returns.
+/// Entered from the IDT stubs in `boot32.S` with a pointer to the saved
+/// general registers and the CPU's frame — see `crashdump::TrapFrame`.
+/// Records the state for the crash dump, then reports and never returns.
 ///
 /// Goes through `panic!` so the report reaches the framebuffer's panic screen
 /// as well as the UART: on a laptop with no serial port the screen is the
 /// only place a fault can be seen.
 #[no_mangle]
-extern "C" fn nanochrono_x86_exception(frame: *const u64) -> ! {
-    if IN_EXCEPTION.swap(true, core::sync::atomic::Ordering::Relaxed) {
-        crate::arch::halt();
-    }
-    // SAFETY: the stub passes the seven quadwords it and the CPU just pushed.
-    let f = unsafe { core::slice::from_raw_parts(frame, 7) };
-    let vector = f[0] as usize;
+extern "C" fn nanochrono_x86_exception(frame: *const crate::crashdump::TrapFrame) -> ! {
+    // SAFETY: the stub passes the frame it and the CPU just pushed.
+    let f = unsafe { &*frame };
+    // CR2 first: a later page fault, even a nested one, would replace it.
     let cr2: u64;
     // SAFETY: reading CR2 at CPL 0 has no side effects.
     unsafe {
         core::arch::asm!("mov {v}, cr2", v = out(reg) cr2, options(nomem, nostack, preserves_flags));
     }
+    if IN_EXCEPTION.swap(true, core::sync::atomic::Ordering::Relaxed) {
+        // A fault inside the report. Said with nothing but port writes —
+        // `core::fmt`, the framebuffer and the dump writer are all suspects
+        // now — and then stopped, rather than recursing into a third fault.
+        crate::serial::write_uart_only(b"\r\nnested exception: vector ");
+        crate::crashdump::raw_hex(f.vector);
+        crate::serial::write_uart_only(b" rip ");
+        crate::crashdump::raw_hex(f.rip);
+        crate::serial::write_uart_only(b" cr2 ");
+        crate::crashdump::raw_hex(cr2);
+        crate::serial::write_uart_only(b"\r\nhalted\r\n");
+        crate::arch::halt();
+    }
+    // SAFETY: once, here, before the panic that writes the dump.
+    unsafe { crate::crashdump::record_exception(f, cr2) };
+
+    let vector = f.vector as usize;
     extern "C" {
         static nc_stack_guard: u8;
     }
@@ -178,17 +210,17 @@ extern "C" fn nanochrono_x86_exception(frame: *const u64) -> ! {
     if vector == 14 && (guard..guard + 4096).contains(&cr2) {
         panic!(
             "kernel stack overflow: write to the guard page at {:#x} from rip={:#x}",
-            cr2, f[2]
+            cr2, f.rip
         );
     }
     panic!(
         "CPU exception {} ({}) error={:#x} rip={:#x} rsp={:#x} rflags={:#x} cr2={:#x}",
         vector,
         EXCEPTION_NAMES.get(vector).copied().unwrap_or("?"),
-        f[1],
-        f[2],
-        f[5],
-        f[4],
+        f.error,
+        f.rip,
+        f.rsp,
+        f.rflags,
         cr2
     );
 }

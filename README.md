@@ -168,10 +168,12 @@ certificate and a Mac — this project cannot do it for you.
 ### Bare metal (no operating system)
 
 ```sh
-./packaging/baremetal/build.sh              # every architecture below
+./packaging/baremetal/build.sh              # every architecture below (release)
 ./packaging/baremetal/build.sh run aarch64  # build and boot under QEMU
 ./packaging/baremetal/build.sh run ppc-g4   # the ppc build, via Open Firmware
 ./packaging/baremetal/build.sh test         # the host-side decoding tests
+./packaging/baremetal/build.sh debug        # x86_64 at -O0 -g, frame pointers
+./packaging/baremetal/build.sh gdb x86_64 [crashtest=df]  # the same, stopped for GDB
 ```
 
 | Architecture | Rust target | Machine (QEMU) | Enters via | Console |
@@ -372,6 +374,46 @@ Idle is real where the architecture allows it without interrupts — `TPAUSE`
 to a TSC deadline (x86 with WAITPKG), `WFE` woken by the generic timer's
 event stream (AArch64) — so the activity counters show it. Elsewhere the wait
 is a low-priority spin, and 100 % active is then the truth.
+
+#### Keyboards on PCs with no 8042
+
+The kernel polls its input with interrupts masked. That is deliberate: an
+interrupt landing in a measurement is the noise it exists to exclude, so
+there is no IRQ1 handler and no EOI to send. What broke keyboards on real
+hardware was the 8042 itself. A UEFI PC with no legacy emulation has none,
+its ports float and read `0xFF`, and the old driver waited out a minute of
+timeouts at boot, then read `0xFF` forever without ever reaching the USB
+keyboard. The controller is now probed and skipped when it is not there, and
+USB and I2C are polled every frame regardless. `-machine q35,i8042=off` in
+QEMU reproduces such a PC. See
+[docs/BAREMETAL_DRIVERS.md](docs/BAREMETAL_DRIVERS.md).
+
+#### Faults, crash dumps and the USB stick
+
+On x86-64 every CPU exception has an IDT gate, and the double fault, NMI,
+machine check and page fault run on stacks of their own (IST), so a fault on
+a broken stack is reported instead of becoming a triple fault and a reset.
+The kernel records every register, the driver that was running and a stack
+trace, then writes a `.DMP` crash dump:
+
+* over **COM1**, as base64;
+* into **`CRASH.DMP` on a USB stick**. The x86-64 ISO carries a small
+  `NANOCRASH` partition with that file, so a stick written from the ISO with
+  `dd` holds the dump of its own crash. Any other FAT16/FAT32 stick with a
+  `CRASH.DMP` in its root works too. The file is found at boot, and the crash
+  only writes the blocks it already occupies;
+* on the **stop screen**, which waits rather than restarting.
+
+```sh
+tools/nanodump.py show /run/media/$USER/NANOCRASH/CRASH.DMP \
+    --elf dist/baremetal/x86_64/nanochrono-kernel.sym.elf
+```
+
+`crashtest=<de|pf|gp|ud|so|df|panic>` on the kernel command line raises a
+fault on purpose, to check a machine end to end. `build.sh gdb` boots the
+`-O0` build as a USB stick under QEMU, stopped for
+`gdb -x packaging/baremetal/gdb/x86_64.gdb`. See
+[docs/CRASH_DUMPS.md](docs/CRASH_DUMPS.md).
 
 ### Linux on other architectures
 
@@ -1062,7 +1104,8 @@ crates/
 include/nanochrono.h        C header
 packaging/linux/            .desktop entry and installer
 packaging/macos/            osxcross cross-build, lipo, .app bundle
-packaging/baremetal/        freestanding kernel build and QEMU boot
+packaging/baremetal/        freestanding kernel build, QEMU boot, gdb/ scripts
+tools/nanodump.py           reads the bare-metal kernel's crash dumps
 packaging/android/          NDK cross-build for the four ABIs
 kernel/linux/               optional ring 0 module, nanochrono.ko (Rust, Dual MIT/GPL)
 kernel/windows/             the same for Windows, nanochrono.sys (Rust, MIT), osslsigncode signing

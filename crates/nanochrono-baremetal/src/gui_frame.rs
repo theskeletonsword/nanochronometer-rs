@@ -81,6 +81,9 @@ const SCAN_SPACE: u8 = 0x39;
 const SCAN_TAB: u8 = 0x0F;
 const SCAN_UP: u8 = 0x48;
 const SCAN_DOWN: u8 = 0x50;
+const SCAN_LEFT: u8 = 0x4B;
+const SCAN_RIGHT: u8 = 0x4D;
+const SCAN_ENTER: u8 = 0x1C;
 
 /// How long a frame is meant to take.
 ///
@@ -301,7 +304,8 @@ impl Layout {
         let readout_y = content_y + (cards_y.saturating_sub(content_y + readout_box)) / 2;
 
         // Wide enough for the longest readout the face can produce.
-        let readout_w = (readout.width_of(READOUT_SAMPLE) + margin * 2).min(width);
+        let readout_w =
+            (readout.width_of(READOUT_SAMPLE) + margin * 2).min(width.saturating_sub(margin * 2 + 4));
         let readout_x = (width - readout_w) / 2;
 
         Layout {
@@ -673,10 +677,16 @@ impl Control {
     fn colour(&self, p: &Palette) -> Colour {
         let t = self.highlight.value().clamp(0, 1000) as u32;
         if t <= 420 {
-            draw::mix_colour(p.panel, p.hover, t * 1000 / 420)
+            draw::mix_colour(p.nav, p.hover, t * 1000 / 420)
         } else {
             draw::mix_colour(p.hover, p.accent, (t - 420) * 1000 / 580)
         }
+    }
+
+    /// The border: the hairline until the control is mostly lit, then the
+    /// accent, as the desktop GUI's active tab has it.
+    fn border_colour(&self, p: &Palette) -> Colour {
+        if self.highlight.value() > 700 { p.accent } else { p.divider }
     }
 
     fn label_colour(&self, p: &Palette) -> Colour {
@@ -704,9 +714,6 @@ struct Ui {
     restart: Control,
     shutdown: Control,
 
-    /// Where the selected tab's underline is, sliding between tabs.
-    underline_x: Tween,
-    underline_w: Tween,
 
     /// The two status meters, easing towards their readings.
     memory_meter: Tween,
@@ -766,9 +773,18 @@ struct Ui {
     /// Cycles and instructions over the stopwatch's runs.
     stopwatch_pmu: PmuTally,
     /// The benchmark tab's last results, and a run asked for.
-    bench: crate::bench::Results,
-    bench_requested: bool,
+    /// The benchmark panel, as the desktop GUI has it: a mode, its rows, the
+    /// selected row, and the log of the last run.
+    bench_mode: crate::bench::Mode,
+    bench_items: crate::bench::Items,
+    bench_selected: usize,
+    bench_report: Option<crate::bench::Report>,
+    /// A row asked to run; the loop runs it between frames.
+    bench_requested: Option<crate::bench::Item>,
     bench_dirty: bool,
+    /// Where the mode and feature rows were drawn, for clicks.
+    bench_mode_boxes: [Hitbox; 3],
+    bench_row_boxes: [Hitbox; 32],
     /// What the key legend showed last, per [`hint_signature`], so it is
     /// repainted when the prompt or its countdown changes and not otherwise.
     hint_state: u64,
@@ -1013,8 +1029,6 @@ impl Ui {
             precision_chip: Control::new(),
             restart: Control::new(),
             shutdown: Control::new(),
-            underline_x: Tween::with_rate(0, 180),
-            underline_w: Tween::with_rate(0, 180),
             memory_meter: Tween::with_rate(0, 90),
             load_meter: Tween::with_rate(0, 90),
             readout_fade: Tween::with_rate(1000, 130),
@@ -1038,9 +1052,14 @@ impl Ui {
             space: SpaceMode::new(),
             checks: None,
             stopwatch_pmu: PmuTally::default(),
-            bench: crate::bench::Results::new(),
-            bench_requested: false,
+            bench_mode: crate::bench::Mode::Isa,
+            bench_items: crate::bench::Mode::Isa.items(),
+            bench_selected: 0,
+            bench_report: None,
+            bench_requested: None,
             bench_dirty: true,
+            bench_mode_boxes: [Hitbox::default(); 3],
+            bench_row_boxes: [Hitbox::default(); 32],
             hint_state: 0,
         }
     }
@@ -1081,6 +1100,42 @@ impl Ui {
     /// motion.
     fn refresh_cards(&mut self) {
         self.cards_dirty = true;
+    }
+
+    /// Selects a benchmark mode and lists its rows, as the desktop panel's
+    /// mode buttons do.
+    fn set_bench_mode(&mut self, mode: crate::bench::Mode) {
+        self.bench_mode = mode;
+        self.bench_items = mode.items();
+        self.bench_selected = 0;
+        self.bench_dirty = true;
+    }
+
+    fn cycle_bench_mode(&mut self, forward: bool) {
+        let all = crate::bench::Mode::ALL;
+        let i = all.iter().position(|&m| m == self.bench_mode).unwrap_or(0);
+        let next = if forward { (i + 1) % all.len() } else { (i + all.len() - 1) % all.len() };
+        self.set_bench_mode(all[next]);
+    }
+
+    fn move_bench_selection(&mut self, down: bool) {
+        let n = self.bench_items.len();
+        if n == 0 {
+            return;
+        }
+        self.bench_selected = if down { (self.bench_selected + 1) % n } else { (self.bench_selected + n - 1) % n };
+        self.bench_dirty = true;
+    }
+
+    /// Queues the selected row. An unavailable row stays inert, as it does
+    /// on the desktop: it is listed to show the landscape, not to be run.
+    fn run_selected_bench(&mut self) {
+        if let Some(item) = self.bench_items.get(self.bench_selected) {
+            if item.is_available() {
+                self.bench_requested = Some(item);
+            }
+        }
+        self.bench_dirty = true;
     }
 
     fn select_tab(&mut self, tab: Tab) {
@@ -1188,6 +1243,19 @@ pub unsafe fn run(fb: &Framebuffer, memory: Memory) -> ! {
     // iterations — see `i2c`.
     let mut input = unsafe { Input::init(clock.calibration.hz / 1_000_000) };
 
+    // Now that `input` is in the interface loop's own frame — where it stays
+    // for the rest of the run — hand the crash dumper the USB stick it found,
+    // if any. The dumper keeps a pointer into `input`, so this cannot be done
+    // from `init`, whose `Input` is still moving.
+    #[cfg(target_arch = "x86_64")]
+    {
+        input.install_crash_sink();
+        // A crashtest armed on the command line fires here, with the USB
+        // stick already handed over, so the forced dump reaches it too.
+        // SAFETY: CPL 0, the IDT is installed; faulting is the point.
+        unsafe { crate::crashdump::fire_pending_crashtest() };
+    }
+
     // If a stack came up short, open on the panel that says which. The
     // diagnosis was previously behind a keypress, which is no use at all on
     // the one machine that most needs it: the keyboard is what did not work.
@@ -1260,15 +1328,16 @@ pub unsafe fn run(fb: &Framebuffer, memory: Memory) -> ! {
             // SAFETY: ring 0; the PMU was enabled at probe.
             unsafe { ui.stopwatch_pmu.fold(&machine.pmu) };
         }
-        if core::mem::take(&mut ui.bench_requested) {
-            // Said before the few seconds of silence the run takes.
-            let top = layout.tabs_y + layout.tabs_h + 8;
-            fb.fill(0, top, layout.width, layout.cards_y.saturating_sub(top + 8), p.background);
-            draw::text_centred(fb, &HEADING, layout.readout_x, layout.readout_w,
-                (top + layout.cards_y) / 2, "running the benchmarks...", p.muted);
+        if let Some(item) = ui.bench_requested.take() {
+            // Said on the footer before the silence the run takes, as the
+            // desktop panel says "running benchmark...".
+            bench_footer(fb, &p, &layout, true);
             fb.present_damage();
+            // Named for a crash dump, until the run ends.
+            #[cfg(x86_any)]
+            let _crumb = crate::crashdump::Driver::Bench.enter();
             // SAFETY: ring 0 / EL1 / supervisor, which the kernels and PMU need.
-            unsafe { crate::bench::run_all(clock.calibration.hz, &machine.pmu, &mut ui.bench) };
+            ui.bench_report = Some(unsafe { crate::bench::run_one(item, clock.calibration.hz, &machine.pmu) });
             ui.bench_dirty = true;
             ui.refresh_cards();
         }
@@ -1419,7 +1488,7 @@ unsafe fn handle(
                     Tab::Timer => ui.timer.toggle(now),
                     Tab::Clock => Integrity::Clean,
                     Tab::Bench => {
-                        ui.bench_requested = true;
+                        ui.run_selected_bench();
                         Integrity::Clean
                     }
                 };
@@ -1428,6 +1497,11 @@ unsafe fn handle(
                 ui.note_integrity(verdict, now_ns);
                 ui.refresh_cards();
             }
+            SCAN_ENTER if ui.tab == Tab::Bench => ui.run_selected_bench(),
+            SCAN_UP if ui.tab == Tab::Bench => ui.move_bench_selection(false),
+            SCAN_DOWN if ui.tab == Tab::Bench => ui.move_bench_selection(true),
+            SCAN_LEFT if ui.tab == Tab::Bench => ui.cycle_bench_mode(false),
+            SCAN_RIGHT if ui.tab == Tab::Bench => ui.cycle_bench_mode(true),
             SCAN_L if ui.tab == Tab::Stopwatch => {
                 let verdict = ui.stopwatch.lap(now);
                 ui.note_integrity(verdict, now_ns);
@@ -1446,7 +1520,7 @@ unsafe fn handle(
                     ui.refresh_cards();
                 }
                 Tab::Bench => {
-                    ui.bench = crate::bench::Results::new();
+                    ui.bench_report = None;
                     ui.bench_dirty = true;
                     ui.refresh_cards();
                 }
@@ -1551,6 +1625,22 @@ fn pointer(m: Motion, ui: &mut Ui, fb: &Framebuffer, layout: &Layout, clock: &Cl
     if ui.precision_chip.box_.contains(x, y) {
         ui.toggle_precision();
     }
+    if ui.tab == Tab::Bench {
+        // The desktop panel: a mode row selects the mode, a feature row
+        // selects itself and runs.
+        for (i, mode) in crate::bench::Mode::ALL.iter().enumerate() {
+            if ui.bench_mode_boxes[i].contains(x, y) {
+                ui.set_bench_mode(*mode);
+            }
+        }
+        for i in 0..ui.bench_items.len().min(ui.bench_row_boxes.len()) {
+            if ui.bench_row_boxes[i].contains(x, y) {
+                ui.bench_selected = i;
+                ui.run_selected_bench();
+            }
+        }
+        return;
+    }
     // Clicking the readout starts and stops it, the way a stopwatch face
     // does. The largest target on screen for the action it is most likely to
     // be asked for.
@@ -1566,10 +1656,7 @@ fn pointer(m: Motion, ui: &mut Ui, fb: &Framebuffer, layout: &Layout, clock: &Cl
             Tab::Stopwatch => ui.stopwatch.toggle(now),
             Tab::Timer => ui.timer.toggle(now),
             Tab::Clock => Integrity::Clean,
-            Tab::Bench => {
-                ui.bench_requested = true;
-                Integrity::Clean
-            }
+            Tab::Bench => Integrity::Clean,
         };
         // SAFETY: ring 0; the PMU was enabled at probe.
         unsafe { sync_stopwatch_pmu(ui, machine) };
@@ -1679,60 +1766,108 @@ fn bench_view(fb: &Framebuffer, p: &Palette, layout: &Layout, ui: &mut Ui) {
     ui.bench_dirty = false;
     ui.last_readout.clear();
     ui.last_readout.str("bench");
+    use crate::bench::Mode;
+
+    // The desktop benchmark panel: modes and rows on the left (two fifths),
+    // the log on the right in the sunken box, the footer underneath.
+    let line = BODY.line_height as u32;
     let top = layout.tabs_y + layout.tabs_h + 8;
-    let bottom = layout.cards_y.saturating_sub(8);
-    fb.fill(0, top, layout.width, bottom.saturating_sub(top), p.background);
-    let line = BODY.line_height as u32 + 3;
-    if ui.bench.len == 0 {
-        draw::text_centred(
-            fb,
-            &HEADING,
-            layout.readout_x,
-            layout.readout_w,
-            (top + bottom) / 2,
-            "SPACE runs the benchmarks - ISA kernels, crypto raw speed, RustCrypto",
-            p.muted,
-        );
-        return;
+    let footer_h = line + 12;
+    let bottom = layout.cards_y.saturating_sub(8 + footer_h);
+    let area_w = layout.width - 2 * layout.margin;
+    let left_w = (area_w - 12) * 2 / 5;
+    let (lx, rx) = (layout.margin, layout.margin + left_w + 12);
+    let right_w = area_w - left_w - 12;
+    fb.fill(0, top, layout.width, layout.cards_y.saturating_sub(top + 8), p.background);
+    draw::boxed(fb, lx, top, left_w, bottom - top, p.panel, p.divider);
+    draw::boxed(fb, rx, top, right_w, bottom - top, p.inset, p.divider);
+
+    // A row: selected rows get the selection fill and an accent border;
+    // the name on the left and its state on the right, green where it can
+    // run and dim where it cannot.
+    let row_at = |y: u32, h: u32, name: &str, state: &str, selected: bool, available: bool| {
+        let (x, w) = (lx + 12, left_w - 24);
+        if selected {
+            draw::boxed(fb, x, y, w, h, p.active, p.accent);
+        }
+        let ink = if available { p.ok } else { p.off };
+        let ty = y + h.saturating_sub(line) / 2;
+        draw::text(fb, &BODY, x + 10, ty, name, ink);
+        draw::text_right(fb, &BODY, x + w - 10, ty, state, ink);
+    };
+
+    let mut y = top + 12;
+    draw::text(fb, &BODY, lx + 12, y, "BENCHMARK MODE", p.label);
+    y += line + 6;
+    for (i, mode) in Mode::ALL.iter().enumerate() {
+        let h = line + 10;
+        let selected = *mode == ui.bench_mode;
+        let available = mode.is_available();
+        let state = if selected { "SELECTED" } else if available { "AVAILABLE" } else { "NOT AVAILABLE" };
+        row_at(y, h, mode.label(), state, selected, available);
+        ui.bench_mode_boxes[i] = Hitbox { x: lx + 12, y, w: left_w - 24, h };
+        y += h + 4;
     }
-    use crate::bench::Group;
-    let groups = [(Group::Isa, "ISA KERNELS"), (Group::Instruction, "CRYPTO RAW SPEED"), (Group::Crypto, "RUSTCRYPTO (16 KiB)")];
-    let col_w = (layout.width - 2 * layout.margin) / 3;
-    for (c, (group, title)) in groups.iter().enumerate() {
-        let x = layout.margin + c as u32 * col_w;
-        let mut y = top;
-        draw::text(fb, &BODY, x, y, title, p.accent);
-        y += line + 2;
-        for r in ui.bench.iter().filter(|r| r.group == *group) {
-            if y + line > bottom {
-                break;
+
+    y += 14;
+    draw::text(fb, &BODY, lx + 12, y, "FEATURE / OPERATION", p.label);
+    y += line + 6;
+    ui.bench_row_boxes = [Hitbox::default(); 32];
+    let row_h = line + 6;
+    // Scrolled so the selected row is always on screen.
+    let fits = ((bottom.saturating_sub(y + 8)) / (row_h + 2)).max(1) as usize;
+    let first = ui.bench_selected.saturating_sub(fits - 1);
+    for (i, item) in ui.bench_items.iter().enumerate().skip(first).take(fits) {
+        let available = item.is_available();
+        let state = if available { "AVAILABLE" } else { "NOT AVAILABLE" };
+        row_at(y, row_h, item.name().as_str(), state, i == ui.bench_selected, available);
+        if i < ui.bench_row_boxes.len() {
+            ui.bench_row_boxes[i] = Hitbox { x: lx + 12, y, w: left_w - 24, h: row_h };
+        }
+        y += row_h + 2;
+    }
+
+    // The log, wrapped to the box.
+    const INTRO: &str = "Select a mode, then pick a feature row.\n\n\
+        Mode 1 runs inline-asm ISA kernels gated by the CPU's feature report.\n\
+        Mode 2 runs real hash, MAC and AEAD calls through RustCrypto.\n\
+        Mode 3 times the bare crypto instructions (AES round, SHA-256 round, \
+        carry-less multiply, VAES, VPCLMULQDQ): speed only, no cipher, no security.\n\n\
+        LEFT/RIGHT pick a mode, UP/DOWN a row, SPACE or ENTER runs it.";
+    let text = match &ui.bench_report {
+        Some(r) => r.log.as_str(),
+        None => INTRO,
+    };
+    let columns = ((right_w - 24) / BODY.width_of("0").max(1)) as usize;
+    let mut ly = top + 12;
+    'lines: for para in text.split('\n') {
+        if para.is_empty() {
+            ly += line + 2;
+            continue;
+        }
+        for piece in draw::wrap(para, columns.max(8)) {
+            if ly + line > bottom - 8 {
+                break 'lines;
             }
-            draw::text(fb, &BODY, x, y, r.name, p.text);
-            if !r.path.is_empty() {
-                let nx = x + BODY.width_of(r.name) + BODY.width_of(" ");
-                draw::text(fb, &BODY, nx, y, r.path, if r.path == "soft" { p.danger } else { p.accent });
-            }
-            // Values are held x1000; shown to one decimal (rates) and two
-            // (cycles), so the thousandths are dropped before formatting.
-            let mut v = Text::<48>::new();
-            v.fixed(r.rate_milli / 100, 1).str(" ").str(group.unit());
-            match (r.cycles_per_op_milli, *group) {
-                (Some(c), _) => {
-                    v.str("  ").fixed(c / 10, 2).str(" cyc");
-                }
-                // A crypto operation is one 16 KiB buffer: microseconds.
-                (None, Group::Crypto) => {
-                    v.str("  ").fixed(r.ns_per_op_milli / 100_000, 1).str(" us");
-                }
-                (None, _) => {
-                    v.str("  ").fixed(r.ns_per_op_milli, 3).str(" ns");
-                }
-            }
-            let vw = BODY.width_of(v.as_str());
-            draw::text(fb, &BODY, (x + col_w).saturating_sub(vw + 16), y, v.as_str(), p.muted);
-            y += line;
+            draw::text(fb, &BODY, rx + 12, ly, piece, p.text);
+            ly += line + 2;
         }
     }
+
+    bench_footer(fb, p, layout, false);
+}
+
+/// The line under the benchmark panels: what to do, or that a run is on.
+fn bench_footer(fb: &Framebuffer, p: &Palette, layout: &Layout, running: bool) {
+    let line = BODY.line_height as u32;
+    let y = layout.cards_y.saturating_sub(8 + line + 4);
+    fb.fill(0, y, layout.width, line + 4, p.background);
+    let (msg, ink) = if running {
+        ("running benchmark...", p.accent)
+    } else {
+        ("click a row to run it - SPACE/ENTER runs the selected row - Z clears the log", p.muted)
+    };
+    draw::text(fb, &BODY, layout.margin, y + 2, msg, ink);
 }
 
 /// Whether the vector state the benchmarks use was switched on by the boot
@@ -1955,16 +2090,15 @@ fn header_clock_box(layout: &Layout) -> Hitbox {
 
 /// The wordmark size that fits the header with some air above and below.
 fn header_wordmark(layout: &Layout) -> &'static crate::logo::Image {
-    crate::logo::wordmark(layout.header_h.saturating_sub(16))
+    crate::logo::for_height(layout.header_h.saturating_sub(12))
 }
 
 /// The title bar: identity on the left, restart and shut down on the right.
 fn header(fb: &Framebuffer, p: &Palette, layout: &Layout, ui: &mut Ui, machine: &Machine) {
     let h = layout.header_h;
-    // A gradient rather than a flat fill. It costs one extra loop and is most
-    // of what separates a header from a coloured rectangle.
-    draw::gradient(fb, 0, 0, layout.width, h, p.header_from, p.header_to);
-    fb.fill(0, h - 1, layout.width, 1, p.divider);
+    // The desktop GUI's navigation strip: one flat surface under both the
+    // title line and the tabs, bordered where it meets the content.
+    fb.fill(0, 0, layout.width, h, p.nav);
 
     // The logo itself — stopwatch, green "Nano", white "Chronometer" —
     // rasterised at build time (see `logo`), vertically centred.
@@ -1985,7 +2119,7 @@ fn header(fb: &Framebuffer, p: &Palette, layout: &Layout, ui: &mut Ui, machine: 
 
     let simd = nanochrono_core::Backend::best().name();
     if pen + BODY.width_of(simd) < layout.width / 2 {
-        draw::text(fb, &BODY, pen, small_y, simd, p.muted);
+        draw::text(fb, &BODY, pen, small_y, simd, p.text);
         pen += BODY.width_of(simd) + 14;
         draw::text(fb, &BODY, pen, small_y, "|", p.divider);
         pen += BODY.width_of("|") + 14;
@@ -2031,17 +2165,10 @@ fn header_buttons(fb: &Framebuffer, p: &Palette, ui: &Ui) {
             continue;
         }
         let lit = control.highlight.value().clamp(0, 1000) as u32;
-        let base = draw::mix_colour(p.button, if danger { p.danger } else { p.accent }, lit / 3);
-        draw::rounded(fb, b.x, b.y, b.w, b.h, 10, base);
-        draw::rounded_outline(
-            fb,
-            b.x,
-            b.y,
-            b.w,
-            b.h,
-            10,
-            if danger { p.danger } else { p.button_edge },
-        );
+        // The desktop GUI's action button: the strip's colour, a hairline
+        // border, the hover colour under the pointer.
+        let base = draw::mix_colour(p.button, p.hover, lit.min(420) * 1000 / 420);
+        draw::boxed(fb, b.x, b.y, b.w, b.h, base, if danger { p.danger } else { p.button_edge });
         let ink = if danger { p.danger } else { p.title };
         if danger {
             glyph_power(fb, b.x + b.w / 2, b.y + b.h / 2, ink);
@@ -2073,20 +2200,9 @@ fn header_clock(fb: &Framebuffer, p: &Palette, layout: &Layout, ui: &mut Ui, clo
     ui.last_header_clock.str(label.as_str());
 
     let b = header_clock_box(layout);
-    // The header is a gradient, so the box is repainted from the gradient
-    // rather than from a flat colour — filling it with either end would leave
-    // a visible rectangle.
-    for col in 0..b.w {
-        let t = ((b.x + col) * 255 / layout.width.max(1)) as u8;
-        fb.fill(
-            b.x + col,
-            b.y,
-            1,
-            b.h,
-            draw::blend(p.header_from, p.header_to, t),
-        );
-    }
-    draw::text(fb, &BODY, b.x, b.y, label.as_str(), p.text);
+    fb.fill(b.x, b.y, b.w, b.h, p.nav);
+    // The time in the timer green, as the desktop title line has it.
+    draw::text(fb, &BODY, b.x, b.y, label.as_str(), p.accent);
 
     // The buttons share the repaint: their highlight is stepped here, and a
     // control that only lit up when something else happened to redraw would
@@ -2117,11 +2233,13 @@ fn tab_bar(fb: &Framebuffer, p: &Palette, layout: &Layout, ui: &mut Ui) -> bool 
     let chip_h = (h * 3 / 5).clamp(22, 34);
     let chip_y = y + (h - chip_h) / 2;
 
+    let _ = pad;
     let mut x = layout.margin;
     for (i, tab) in Tab::ALL.iter().enumerate() {
-        let w = BODY.width_of(tab.name()) + pad * 2;
-        ui.tabs[i].box_ = Hitbox { x, y, w, h };
-        x += w;
+        // Desktop tabs: 12 px of padding either side, 6 px apart.
+        let w = BODY.width_of(tab.name()) + 24;
+        ui.tabs[i].box_ = Hitbox { x, y: chip_y, w, h: chip_h };
+        x += w + 6;
     }
 
     // The chips are laid out from the right so the row stays anchored to the
@@ -2141,12 +2259,12 @@ fn tab_bar(fb: &Framebuffer, p: &Palette, layout: &Layout, ui: &mut Ui) -> bool 
         let mut fits = true;
         for (i, panel) in Panel::ALL.iter().enumerate().rev() {
             let label = if short { panel.short() } else { panel.name() };
-            let w = BODY.width_of(label) + 22;
+            let w = BODY.width_of(label) + 24;
             if cursor.saturating_sub(w) <= x + 24 {
                 fits = false;
                 break;
             }
-            cursor -= w + 8;
+            cursor -= w + 6;
             boxes[i] = Hitbox {
                 x: cursor,
                 y: chip_y,
@@ -2164,7 +2282,7 @@ fn tab_bar(fb: &Framebuffer, p: &Palette, layout: &Layout, ui: &mut Ui) -> bool 
         ui.chips[i].box_ = *b;
     }
 
-    let precision_w = BODY.width_of("SIMPLE") + 22;
+    let precision_w = BODY.width_of("SIMPLE") + 24;
     ui.precision_chip.box_ = if right.saturating_sub(precision_w + 12) > x + 24 {
         Hitbox {
             x: right - precision_w - 12,
@@ -2188,55 +2306,20 @@ fn tab_bar(fb: &Framebuffer, p: &Palette, layout: &Layout, ui: &mut Ui) -> bool 
         .precision_chip
         .step(ui.precision_chip.box_.contains(px, py), false);
 
-    // The underline chases the selected tab rather than jumping to it, which
-    // is the single most recognisable piece of motion in a modern interface.
-    let selected = ui.tabs[Tab::ALL.iter().position(|&t| t == ui.tab).unwrap_or(0)].box_;
-    ui.underline_x.retarget(selected.x as i32);
-    ui.underline_w.retarget(selected.w as i32);
-    moved |= ui.underline_x.step() | ui.underline_w.step();
 
     if !moved {
         return false;
     }
 
-    // --- draw
-    fb.fill(0, y, layout.width, h, p.background);
+    // --- draw: the lower half of the navigation strip, bordered underneath
+    fb.fill(0, y, layout.width, h, p.nav);
     fb.fill(0, y + h - 1, layout.width, 1, p.divider);
 
     for (i, tab) in Tab::ALL.iter().enumerate() {
         let b = ui.tabs[i].box_;
-        let lit = ui.tabs[i].highlight.value().clamp(0, 1000) as u32;
-        // A tab is not a pill: it fills its cell and is marked by the
-        // underline, which is what makes the sliding indicator legible.
-        if lit > 0 {
-            fb.fill(
-                b.x,
-                b.y,
-                b.w,
-                b.h - 1,
-                draw::mix_colour(p.background, p.panel, lit),
-            );
-        }
-        let ink = draw::mix_colour(p.muted, p.title, lit);
-        draw::text_centred(
-            fb,
-            &BODY,
-            b.x,
-            b.w,
-            b.y + (b.h - BODY.line_height as u32) / 2,
-            tab.name(),
-            ink,
-        );
+        let c = &ui.tabs[i];
+        draw::tab_button(fb, &BODY, b.x, b.y, b.w, b.h, tab.name(), c.colour(p), c.border_colour(p), c.label_colour(p));
     }
-
-    draw::underline(
-        fb,
-        ui.underline_x.value().max(0) as u32,
-        y + h - 3,
-        ui.underline_w.value().max(0) as u32,
-        p.accent,
-        p.glow,
-    );
 
     for (i, panel) in Panel::ALL.iter().enumerate() {
         let b = ui.chips[i].box_;
@@ -2244,32 +2327,14 @@ fn tab_bar(fb: &Framebuffer, p: &Palette, layout: &Layout, ui: &mut Ui) -> bool 
             continue;
         }
         let label = if short { panel.short() } else { panel.name() };
-        draw::chip(
-            fb,
-            &BODY,
-            b.x,
-            b.y,
-            b.w,
-            b.h,
-            label,
-            ui.chips[i].colour(p),
-            ui.chips[i].label_colour(p),
-        );
+        let c = &ui.chips[i];
+        draw::tab_button(fb, &BODY, b.x, b.y, b.w, b.h, label, c.colour(p), c.border_colour(p), c.label_colour(p));
     }
 
     let b = ui.precision_chip.box_;
     if b.w > 0 {
-        draw::chip(
-            fb,
-            &BODY,
-            b.x,
-            b.y,
-            b.w,
-            b.h,
-            precision_label,
-            draw::mix_colour(p.panel, p.hover, 600),
-            p.accent,
-        );
+        // The selected precision, drawn as the desktop's active toggle.
+        draw::tab_button(fb, &BODY, b.x, b.y, b.w, b.h, precision_label, p.accent, p.accent, p.background);
     }
     true
 }
@@ -2319,6 +2384,13 @@ fn readout(fb: &Framebuffer, p: &Palette, layout: &Layout, ui: &mut Ui, clock: &
     let x = layout.readout_x + layout.readout_w.saturating_sub(text_w) / 2;
     let y = layout.readout_y + layout.readout_h.saturating_sub(face.line_height as u32) / 2;
 
+    // The face sits in the desktop GUI's sunken box (`style::inset`), full
+    // width. Its frame is repainted only while the readout fades in — a tab
+    // switch, or coming back from the benchmark view, which draws over it.
+    if fading {
+        let (fx, fy, fw, fh) = inset_frame(layout);
+        draw::boxed(fb, fx, fy, fw, fh, p.inset, p.divider);
+    }
     // The whole box is cleared rather than the text's own width: switching
     // precision or crossing from one to two hours changes the width, and a
     // clear that only covers the new string leaves the old one's tail behind.
@@ -2327,21 +2399,28 @@ fn readout(fb: &Framebuffer, p: &Palette, layout: &Layout, ui: &mut Ui, clock: &
         layout.readout_y,
         layout.readout_w,
         layout.readout_h,
-        p.background,
+        p.inset,
     );
 
+    // The desktop's state colours: green running or at zero, amber stopped
+    // with time on it, red when a countdown has run out.
+    let has_time = match ui.tab {
+        Tab::Stopwatch => ui.stopwatch.accumulated.get() != 0,
+        _ => true,
+    };
     let ink = if ui.tab == Tab::Timer && ui.timer.expired {
         p.danger
-    } else if running {
+    } else if running || !has_time {
         p.accent
     } else {
-        // A stopped stopwatch is still a reading, so it stays legible — just
-        // not lit.
-        p.text
+        p.paused
     };
-    let halo = if running { p.glow } else { p.shadow };
 
-    draw::text_glow(fb, face, x, y, label.as_str(), ink, halo, 2);
+    // The desktop GUI draws the digits twice — a dark green copy offset
+    // down and right, then the face over it — for a CRT-style bloom.
+    let bloom = (face.line_height as u32 / 24).max(2);
+    draw::text(fb, face, x + bloom, y + bloom, label.as_str(), p.glow);
+    draw::text(fb, face, x, y, label.as_str(), ink);
 
     // One line of context, so the number is not left to speak for itself.
     let mut note = Text::<64>::new();
@@ -2392,9 +2471,24 @@ fn readout(fb: &Framebuffer, p: &Palette, layout: &Layout, ui: &mut Ui, clock: &
         layout.readout_y,
         layout.readout_w,
         layout.readout_h,
-        p.background,
+        p.inset,
         alpha,
     );
+}
+
+/// The sunken box around the readout: the content width, and all the
+/// height between the tabs and the cards, with the readout centred in it —
+/// the region the benchmark view's panels occupy too. The readout's own box
+/// is inside it, so clearing that never touches the border.
+fn inset_frame(layout: &Layout) -> (u32, u32, u32, u32) {
+    let top = layout.tabs_y + layout.tabs_h + 8;
+    let bottom = layout.cards_y.saturating_sub(8);
+    (
+        layout.margin,
+        top,
+        layout.width.saturating_sub(layout.margin * 2),
+        bottom.saturating_sub(top),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -2792,19 +2886,17 @@ fn panel_rows(
                 "ps/2 pointer",
                 found.ps2_pointer.map_or("none", |kind| kind.name()),
             );
-            *y = row(
-                fb,
-                p,
-                x,
-                w,
-                *y,
-                "xhci",
-                if found.usb_controller {
-                    "up"
-                } else {
-                    "not found"
-                },
-            );
+            // The crash dump's USB target rides on this row rather than a
+            // new one: the card is sized for nine rows, and this is the
+            // controller the stick hangs off.
+            let mut xhci = Text::<48>::new();
+            match (found.usb_controller, found.usb_storage, found.crash_file_kib) {
+                (false, _, _) => xhci.str("not found"),
+                (true, _, Some(kib)) => xhci.str("up, CRASH.DMP on stick (").num(kib).str(" KiB)"),
+                (true, true, None) => xhci.str("up, stick without CRASH.DMP"),
+                (true, false, None) => xhci.str("up"),
+            };
+            *y = row(fb, p, x, w, *y, "xhci", xhci.as_str());
             *y = row(fb, p, x, w, *y, "usb keyboard", yes_no(found.usb_keyboard));
             *y = row(fb, p, x, w, *y, "usb pointer", yes_no(found.usb_pointer));
             *y = row(fb, p, x, w, *y, "ehci / ohci", "seen, not driven");
@@ -2814,7 +2906,10 @@ fn panel_rows(
             // the wrong ones arriving are different faults with the same
             // symptom.
             let mut raw = Text::<48>::new();
-            if input.recent_bytes().is_empty() {
+            if !found.ps2_controller {
+                // The ports float: nothing to read, and nothing is read.
+                raw.str("no 8042 - usb/i2c only");
+            } else if input.recent_bytes().is_empty() {
                 raw.str("none yet - press a key");
             } else {
                 for byte in input.recent_bytes() {
@@ -2923,10 +3018,10 @@ fn session_rows(
 ) {
     match ui.tab {
         Tab::Bench => {
-            let mut n = Text::<16>::new();
-            n.num(ui.bench.len as u64);
-            *y = row(fb, p, x, w, *y, "results", if ui.bench.len == 0 { "none - SPACE runs" } else { n.as_str() });
-            *y = row(fb, p, x, w, *y, "passes", "3 per row, best kept");
+            *y = row(fb, p, x, w, *y, "mode", ui.bench_mode.label());
+            let last = ui.bench_report.as_ref().map(|r| r.item.name());
+            *y = row(fb, p, x, w, *y, "last run", last.as_ref().map_or("none - SPACE runs", |n| n.as_str()));
+            *y = row(fb, p, x, w, *y, "passes", "3, increasing length");
             *y = row(fb, p, x, w, *y, "crypto", if cfg!(feature = "crypto") { "rustcrypto, 16 KiB" } else { "not in this build" });
             simd_state_rows(fb, p, x, w, y);
             let _ = (clock, machine);
@@ -3097,21 +3192,11 @@ fn machine_rows(
 
 /// Draws a card and returns the y its rows start at.
 fn card(fb: &Framebuffer, p: &Palette, x: u32, y: u32, w: u32, h: u32, title: &str) -> u32 {
-    // A one-pixel offset fill under the card, which reads as a shadow at this
-    // contrast and costs one more rectangle.
-    draw::rounded(fb, x + 2, y + 3, w, h, 14, p.shadow);
-    draw::rounded(fb, x, y, w, h, 14, p.panel);
-    draw::rounded_outline(fb, x, y, w, h, 14, p.divider);
-
-    draw::text(fb, &HEADING, x + 20, y + 14, title, p.accent);
-    fb.fill(
-        x + 20,
-        y + 18 + HEADING.line_height as u32,
-        w - 40,
-        1,
-        p.divider,
-    );
-    y + 28 + HEADING.line_height as u32
+    // The desktop GUI's panel (`style::panel`): a flat fill, a hairline
+    // border, two-pixel corners, and the title in the label green.
+    draw::boxed(fb, x, y, w, h, p.panel, p.divider);
+    draw::text(fb, &HEADING, x + 20, y + 14, title, p.label);
+    y + 24 + HEADING.line_height as u32
 }
 
 /// One label/value row, with the value right-aligned inside the card.
@@ -3123,7 +3208,7 @@ fn card(fb: &Framebuffer, p: &Palette, x: u32, y: u32, w: u32, h: u32, title: &s
 fn row(fb: &Framebuffer, p: &Palette, x: u32, w: u32, y: u32, label: &str, value: &str) -> u32 {
     let pad = 20;
     let right = x + w - pad;
-    draw::text_right(fb, &BODY, right, y, value, p.text);
+    draw::text_right(fb, &BODY, right, y, value, p.value);
 
     let room = right.saturating_sub(BODY.width_of(value) + BODY.width_of("  ") + x + pad);
     draw::text(
@@ -3198,6 +3283,8 @@ fn hint_bar(fb: &Framebuffer, p: &Palette, layout: &Layout, ui: &mut Ui, now_ns:
     let y = layout.hint_y;
     let h = layout.status_y.saturating_sub(y);
     fb.fill(0, y, layout.width, h, p.background);
+    // The desktop's horizontal rule above the hint line.
+    fb.fill(0, y, layout.width, 1, p.divider);
 
     let ty = y + h.saturating_sub(BODY.line_height as u32) / 2;
 
@@ -3280,7 +3367,7 @@ fn hint_bar(fb: &Framebuffer, p: &Palette, layout: &Layout, ui: &mut Ui, now_ns:
         // scans as keys rather than as a sentence.
         let mut bracket = Text::<12>::new();
         bracket.str("[").str(key).str("]");
-        draw::text(fb, &BODY, pen, ty, bracket.as_str(), p.accent);
+        draw::text(fb, &BODY, pen, ty, bracket.as_str(), p.muted);
         draw::text(
             fb,
             &BODY,
@@ -3295,8 +3382,7 @@ fn hint_bar(fb: &Framebuffer, p: &Palette, layout: &Layout, ui: &mut Ui, now_ns:
 
 /// The panel the status readings sit on, drawn once.
 fn status_frame(fb: &Framebuffer, p: &Palette, layout: &Layout) {
-    fb.fill(0, layout.status_y, layout.width, layout.status_h, p.panel);
-    fb.fill(0, layout.status_y, layout.width, 1, p.divider);
+    fb.fill(0, layout.status_y, layout.width, layout.status_h, p.status_bg);
 }
 
 /// The two rows of readings at the bottom.
@@ -3337,13 +3423,7 @@ fn status_bar(
     let row_h = BODY.line_height as u32;
     let y1 = layout.status_y + 7;
     let y2 = y1 + row_h + 6;
-    fb.fill(
-        0,
-        layout.status_y + 1,
-        layout.width,
-        layout.status_h - 1,
-        p.panel,
-    );
+    fb.fill(0, layout.status_y, layout.width, layout.status_h, p.status_bg);
 
     let meter_w = (layout.width / 8).clamp(70, 150);
     let meter_h = (row_h / 2).max(6);
@@ -3351,7 +3431,7 @@ fn status_bar(
 
     // --- row one: memory, load, counter rate
     let mut pen = layout.margin;
-    draw::text(fb, &BODY, pen, y1, "MEM", p.muted);
+    draw::text(fb, &BODY, pen, y1, "MEM", p.status);
     pen += BODY.width_of("MEM") + 10;
     draw::meter(
         fb,
@@ -3377,11 +3457,11 @@ fn status_bar(
     } else {
         memory.str("unreported");
     }
-    draw::text(fb, &BODY, pen, y1, memory.as_str(), p.text);
+    draw::text(fb, &BODY, pen, y1, memory.as_str(), p.status);
     pen += BODY.width_of(memory.as_str()) + 28;
 
     if pen + meter_w + 90 < layout.width {
-        draw::text(fb, &BODY, pen, y1, "CPU", p.muted);
+        draw::text(fb, &BODY, pen, y1, "CPU", p.status);
         pen += BODY.width_of("CPU") + 10;
         let permille = ui.load_meter.value().max(0) as u32;
         draw::meter(
@@ -3395,7 +3475,7 @@ fn status_bar(
             if permille > 800 { p.warn } else { p.accent },
         );
         pen += meter_w + 12;
-        draw::text(fb, &BODY, pen, y1, load.as_str(), p.text);
+        draw::text(fb, &BODY, pen, y1, load.as_str(), p.status);
     }
 
     // Right of row one: the counter's rate and where the rate came from,
@@ -3429,7 +3509,7 @@ fn status_bar(
         .str(ui.stopwatch.integrity.name())
         .str("   seu: ")
         .str(ui.space.name());
-    draw::text(fb, &BODY, layout.margin, y2, left.as_str(), p.muted);
+    draw::text(fb, &BODY, layout.margin, y2, left.as_str(), p.status);
 
     let mut right = Text::<64>::new();
     right.str(input.source());
@@ -3445,7 +3525,7 @@ fn status_bar(
             layout.width - layout.margin,
             y2,
             right.as_str(),
-            p.muted,
+            p.status,
         );
     }
 }

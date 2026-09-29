@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Reading what the loader left behind.
 //!
-//! Only the framebuffer tag is parsed. The rest of the multiboot2 information
-//! structure — memory maps, modules, the command line — describes resources
-//! this kernel does not manage, and parsing tags it will never act on would
-//! be code with no way to be wrong loudly.
+//! The framebuffer, the memory map, the ACPI root and the command line are
+//! parsed. The rest of the multiboot2 information structure — modules, the
+//! boot device — describes resources this kernel does not manage, and parsing
+//! tags it will never act on would be code with no way to be wrong loudly.
 
 use crate::framebuffer::Framebuffer;
 
@@ -236,6 +236,96 @@ pub unsafe fn memory_v1(info: u64) -> Memory {
         total: (lower + upper) * 1024,
         regions: 0,
     }
+}
+
+/// Tag type 1: the kernel command line, NUL-terminated.
+const TAG_COMMAND_LINE: u32 = 1;
+
+/// The longest command line read. Only `crashtest=` is looked for in it.
+const COMMAND_LINE_MAX: usize = 256;
+
+/// The command line a multiboot2 loader passed (`multiboot2 /boot/kernel
+/// <args>` in GRUB), or `None`.
+///
+/// # Safety
+/// `info` must be the multiboot2 information pointer the loader passed, or
+/// zero.
+pub unsafe fn command_line(info: u64) -> Option<&'static str> {
+    if info == 0 || info % 8 != 0 {
+        return None;
+    }
+    let base = info as usize;
+    // SAFETY: forwarded from this function's own contract.
+    let total = unsafe { core::ptr::read_volatile(base as *const u32) } as usize;
+    if !(16..0x10_0000).contains(&total) {
+        return None;
+    }
+    let mut offset = 8;
+    while offset + 8 <= total {
+        // SAFETY: bounded by the total size the header declares.
+        let (kind, size) = unsafe {
+            (
+                core::ptr::read_volatile((base + offset) as *const u32),
+                core::ptr::read_volatile((base + offset + 4) as *const u32) as usize,
+            )
+        };
+        if kind == TAG_END || size < 8 || offset + size > total {
+            return None;
+        }
+        if kind == TAG_COMMAND_LINE {
+            // SAFETY: the string lies inside the tag, which lies inside the
+            // structure; `c_str` stops at the tag's end regardless.
+            return unsafe { c_str(base + offset + 8, size - 8) };
+        }
+        offset += (size + 7) & !7;
+    }
+    None
+}
+
+/// The command line a multiboot1 loader passed (QEMU's `-append`), or
+/// `None`. Flag bit 2 says whether `cmdline`, at offset 16, is valid.
+///
+/// # Safety
+/// `info` must be the multiboot1 information pointer the loader passed, or
+/// zero.
+pub unsafe fn command_line_v1(info: u64) -> Option<&'static str> {
+    if info == 0 || info % 4 != 0 {
+        return None;
+    }
+    let base = info as usize;
+    // SAFETY: the caller guarantees a multiboot1 structure; flags and
+    // cmdline are its first and fifth words.
+    let (flags, address) = unsafe {
+        (
+            core::ptr::read_volatile(base as *const u32),
+            core::ptr::read_volatile((base + 16) as *const u32) as usize,
+        )
+    };
+    if flags & (1 << 2) == 0 || address == 0 {
+        return None;
+    }
+    // SAFETY: the loader placed the string below 4 GiB, inside the identity
+    // map; it is read up to its NUL or the bound, whichever comes first.
+    unsafe { c_str(address, COMMAND_LINE_MAX) }
+}
+
+/// A NUL-terminated string of at most `max` bytes at `address`, if it is
+/// UTF-8. The loader's memory is never reclaimed — there is no allocator —
+/// so the borrow can be `'static`.
+///
+/// # Safety
+/// `address .. address + max` must be readable, or hold a NUL before the
+/// first unreadable byte.
+unsafe fn c_str(address: usize, max: usize) -> Option<&'static str> {
+    let max = max.min(COMMAND_LINE_MAX);
+    let mut len = 0;
+    // SAFETY: forwarded from this function's own contract.
+    while len < max && unsafe { core::ptr::read_volatile((address + len) as *const u8) } != 0 {
+        len += 1;
+    }
+    // SAFETY: the `len` bytes just read.
+    let bytes = unsafe { core::slice::from_raw_parts(address as *const u8, len) };
+    core::str::from_utf8(bytes).ok()
 }
 
 extern "C" {

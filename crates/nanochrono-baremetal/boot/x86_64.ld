@@ -28,7 +28,11 @@ SECTIONS {
     }
 
     .text : ALIGN(4K) {
+        /* Bounds for the crash dump, which keeps only code and stack words
+           that lie inside them. */
+        __text_start = .;
         *(.text .text.*)
+        __text_end = .;
     }
 
     .rodata : ALIGN(4K) {

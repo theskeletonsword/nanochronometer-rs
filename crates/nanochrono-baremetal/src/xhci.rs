@@ -113,6 +113,7 @@ const TRB_DATA: u32 = 3;
 const TRB_STATUS: u32 = 4;
 const TRB_LINK: u32 = 6;
 const TRB_ENABLE_SLOT: u32 = 9;
+const TRB_DISABLE_SLOT: u32 = 10;
 const TRB_ADDRESS_DEVICE: u32 = 11;
 const TRB_CONFIGURE_ENDPOINT: u32 = 12;
 const TRB_TRANSFER_EVENT: u32 = 32;
@@ -171,7 +172,7 @@ impl Ring {
 /// both. Enumerating only the *first* connected port is worse still — on a
 /// real machine that port is usually the webcam or the Bluetooth radio, and
 /// the result is a stack that comes up cleanly and delivers no input at all.
-pub const MAX_DEVICES: usize = 2;
+pub const MAX_DEVICES: usize = 3;
 
 // The structures the controller reads by physical address. Statics because
 // there is no allocator, and the identity map makes their addresses usable
@@ -191,7 +192,8 @@ struct Dcbaa([u64; MAX_SLOTS + 1]);
 
 /// How many device slots this driver asks the controller for.
 ///
-/// Two devices are ever addressed, so the number is small — but the
+/// Three devices are ever addressed (keyboard, pointer, and a mass-
+/// storage stick for the crash dump), so the number is small — but the
 /// controller assigns slot numbers itself and only promises them to be within
 /// what `CONFIG` asked for, so the array has to cover all of them.
 const MAX_SLOTS: usize = 8;
@@ -214,7 +216,7 @@ static mut SCRATCHPAD_PAGES: ScratchpadPages =
     ScratchpadPages([[0; SCRATCHPAD_PAGE]; MAX_SCRATCHPAD]);
 static mut COMMAND_RING: Ring = Ring::new();
 static mut EVENT_RING: Ring = Ring::new();
-static mut TRANSFER_RINGS: [Ring; MAX_DEVICES] = [Ring::new(), Ring::new()];
+static mut TRANSFER_RINGS: [Ring; MAX_DEVICES] = [Ring::new(), Ring::new(), Ring::new()];
 
 /// Event Ring Segment Table: one entry, pointing at the event ring.
 #[repr(C, align(64))]
@@ -247,13 +249,14 @@ const INPUT_CONTEXT_BYTES: usize = 33 * 64;
 /// enumerated, and enumeration is serial. The device contexts are not — the
 /// controller keeps writing them for as long as the device is addressed.
 static mut INPUT_CONTEXT: InputContext = InputContext([0; INPUT_CONTEXT_BYTES]);
-static mut DEVICE_CONTEXTS: [Context; MAX_DEVICES] = [Context([0; 2048]), Context([0; 2048])];
+static mut DEVICE_CONTEXTS: [Context; MAX_DEVICES] =
+    [Context([0; 2048]), Context([0; 2048]), Context([0; 2048])];
 
 /// Where descriptors and reports are read into.
 #[repr(C, align(64))]
 struct Buffer([u8; 256]);
 
-static mut BUFFERS: [Buffer; MAX_DEVICES] = [Buffer([0; 256]), Buffer([0; 256])];
+static mut BUFFERS: [Buffer; MAX_DEVICES] = [Buffer([0; 256]), Buffer([0; 256]), Buffer([0; 256])];
 
 /// The address of one device's transfer ring.
 fn transfer_ring_address(index: usize) -> u64 {
@@ -438,6 +441,9 @@ pub struct Xhci {
     device_count: usize,
     /// Scratchpad pages the controller asked for.
     scratchpad: usize,
+    /// The mass-storage device, once one has been enumerated for the crash
+    /// dump. `None` on a machine with no USB stick plugged in.
+    msc: Option<MscSlot>,
 }
 
 impl Xhci {
@@ -493,6 +499,7 @@ impl Xhci {
             devices: [DeviceSlot::new(); MAX_DEVICES],
             device_count: 0,
             scratchpad: 0,
+            msc: None,
             bar_len,
         };
 
@@ -1022,6 +1029,9 @@ impl Setup {
 
 /// `GET_DESCRIPTOR`, device-to-host, standard, to the device.
 const REQ_GET_DESCRIPTOR: u8 = 6;
+/// How many bytes of the configuration descriptor are asked for: the whole
+/// per-device buffer.
+const CONFIG_READ: usize = 256;
 const REQ_SET_CONFIGURATION: u8 = 9;
 /// HID class request: select the boot protocol.
 const REQ_SET_PROTOCOL: u8 = 0x0B;
@@ -1059,15 +1069,51 @@ pub struct HidDevice {
     pub report_len: u16,
 }
 
+/// Which kinds of device the caller still needs; anything else found on a
+/// port has its slot disabled again rather than taking one of the few device
+/// indices.
+#[derive(Debug, Clone, Copy)]
+pub struct Want {
+    pub keyboard: bool,
+    pub pointer: bool,
+    pub storage: bool,
+}
+
+/// What [`Xhci::enumerate_port`] found on a port.
+#[derive(Debug, Clone, Copy)]
+pub enum PortDevice {
+    /// A boot-protocol keyboard or pointer, configured and ready to poll,
+    /// with the index every later call about it takes.
+    Hid(usize, HidDevice),
+    /// A Bulk-Only mass-storage stick, configured and ready for block
+    /// transfers — the crash dump's USB target.
+    Storage,
+    /// Anything else: a webcam, a radio, a fingerprint reader, a HID device
+    /// this driver does not read. Its slot has been disabled again.
+    Other,
+}
+
 impl Xhci {
-    /// Enumerates the device on `port` and configures its HID endpoint.
+    /// Enumerates the device on `port` **once**, and configures it as what
+    /// its interface descriptor says it is.
     ///
-    /// Returns the device and the index it was given, which every later call
-    /// about it takes.
+    /// One pass per port, dispatching on the class, rather than one pass for
+    /// HID and another for storage. Addressing a device takes a slot, and a
+    /// controller refuses to address a port that another slot already holds
+    /// — the second pass of the old two-pass scan got a TRB Error from
+    /// Address Device for exactly that reason. Every device this driver does
+    /// not keep has its slot disabled again, so the webcam, radio and
+    /// fingerprint reader on a notebook's root ports do not use up the slots
+    /// before a stick is reached.
+    ///
+    /// `want` says which kinds are still needed. A second keyboard, or a
+    /// stick when one is already held, is handled like any unwanted device:
+    /// its slot is disabled, so it cannot take the index the next wanted
+    /// device needs.
     ///
     /// # Safety
     /// Drives the controller; requires ring 0 and an identity map.
-    pub unsafe fn enumerate(&mut self, port: u8) -> Option<(usize, HidDevice)> {
+    pub unsafe fn enumerate_port(&mut self, port: u8, want: Want) -> Option<PortDevice> {
         let index = self.device_count;
         if index >= MAX_DEVICES {
             return None;
@@ -1079,10 +1125,28 @@ impl Xhci {
         }
         // The slot number is in the top byte of the completion event's
         // control field, and nowhere else.
+        let slot = event.slot;
         self.devices[index] = DeviceSlot::new();
-        self.devices[index].slot = event.slot;
+        self.devices[index].slot = slot;
 
         // SAFETY: as above.
+        let found = unsafe { self.identify(port, index, want) };
+        if !matches!(found, Some(PortDevice::Hid(..)) | Some(PortDevice::Storage)) {
+            // Not kept, or failed part-way: hand the slot back so the port
+            // can be addressed again and the slot reused.
+            // SAFETY: as above.
+            unsafe { self.disable_slot(slot) };
+        }
+        found
+    }
+
+    /// Addresses the device, reads its descriptors and configures it by
+    /// class. The caller disables the slot unless this keeps the device.
+    ///
+    /// # Safety
+    /// As [`enumerate_port`](Self::enumerate_port).
+    unsafe fn identify(&mut self, port: u8, index: usize, want: Want) -> Option<PortDevice> {
+        // SAFETY: forwarded from this function's own contract.
         unsafe { self.address_device(port, index)? };
 
         // The device descriptor names the vendor and product, and its
@@ -1108,8 +1172,10 @@ impl Xhci {
         let product = u16::from_le_bytes([descriptor[10], descriptor[11]]);
 
         // The configuration descriptor carries the interface and endpoint
-        // descriptors after it, which is where the HID class and the
-        // interrupt endpoint are named.
+        // descriptors after it, which is where the class and the endpoints
+        // are named. The whole buffer is asked for: a device answers with its
+        // real `wTotalLength` as a short packet, and a composite device's
+        // interfaces do not all fit in 64 bytes.
         // SAFETY: as above.
         unsafe {
             self.control_in(
@@ -1119,17 +1185,57 @@ impl Xhci {
                     request: REQ_GET_DESCRIPTOR,
                     value: DESC_CONFIGURATION,
                     index: 0,
-                    length: 64,
+                    length: CONFIG_READ as u16,
                 },
-                64,
+                CONFIG_READ as u16,
             )?
         };
-
         // SAFETY: the transfer completed.
-        let configuration_descriptor: [u8; 64] = unsafe { buffer_copy(index) };
-        let parsed = parse_configuration(&configuration_descriptor)?;
+        let configuration: [u8; CONFIG_READ] = unsafe { buffer_copy(index) };
 
-        // SAFETY: as above.
+        if let Some(parsed) = parse_configuration(&configuration) {
+            // A HID device this driver does not read, or one of a kind
+            // already held, is not worth a slot.
+            let wanted = match parsed.kind {
+                HidKind::Keyboard => want.keyboard,
+                HidKind::Pointer => want.pointer,
+                HidKind::Other => false,
+            };
+            if !wanted {
+                return Some(PortDevice::Other);
+            }
+            // SAFETY: as above.
+            unsafe { self.configure_hid(index, &parsed)? };
+            self.device_count = index + 1;
+            return Some(PortDevice::Hid(
+                index,
+                HidDevice {
+                    kind: parsed.kind,
+                    vendor,
+                    product,
+                    report_len: parsed.max_packet,
+                },
+            ));
+        }
+
+        if want.storage && self.msc.is_none() {
+            if let Some(parsed) = parse_mass_storage(&configuration) {
+                // SAFETY: as above.
+                unsafe { self.configure_storage(index, &parsed)? };
+                self.device_count = index + 1;
+                return Some(PortDevice::Storage);
+            }
+        }
+        Some(PortDevice::Other)
+    }
+
+    /// Selects the configuration and the boot protocol, and adds the
+    /// interrupt endpoint.
+    ///
+    /// # Safety
+    /// Drives the controller; requires ring 0.
+    unsafe fn configure_hid(&mut self, index: usize, parsed: &Parsed) -> Option<()> {
+        // SAFETY: forwarded from this function's own contract.
         unsafe {
             self.control_out(
                 index,
@@ -1162,18 +1268,24 @@ impl Xhci {
 
         self.devices[index].endpoint = parsed.endpoint;
         // SAFETY: as above.
-        unsafe { self.configure_endpoint(index, parsed.endpoint, parsed.max_packet)? };
+        unsafe { self.configure_endpoint(index, parsed.endpoint, parsed.max_packet) }
+    }
 
-        self.device_count = index + 1;
-        Some((
-            index,
-            HidDevice {
-                kind: parsed.kind,
-                vendor,
-                product,
-                report_len: parsed.max_packet,
-            },
-        ))
+    /// Hands a slot back to the controller: Disable Slot, and the DCBAA entry
+    /// cleared so a stale context is never followed.
+    ///
+    /// # Safety
+    /// Drives the controller; requires ring 0.
+    unsafe fn disable_slot(&mut self, slot: u8) {
+        if slot == 0 || slot as usize > MAX_SLOTS {
+            return;
+        }
+        let control = (TRB_DISABLE_SLOT << 10) | ((slot as u32) << 24);
+        // SAFETY: forwarded from this function's own contract. The result is
+        // not needed: a slot that fails to disable only costs one of eight.
+        let _ = unsafe { self.command(0, 0, control) };
+        // SAFETY: single core; the controller no longer owns the slot.
+        unsafe { (*core::ptr::addr_of_mut!(DCBAA)).0[slot as usize] = 0 };
     }
 
     /// Builds the input context and issues Address Device.
@@ -1575,6 +1687,477 @@ fn parse_configuration(buf: &[u8]) -> Option<Parsed> {
         offset += length;
     }
     None
+}
+
+// --- mass storage (Bulk-Only Transport + SCSI) ----------------------------
+//
+// Enough of a USB mass-storage driver to write a crash dump to a stick, and
+// no more: one LUN, one block at a time, no stall recovery beyond giving up.
+// The reference is the USB Mass Storage Bulk-Only Transport specification;
+// the CBW/CSW signatures, flags and sizes were cross-checked against
+// FreeBSD's `sys/dev/usb/storage/umass.c` (see NOTICE). Like umass without a
+// quirk entry, a CSW with any other signature is a failure.
+
+/// Mass-storage class, SCSI transparent command set, Bulk-Only Transport.
+const MSC_CLASS: u8 = 0x08;
+const MSC_SUBCLASS_SCSI: u8 = 0x06;
+const MSC_PROTOCOL_BOT: u8 = 0x50;
+
+/// Endpoint transfer type 2 in the `bmAttributes` low bits is bulk.
+const EP_ATTR_BULK: u8 = 0x02;
+
+/// `dCBWSignature` "USBC" and `dCSWSignature" "USBS", little-endian.
+const CBW_SIGNATURE: u32 = 0x4342_5355;
+const CSW_SIGNATURE: u32 = 0x5342_5355;
+
+/// SCSI opcodes.
+const SCSI_TEST_UNIT_READY: u8 = 0x00;
+const SCSI_INQUIRY: u8 = 0x12;
+const SCSI_READ_CAPACITY_10: u8 = 0x25;
+const SCSI_READ_10: u8 = 0x28;
+const SCSI_WRITE_10: u8 = 0x2A;
+
+/// The largest block this driver handles. 4096 covers 4K-native sticks;
+/// 512 is what almost all of them report.
+const MAX_BLOCK: usize = 4096;
+
+/// Dedicated bulk transfer rings for the one mass-storage device. Separate
+/// from the HID transfer rings, and separate from each other: the two bulk
+/// endpoints keep independent dequeue pointers, so they cannot share a ring.
+static mut MSC_OUT_RING: Ring = Ring::new();
+static mut MSC_IN_RING: Ring = Ring::new();
+
+/// The data buffer the controller reads and writes for a block transfer.
+#[repr(C, align(4096))]
+struct MscData([u8; MAX_BLOCK]);
+static mut MSC_DATA: MscData = MscData([0; MAX_BLOCK]);
+
+/// The 31-byte command wrapper and 13-byte status wrapper, each in a cache
+/// line of its own so a controller that writes the CSW cannot touch the CBW.
+#[repr(C, align(64))]
+struct MscFrame([u8; 64]);
+static mut MSC_CBW: MscFrame = MscFrame([0; 64]);
+static mut MSC_CSW: MscFrame = MscFrame([0; 64]);
+
+/// The producer state of one bulk ring: which entry is next, and the cycle
+/// bit that marks it as this pass's.
+#[derive(Clone, Copy)]
+struct RingCursor {
+    index: usize,
+    cycle: u32,
+}
+
+impl RingCursor {
+    const fn new() -> RingCursor {
+        RingCursor { index: 0, cycle: 1 }
+    }
+}
+
+/// An addressed mass-storage device: its slot, its two bulk endpoints and
+/// their rings, and the geometry SCSI reported.
+#[derive(Clone, Copy)]
+struct MscSlot {
+    slot: u8,
+    /// `bEndpointAddress` of each bulk endpoint — the IN one has bit 7 set.
+    in_ep: u8,
+    out_ep: u8,
+    in_cursor: RingCursor,
+    out_cursor: RingCursor,
+    block_size: u32,
+    block_count: u64,
+    /// The `dCBWTag`, incremented per command so a CSW can be matched to it.
+    tag: u32,
+}
+
+/// The address of a bulk ring.
+fn msc_ring_address(in_dir: bool) -> u64 {
+    if in_dir {
+        &raw const MSC_IN_RING as u64
+    } else {
+        &raw const MSC_OUT_RING as u64
+    }
+}
+
+impl Xhci {
+    /// Whether a mass-storage device was enumerated.
+    pub fn has_storage(&self) -> bool {
+        self.msc.is_some()
+    }
+
+    /// The block size the stick reported, or zero if there is none.
+    pub fn block_size(&self) -> u32 {
+        self.msc.map_or(0, |m| m.block_size)
+    }
+
+    /// The number of addressable blocks, or zero.
+    pub fn block_count(&self) -> u64 {
+        self.msc.map_or(0, |m| m.block_count)
+    }
+
+    /// Configures an addressed mass-storage device for block transfers:
+    /// selects its configuration, adds both bulk endpoints, and brings the
+    /// SCSI unit up. Records the stick in `self.msc` on success.
+    ///
+    /// # Safety
+    /// Drives the controller; requires ring 0 and an identity map.
+    unsafe fn configure_storage(&mut self, index: usize, parsed: &MassStorage) -> Option<()> {
+        // SAFETY: forwarded from this function's own contract.
+        unsafe {
+            self.control_out(
+                index,
+                Setup {
+                    request_type: 0x00,
+                    request: REQ_SET_CONFIGURATION,
+                    value: parsed.configuration as u16,
+                    index: 0,
+                    length: 0,
+                },
+            )?;
+            self.configure_bulk(index, parsed)?;
+        }
+
+        let mut msc = MscSlot {
+            slot: self.devices[index].slot,
+            in_ep: parsed.in_ep,
+            out_ep: parsed.out_ep,
+            in_cursor: RingCursor::new(),
+            out_cursor: RingCursor::new(),
+            block_size: 512,
+            block_count: 0,
+            tag: 0,
+        };
+
+        // Wake the device and read its geometry before it is trusted with a
+        // write. A stick answers `TEST UNIT READY` with a check condition
+        // until its medium is ready, which is why this is a loop.
+        // SAFETY: as above.
+        unsafe {
+            let mut inquiry = [0u8; 6];
+            inquiry[0] = SCSI_INQUIRY;
+            inquiry[4] = 36;
+            self.bot(&mut msc, &inquiry, true, 36)?;
+
+            let ready = (0..16).any(|_| {
+                let cdb = [SCSI_TEST_UNIT_READY, 0, 0, 0, 0, 0];
+                let ok = self.bot(&mut msc, &cdb, false, 0).is_some();
+                if !ok {
+                    delay(200_000);
+                }
+                ok
+            });
+            if !ready {
+                return None;
+            }
+
+            let cdb = [SCSI_READ_CAPACITY_10, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+            self.bot(&mut msc, &cdb, true, 8)?;
+            let cap: [u8; 8] = msc_data_copy();
+            let last_lba = u32::from_be_bytes([cap[0], cap[1], cap[2], cap[3]]);
+            let block_size = u32::from_be_bytes([cap[4], cap[5], cap[6], cap[7]]);
+            if block_size == 0 || block_size as usize > MAX_BLOCK {
+                return None;
+            }
+            msc.block_size = block_size;
+            msc.block_count = last_lba as u64 + 1;
+        }
+
+        self.msc = Some(msc);
+        Some(())
+    }
+
+    /// Adds both bulk endpoints to the device, each on its own ring.
+    ///
+    /// # Safety
+    /// Writes memory the controller reads; requires ring 0.
+    unsafe fn configure_bulk(&mut self, device: usize, parsed: &MassStorage) -> Option<()> {
+        let out_dci = (parsed.out_ep & 0x0F) as usize * 2;
+        let in_dci = (parsed.in_ep & 0x0F) as usize * 2 + 1;
+        if out_dci < 2 || in_dci < 2 || out_dci >= 32 || in_dci >= 32 {
+            return None;
+        }
+        let cs = self.context_size;
+        let slot = self.devices[device].slot;
+        // SAFETY: forwarded from this function's own contract.
+        unsafe {
+            let input = &raw mut INPUT_CONTEXT as *mut u8;
+            core::ptr::write_bytes(input, 0, INPUT_CONTEXT_BYTES);
+            // Add the slot and both endpoints.
+            write_ctx(input, 1, 1 | (1 << out_dci) | (1 << in_dci));
+
+            let slot_ctx = input.add(cs);
+            write_ctx(slot_ctx, 0, (out_dci.max(in_dci) as u32) << 27);
+
+            // Bulk OUT is endpoint type 2, Bulk IN type 6.
+            let ep_out = input.add(cs * (out_dci + 1));
+            write_ctx(ep_out, 1, (2 << 3) | (3 << 1) | ((parsed.out_mps as u32) << 16));
+            write_ctx64(ep_out, 2, msc_ring_address(false) | 1);
+            write_ctx(ep_out, 4, parsed.out_mps as u32);
+
+            let ep_in = input.add(cs * (in_dci + 1));
+            write_ctx(ep_in, 1, (6 << 3) | (3 << 1) | ((parsed.in_mps as u32) << 16));
+            write_ctx64(ep_in, 2, msc_ring_address(true) | 1);
+            write_ctx(ep_in, 4, parsed.in_mps as u32);
+
+            let control = (TRB_CONFIGURE_ENDPOINT << 10) | ((slot as u32) << 24);
+            let event = self.command(&raw const INPUT_CONTEXT as u64, 0, control)?;
+            (event.completion == CC_SUCCESS).then_some(())
+        }
+    }
+
+    /// Reads one block into `out`.
+    ///
+    /// # Safety
+    /// Drives the controller; requires ring 0.
+    pub unsafe fn read_block(&mut self, lba: u32, out: &mut [u8]) -> Option<()> {
+        let mut msc = self.msc?;
+        let bs = msc.block_size;
+        let cdb = read_write_cdb(SCSI_READ_10, lba);
+        // SAFETY: forwarded from this function's own contract.
+        let ok = unsafe { self.bot(&mut msc, &cdb, true, bs) };
+        self.msc = Some(msc);
+        ok?;
+        let n = out.len().min(bs as usize);
+        // SAFETY: the transfer completed, so the controller is done writing.
+        out[..n].copy_from_slice(unsafe {
+            core::slice::from_raw_parts(&raw const MSC_DATA as *const u8, n)
+        });
+        Some(())
+    }
+
+    /// Writes one block from `data`, zero-padded to the block size.
+    ///
+    /// # Safety
+    /// Drives the controller; requires ring 0.
+    pub unsafe fn write_block(&mut self, lba: u32, data: &[u8]) -> Option<()> {
+        let mut msc = self.msc?;
+        let bs = msc.block_size as usize;
+        let n = data.len().min(bs);
+        // SAFETY: MSC_DATA is `MAX_BLOCK` and `bs <= MAX_BLOCK`.
+        unsafe {
+            let buf = &raw mut MSC_DATA as *mut u8;
+            core::ptr::write_bytes(buf, 0, bs);
+            core::ptr::copy_nonoverlapping(data.as_ptr(), buf, n);
+        }
+        let cdb = read_write_cdb(SCSI_WRITE_10, lba);
+        // SAFETY: forwarded from this function's own contract.
+        let ok = unsafe { self.bot(&mut msc, &cdb, false, bs as u32) };
+        self.msc = Some(msc);
+        ok
+    }
+
+    /// One Bulk-Only transaction: command wrapper out, an optional data
+    /// stage, status wrapper in. `true` when the device reports success.
+    ///
+    /// # Safety
+    /// Drives the controller; requires ring 0.
+    unsafe fn bot(
+        &mut self,
+        msc: &mut MscSlot,
+        cdb: &[u8],
+        data_in: bool,
+        data_len: u32,
+    ) -> Option<()> {
+        msc.tag = msc.tag.wrapping_add(1);
+        // SAFETY: MSC_CBW is 64 bytes; a CBW is 31.
+        unsafe {
+            let cbw = &raw mut MSC_CBW as *mut u8;
+            core::ptr::write_bytes(cbw, 0, 64);
+            write_le32(cbw, 0, CBW_SIGNATURE);
+            write_le32(cbw, 4, msc.tag);
+            write_le32(cbw, 8, data_len);
+            *cbw.add(12) = if data_in { 0x80 } else { 0x00 }; // bmCBWFlags
+            *cbw.add(13) = 0; // LUN 0
+            *cbw.add(14) = cdb.len() as u8;
+            core::ptr::copy_nonoverlapping(cdb.as_ptr(), cbw.add(15), cdb.len().min(16));
+        }
+
+        // Command out.
+        // SAFETY: forwarded from this function's own contract.
+        unsafe { self.bulk(msc, false, &raw const MSC_CBW as u64, 31)? };
+        // Data stage, if any.
+        if data_len > 0 {
+            // SAFETY: as above.
+            unsafe { self.bulk(msc, data_in, &raw const MSC_DATA as u64, data_len)? };
+        }
+        // Status in.
+        // SAFETY: as above.
+        unsafe { self.bulk(msc, true, &raw const MSC_CSW as u64, 13)? };
+
+        // SAFETY: the status transfer completed, so the CSW is in memory.
+        unsafe {
+            let csw = &raw const MSC_CSW as *const u8;
+            let signature = read_le32(csw, 0);
+            let tag = read_le32(csw, 4);
+            let status = *csw.add(12);
+            (signature == CSW_SIGNATURE && tag == msc.tag && status == 0).then_some(())
+        }
+    }
+
+    /// One bulk transfer on the IN or OUT ring, waited to completion.
+    ///
+    /// Blocking, which is correct here: this runs at boot and in the panic
+    /// handler, and in both nothing else can proceed until the block is
+    /// moved. A stall or other non-success completion gives up rather than
+    /// trying to recover, because the caller's fallback — the next storage
+    /// tier, or the serial dump — is better than a driver that loops on a
+    /// wedged endpoint.
+    ///
+    /// # Safety
+    /// Drives the controller; requires ring 0.
+    unsafe fn bulk(&mut self, msc: &mut MscSlot, in_dir: bool, buffer: u64, len: u32) -> Option<()> {
+        let base = msc_ring_address(in_dir);
+        let cursor = if in_dir {
+            &mut msc.in_cursor
+        } else {
+            &mut msc.out_cursor
+        };
+        // SAFETY: `base` is one of the two bulk rings, each `RING_LEN` long.
+        unsafe { bulk_enqueue(cursor, base, buffer, len, (TRB_NORMAL << 10) | TRB_IOC) };
+
+        // Doorbell target: OUT endpoint N is DCI 2N, IN endpoint N is 2N + 1.
+        let ep = if in_dir { msc.in_ep } else { msc.out_ep };
+        let dci = ((ep & 0x0F) as u32) * 2 + if in_dir { 1 } else { 0 };
+        // SAFETY: forwarded from this function's own contract.
+        unsafe { self.ring_doorbell(msc.slot, dci) };
+        // SAFETY: as above.
+        let (code, _) = unsafe { self.wait_event(TRB_TRANSFER_EVENT)? };
+        (code == CC_SUCCESS || code == CC_SHORT_PACKET).then_some(())
+    }
+}
+
+/// Places one TRB on a bulk ring, wrapping with a link TRB at the end.
+///
+/// # Safety
+/// `base` must be a `Ring` and `cursor` its matching state.
+unsafe fn bulk_enqueue(cursor: &mut RingCursor, base: u64, parameter: u64, status: u32, control: u32) {
+    // SAFETY: forwarded from this function's own contract.
+    unsafe {
+        if cursor.index >= RING_LEN - 1 {
+            let trb = trb_at(base, RING_LEN - 1);
+            (*trb).parameter = base;
+            (*trb).status = 0;
+            (*trb).control = (TRB_LINK << 10) | TRB_TOGGLE | cursor.cycle;
+            cursor.index = 0;
+            cursor.cycle ^= 1;
+        }
+        let trb = trb_at(base, cursor.index);
+        (*trb).parameter = parameter;
+        (*trb).status = status;
+        // The cycle bit last, as everywhere: it hands the entry to hardware.
+        (*trb).control = control | cursor.cycle;
+    }
+    cursor.index += 1;
+}
+
+/// Copies the first `N` bytes out of the shared block buffer.
+///
+/// # Safety
+/// The controller must not be writing it, which holds after a completed
+/// transfer. `N` at most [`MAX_BLOCK`].
+unsafe fn msc_data_copy<const N: usize>() -> [u8; N] {
+    let mut out = [0u8; N];
+    // SAFETY: forwarded from this function's own contract.
+    unsafe {
+        core::ptr::copy_nonoverlapping(&raw const MSC_DATA as *const u8, out.as_mut_ptr(), N);
+    }
+    out
+}
+
+/// A READ(10) or WRITE(10) command block for one block at `lba`.
+fn read_write_cdb(opcode: u8, lba: u32) -> [u8; 10] {
+    let l = lba.to_be_bytes();
+    // bytes 2..6 LBA, byte 7..9 transfer length = 1 block.
+    [opcode, 0, l[0], l[1], l[2], l[3], 0, 0, 1, 0]
+}
+
+/// Writes a little-endian u32 into a byte buffer.
+///
+/// # Safety
+/// `base` must point at `offset + 4` writable bytes.
+unsafe fn write_le32(base: *mut u8, offset: usize, value: u32) {
+    // SAFETY: forwarded from this function's own contract.
+    unsafe { core::ptr::copy_nonoverlapping(value.to_le_bytes().as_ptr(), base.add(offset), 4) }
+}
+
+/// Reads a little-endian u32 from a byte buffer.
+///
+/// # Safety
+/// `base` must point at `offset + 4` readable bytes.
+unsafe fn read_le32(base: *const u8, offset: usize) -> u32 {
+    let mut b = [0u8; 4];
+    // SAFETY: forwarded from this function's own contract.
+    unsafe { core::ptr::copy_nonoverlapping(base.add(offset), b.as_mut_ptr(), 4) };
+    u32::from_le_bytes(b)
+}
+
+/// The bulk endpoints of a mass-storage interface.
+struct MassStorage {
+    configuration: u8,
+    in_ep: u8,
+    out_ep: u8,
+    in_mps: u16,
+    out_mps: u16,
+}
+
+/// Walks a configuration descriptor for a Bulk-Only mass-storage interface
+/// and its two bulk endpoints.
+///
+/// Like [`parse_configuration`], it steps by the length byte rather than
+/// assuming an order. The endpoints are only accepted while the walk is
+/// inside a mass-storage interface, so a composite device's other interfaces
+/// cannot contribute one.
+fn parse_mass_storage(buf: &[u8]) -> Option<MassStorage> {
+    if buf.len() < 9 || buf[1] != 2 {
+        return None;
+    }
+    let configuration = buf[5];
+    let mut in_ep = None;
+    let mut out_ep = None;
+    let mut in_mps = 0u16;
+    let mut out_mps = 0u16;
+    let mut in_msc = false;
+    let mut offset = 0usize;
+
+    while offset + 2 <= buf.len() {
+        let length = buf[offset] as usize;
+        let descriptor_type = buf[offset + 1];
+        if length < 2 || offset + length > buf.len() {
+            break;
+        }
+        match descriptor_type {
+            // Interface: is it the BOT/SCSI mass-storage one?
+            4 if length >= 9 => {
+                in_msc = buf[offset + 5] == MSC_CLASS
+                    && buf[offset + 6] == MSC_SUBCLASS_SCSI
+                    && buf[offset + 7] == MSC_PROTOCOL_BOT;
+            }
+            // Endpoint: bulk, inside that interface. Direction from bit 7.
+            5 if length >= 7 && in_msc => {
+                let address = buf[offset + 2];
+                let attributes = buf[offset + 3];
+                let mps = u16::from_le_bytes([buf[offset + 4], buf[offset + 5]]) & 0x7FF;
+                if attributes & 0x03 == EP_ATTR_BULK {
+                    if address & 0x80 != 0 {
+                        in_ep = Some(address);
+                        in_mps = mps;
+                    } else {
+                        out_ep = Some(address);
+                        out_mps = mps;
+                    }
+                }
+            }
+            _ => {}
+        }
+        offset += length;
+    }
+
+    Some(MassStorage {
+        configuration,
+        in_ep: in_ep?,
+        out_ep: out_ep?,
+        in_mps: in_mps.max(1),
+        out_mps: out_mps.max(1),
+    })
 }
 
 const _: usize = XHCI_PAGESIZE;

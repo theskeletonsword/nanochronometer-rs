@@ -94,9 +94,15 @@ xHCI enumeration, a software cursor and clickable controls.
 There are three stacks, and the kernel brings up as many as it needs:
 
 `crates/nanochrono-baremetal/src/input.rs` drives the 8042 controller —
-controller command byte, both port resets, explicit enable of scanning, the
-IntelliMouse "magic knock" to unlock 4-byte packets, packet resynchronisation
-on bit 3, and nine-bit sign extension on the movement deltas.
+a presence probe (ports that float read `0xFF`), both ports disabled and the
+output buffer drained, controller command byte, both port resets, explicit
+enable of scanning, the IntelliMouse "magic knock" to unlock 4-byte packets,
+packet resynchronisation on bit 3, and nine-bit sign extension on the
+movement deltas. Every wait is timed on the counter, with an `io_wait` (a
+write to port `0x80`) between status reads. Keys: the `0xE0` prefix, the fake
+Shifts around extended keys and the Pause sequence are decoded, and command
+replies (`0xFA`, `0xFE`) are not taken for keys. The kernel polls with
+interrupts masked, so there is no IRQ1 handler and no EOI to send.
 
 `crates/nanochrono-baremetal/src/xhci.rs` drives an xHCI controller found
 through PCI — reset, DCBAA, command/event/transfer rings, Enable Slot, Address
@@ -122,6 +128,7 @@ Three specific things this got wrong, all of which are fixed:
 | Keyboard detected, no keys arrive | Scanning was never enabled. The specification says a keyboard resumes scanning after a reset; enough embedded controllers do not that it has to be asked for. A missed reset is also no longer taken as an absent device — an EC that swallows the reset still delivers scancodes |
 | Pointer never found on real hardware | USB was only tried when the 8042 found nothing |
 | USB brought up but no input | Only the **first connected port** was enumerated. On a laptop that port is usually the webcam, the Bluetooth radio or the fingerprint reader. Every connected port is now tried, and a keyboard *and* a pointer are both kept |
+| Boot stalls at "detecting input devices", then no key works (a UEFI PC with no 8042) | With no 8042 and no firmware emulating one, ports `0x60`/`0x64` float and read `0xFF`: "output full" and "input full" at once. Every wait spun its full million reads, over a minute in all, and afterwards `poll` read `0xFF` from the port forever and returned before USB was ever asked — the USB keyboard was enumerated and never read. The 8042 is now probed first and skipped when it is not there, waits are timed, and a PS/2 byte that completes no event no longer ends the turn |
 | Interface unresponsive | `poll_report` waited for the interrupt transfer to complete. A keyboard with no key held never completes one, so every frame paid the full timeout. Polling is now non-blocking: the transfer is queued once and left outstanding, and each call drains whatever the controller has posted |
 
 Where firmware translates USB to the 8042 — "legacy USB support", on by
@@ -145,6 +152,20 @@ $ qemu-system-x86_64 -enable-kvm -cpu host -cdrom test.iso \
 `force-usb` skips the 8042 entirely. It is off by default and never in a
 release build. With it, the interface reports `xhci: up`, `usb keyboard: yes`
 and `usb pointer: yes` — two devices on two ports — and both deliver events.
+
+A closer model of a UEFI machine with no legacy controller needs no feature
+at all: QEMU can leave the 8042 out, and its ports then float exactly as they
+do on such a PC.
+
+```console
+$ qemu-system-x86_64 -machine q35,i8042=off -accel kvm -cpu host \
+      -cdrom dist/baremetal/nanochronometer_x86_64.iso \
+      -device qemu-xhci -device usb-kbd
+```
+
+The USB panel then reads `8042 bytes: no 8042 - usb/i2c only` and the keys
+work. Before the fix this configuration reproduced the fault above: the panel
+showed `FF FF FF FF FF FF FF FF` and no key did anything.
 
 ### The third stack: I2C-HID, and the AML interpreter under it
 

@@ -86,6 +86,19 @@ unsafe fn graphical(fb: &Framebuffer, reason: &str, power: Option<&acpi::PowerRe
         y += BODY.line_height as u32;
     }
 
+    // The crash dump's register block. On a notebook with no serial port
+    // this screen is the only copy of it, so it is shown whole.
+    #[cfg(target_arch = "x86_64")]
+    {
+        y += 16;
+        draw::text(fb, &BODY, 28, y, "CPU STATE", p.accent);
+        y += BODY.line_height as u32 + 8;
+        crate::crashdump::summary_lines(|line| {
+            draw::text(fb, &BODY, 28, y, line, p.muted);
+            y += BODY.line_height as u32;
+        });
+    }
+
     // The two controls, in the corner the desktop GUI puts its window buttons
     // — except these restart and power off, because on bare metal there is no
     // window to minimise and nothing to close to.
