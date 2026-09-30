@@ -949,6 +949,13 @@ impl Xhci {
             parameter: trb.parameter,
             slot: (trb.control >> 24) as u8,
         };
+        // When a transfer completes — a key report, a mouse report, a block
+        // read from a USB stick — depends on the device and the bus, not on
+        // anything this code controls. Into NC_RNG, uncredited.
+        crate::rng::stir(
+            nanochrono_core::rng::EVENT_USB,
+            trb.parameter ^ (trb.status as u64) << 32 ^ trb.control as u64,
+        );
 
         self.event_index += 1;
         if self.event_index >= RING_LEN {

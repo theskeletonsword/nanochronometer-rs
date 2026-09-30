@@ -88,11 +88,13 @@ unsafe fn read(xhci: &mut Xhci, lba: u32) -> Option<Sector> {
     Some(sector)
 }
 
-/// Finds `CRASH.DMP` on the stick `xhci` has enumerated.
+/// Finds a file by 8.3 `name` on the stick `xhci` has enumerated: superfloppy,
+/// MBR or GPT, FAT16 or FAT32. Returns the volume and the file's first cluster
+/// and size.
 ///
 /// # Safety
 /// Drives the controller; requires ring 0.
-pub unsafe fn find_crash_file(xhci: &mut Xhci) -> Option<CrashFile> {
+unsafe fn find_file(xhci: &mut Xhci, target: Target) -> Option<(Volume, u32, u32)> {
     // Only the 512-byte case is handled; the FAT arithmetic below counts in
     // logical sectors and assumes they are device blocks.
     if xhci.block_size() != BLOCK as u32 {
@@ -108,14 +110,14 @@ pub unsafe fn find_crash_file(xhci: &mut Xhci) -> Option<CrashFile> {
     // A superfloppy: the boot sector of the volume is sector 0 itself.
     if parse_volume(&sector0, 0).is_some() {
         // SAFETY: as above.
-        return unsafe { find_in_volume(xhci, 0) };
+        return unsafe { find_in_volume(xhci, 0, target) };
     }
 
     // A protective MBR (type 0xEE) means the real table is the GPT.
     let protective = (0..4).any(|i| sector0[0x1BE + i * 16 + 4] == 0xEE);
     if protective {
         // SAFETY: as above.
-        return unsafe { find_in_gpt(xhci) };
+        return unsafe { find_in_gpt(xhci, target) };
     }
 
     // Otherwise the four primary MBR partitions, any FAT type.
@@ -127,12 +129,61 @@ pub unsafe fn find_crash_file(xhci: &mut Xhci) -> Option<CrashFile> {
         // has to parse before anything is trusted.
         if matches!(kind, 0x04 | 0x06 | 0x0E | 0x0B | 0x0C) && start != 0 {
             // SAFETY: as above.
-            if let Some(file) = unsafe { find_in_volume(xhci, start) } {
-                return Some(file);
+            if let Some(hit) = unsafe { find_in_volume(xhci, start, target) } {
+                return Some(hit);
             }
         }
     }
     None
+}
+
+/// Finds `CRASH.DMP` and resolves it to raw block extents for the crash path.
+///
+/// # Safety
+/// Drives the controller; requires ring 0.
+pub unsafe fn find_crash_file(xhci: &mut Xhci) -> Option<CrashFile> {
+    // SAFETY: forwarded from this function's own contract.
+    let (vol, first, size) = unsafe { find_file(xhci, Target::Short(CRASH_DMP_83))? };
+    // SAFETY: as above.
+    unsafe { extents_of(xhci, &vol, first, size) }
+}
+
+/// Reads a file by (long) `name` into `out`, following its cluster chain.
+/// Returns how many bytes were read (the smaller of the file's size and
+/// `out.len()`), or `None` if the file is not there.
+///
+/// Used to load a `.ncplu` plugin from the boot medium's FAT partition.
+///
+/// # Safety
+/// Drives the controller; requires ring 0.
+pub unsafe fn read_file(xhci: &mut Xhci, name: &str, out: &mut [u8]) -> Option<usize> {
+    // SAFETY: forwarded from this function's own contract.
+    let (vol, first, size) = unsafe { find_file(xhci, Target::Long(name))? };
+    let want = (size as usize).min(out.len());
+    let per_cluster_bytes = vol.sectors_per_cluster as usize * BLOCK;
+
+    let mut done = 0usize;
+    let mut cluster = first;
+    // Bounded by the file's cluster count, so a corrupt chain cannot loop.
+    let max_clusters = want / per_cluster_bytes.max(1) + 2;
+    for _ in 0..max_clusters {
+        if done >= want || !is_data_cluster(&vol, cluster) {
+            break;
+        }
+        for s in 0..vol.sectors_per_cluster {
+            if done >= want {
+                break;
+            }
+            // SAFETY: as above.
+            let sector = unsafe { read(xhci, cluster_lba(&vol, cluster) + s)? };
+            let n = (want - done).min(BLOCK);
+            out[done..done + n].copy_from_slice(&sector[..n]);
+            done += n;
+        }
+        // SAFETY: as above.
+        cluster = unsafe { next_cluster(xhci, &vol, cluster)? };
+    }
+    Some(done)
 }
 
 /// The GPT header's signature, at the start of LBA 1.
@@ -150,7 +201,7 @@ const GPT_MAX_ENTRIES: u32 = 128;
 ///
 /// # Safety
 /// Drives the controller; requires ring 0.
-unsafe fn find_in_gpt(xhci: &mut Xhci) -> Option<CrashFile> {
+unsafe fn find_in_gpt(xhci: &mut Xhci, target: Target) -> Option<(Volume, u32, u32)> {
     // SAFETY: forwarded from this function's own contract.
     let header = unsafe { read(xhci, 1)? };
     if &header[0..8] != GPT_SIGNATURE {
@@ -188,8 +239,8 @@ unsafe fn find_in_gpt(xhci: &mut Xhci) -> Option<CrashFile> {
             continue;
         }
         // SAFETY: as above.
-        if let Some(file) = unsafe { find_in_volume(xhci, first as u32) } {
-            return Some(file);
+        if let Some(hit) = unsafe { find_in_volume(xhci, first as u32, target) } {
+            return Some(hit);
         }
     }
     None
@@ -203,6 +254,7 @@ enum FatKind {
 }
 
 /// The parsed boot-sector fields the walk needs.
+#[derive(Clone, Copy)]
 struct Volume {
     kind: FatKind,
     fat_start: u32,
@@ -342,50 +394,159 @@ const CRASH_DMP_83: &[u8; 11] = b"CRASH   DMP";
 /// corrupt chain cannot loop forever.
 const MAX_DIR_CLUSTERS: usize = 32;
 
-/// What scanning one directory sector found.
-enum Scan {
-    /// The entry: first cluster and size.
-    Found(u32, u32),
-    /// The end-of-directory marker: no such file.
-    End,
-    /// Neither: keep reading.
-    More,
+/// What to match a directory entry against: a raw 8.3 name, or a long name
+/// (case-insensitive) reassembled from its VFAT entries. `CRASH.DMP` is 8.3;
+/// a plugin's `SNAKE.NCPLU` has a five-character extension and so exists only
+/// as a long name.
+#[derive(Clone, Copy)]
+enum Target<'a> {
+    Short(&'a [u8; 11]),
+    Long(&'a str),
 }
 
-/// Looks through one sector of directory entries for `CRASH.DMP`.
-fn scan_directory(sector: &Sector) -> Scan {
-    for e in 0..(BLOCK / 32) {
-        let entry = &sector[e * 32..e * 32 + 32];
-        match entry[0] {
-            0x00 => return Scan::End, // end of directory
-            0xE5 => continue,         // deleted
-            _ => {}
-        }
-        // Long-file-name components and the volume label are not files.
-        if entry[11] & 0x0F == 0x0F || entry[11] & 0x08 != 0 {
-            continue;
-        }
-        if &entry[0..11] == CRASH_DMP_83 {
-            // The high half is FAT32's; FAT16 keeps it zero, and a volume
-            // that does not is caught by the data-cluster check downstream.
-            let first = (u16::from_le_bytes([entry[20], entry[21]]) as u32) << 16
-                | u16::from_le_bytes([entry[26], entry[27]]) as u32;
-            let size = u32::from_le_bytes([entry[28], entry[29], entry[30], entry[31]]);
-            return Scan::Found(first, size);
+/// A long file name reassembled from its VFAT entries. Bounded to 63 bytes,
+/// which covers any plugin name this loads; longer names simply do not match.
+struct LongName {
+    buf: [u8; 63],
+    len: usize,
+    complete: bool,
+}
+
+impl LongName {
+    fn new() -> LongName {
+        LongName {
+            buf: [0; 63],
+            len: 0,
+            complete: false,
         }
     }
-    Scan::More
+
+    fn reset(&mut self) {
+        self.len = 0;
+        self.complete = false;
+    }
+
+    /// Adds one VFAT long-name entry. They appear in reverse order, the last
+    /// logical piece (bit 6 of the sequence set) first; each carries 13
+    /// UTF-16 characters at fixed offsets.
+    fn add(&mut self, e: &[u8]) {
+        let seq = (e[0] & 0x1F) as usize;
+        if seq == 0 || seq * 13 > self.buf.len() {
+            self.reset();
+            return;
+        }
+        // The 13 character slots within a 32-byte entry.
+        const SLOTS: [usize; 13] = [1, 3, 5, 7, 9, 14, 16, 18, 20, 22, 24, 28, 30];
+        let base = (seq - 1) * 13;
+        for (k, &o) in SLOTS.iter().enumerate() {
+            let (lo, hi) = (e[o], e[o + 1]);
+            // NUL terminates the name; 0xFFFF pads after it.
+            if lo == 0 && hi == 0 {
+                break;
+            }
+            if hi != 0 || lo == 0xFF {
+                continue;
+            }
+            let at = base + k;
+            if at < self.buf.len() {
+                self.buf[at] = lo;
+                if at + 1 > self.len {
+                    self.len = at + 1;
+                }
+            }
+        }
+        // The piece with the 0x40 bit is the last logical one: once it is in,
+        // the name is whole.
+        if e[0] & 0x40 != 0 {
+            self.complete = true;
+        }
+    }
+
+    fn matches(&self, target: &str) -> bool {
+        self.complete
+            && self.len == target.len()
+            && self.buf[..self.len]
+                .iter()
+                .zip(target.bytes())
+                .all(|(&a, b)| a.eq_ignore_ascii_case(&b))
+    }
 }
 
-/// Looks for `CRASH.DMP` in the root directory of the FAT volume at
-/// `part_start`.
+/// The first cluster and byte size out of a short (8.3) directory entry.
+fn entry_location(e: &[u8]) -> (u32, u32) {
+    // The high half is FAT32's; FAT16 keeps it zero.
+    let first = (u16::from_le_bytes([e[20], e[21]]) as u32) << 16
+        | u16::from_le_bytes([e[26], e[27]]) as u32;
+    let size = u32::from_le_bytes([e[28], e[29], e[30], e[31]]);
+    (first, size)
+}
+
+/// What one directory entry means for the walk.
+enum DirStep {
+    Found(u32, u32),
+    End,
+    Continue,
+}
+
+/// Classifies one 32-byte directory entry, accumulating long-name pieces in
+/// `long` until a short entry either matches `target` or resets it.
+fn match_entry(e: &[u8], long: &mut LongName, target: Target) -> DirStep {
+    match e[0] {
+        0x00 => return DirStep::End,
+        0xE5 => {
+            long.reset();
+            return DirStep::Continue;
+        }
+        _ => {}
+    }
+    // A long-name component: accumulate and wait for its short entry.
+    if e[11] & 0x0F == 0x0F {
+        long.add(e);
+        return DirStep::Continue;
+    }
+    // The volume label is not a file.
+    if e[11] & 0x08 != 0 {
+        long.reset();
+        return DirStep::Continue;
+    }
+    let hit = match target {
+        Target::Short(name) => &e[0..11] == name,
+        Target::Long(name) => long.matches(name),
+    };
+    if hit {
+        let (first, size) = entry_location(e);
+        return DirStep::Found(first, size);
+    }
+    long.reset();
+    DirStep::Continue
+}
+
+/// Finds a file matching `target` in the root directory of the FAT volume at
+/// `part_start`, returning the volume and the file's first cluster and size.
 ///
 /// # Safety
 /// Drives the controller; requires ring 0.
-unsafe fn find_in_volume(xhci: &mut Xhci, part_start: u32) -> Option<CrashFile> {
+unsafe fn find_in_volume(
+    xhci: &mut Xhci,
+    part_start: u32,
+    target: Target,
+) -> Option<(Volume, u32, u32)> {
     // SAFETY: forwarded from this function's own contract.
     let bpb = unsafe { read(xhci, part_start)? };
     let vol = parse_volume(&bpb, part_start)?;
+    let mut long = LongName::new();
+
+    // A closure over one sector's entries, so the long-name accumulator
+    // persists across sector and cluster boundaries.
+    let mut scan = |sector: &Sector| -> DirStep {
+        for i in 0..(BLOCK / 32) {
+            match match_entry(&sector[i * 32..i * 32 + 32], &mut long, target) {
+                DirStep::Continue => {}
+                other => return other,
+            }
+        }
+        DirStep::Continue
+    };
 
     match vol.kind {
         // FAT16: the root directory is a fixed run of sectors.
@@ -393,11 +554,10 @@ unsafe fn find_in_volume(xhci: &mut Xhci, part_start: u32) -> Option<CrashFile> 
             for s in 0..vol.root_sectors {
                 // SAFETY: as above.
                 let sector = unsafe { read(xhci, vol.root_start + s)? };
-                match scan_directory(&sector) {
-                    // SAFETY: as above.
-                    Scan::Found(first, size) => return unsafe { extents_of(xhci, &vol, first, size) },
-                    Scan::End => return None,
-                    Scan::More => {}
+                match scan(&sector) {
+                    DirStep::Found(first, size) => return Some((vol, first, size)),
+                    DirStep::End => return None,
+                    DirStep::Continue => {}
                 }
             }
         }
@@ -411,13 +571,10 @@ unsafe fn find_in_volume(xhci: &mut Xhci, part_start: u32) -> Option<CrashFile> 
                 for s in 0..vol.sectors_per_cluster {
                     // SAFETY: as above.
                     let sector = unsafe { read(xhci, cluster_lba(&vol, cluster) + s)? };
-                    match scan_directory(&sector) {
-                        Scan::Found(first, size) => {
-                            // SAFETY: as above.
-                            return unsafe { extents_of(xhci, &vol, first, size) };
-                        }
-                        Scan::End => return None,
-                        Scan::More => {}
+                    match scan(&sector) {
+                        DirStep::Found(first, size) => return Some((vol, first, size)),
+                        DirStep::End => return None,
+                        DirStep::Continue => {}
                     }
                 }
                 // SAFETY: as above.

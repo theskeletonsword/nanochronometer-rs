@@ -149,6 +149,14 @@ pub unsafe extern "C" fn kmain(magic: usize, multiboot_info: usize) -> ! {
             if let Some(test) = nanochrono_baremetal::crashdump::CrashTest::from_command_line(line) {
                 nanochrono_baremetal::crashdump::arm_crashtest(test);
             }
+            // `plugin=<name>` loads and runs <NAME>.ncplu from the boot
+            // medium's FAT partition once the interface is up.
+            if let Some(name) = line
+                .split_ascii_whitespace()
+                .find_map(|w| w.strip_prefix("plugin="))
+            {
+                nanochrono_baremetal::ncplu::arm_plugin(name);
+            }
         }
     }
 

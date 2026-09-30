@@ -2,6 +2,10 @@
 /target/
 # nanochrono-baremetal is outside the workspace, so it has its own.
 /crates/nanochrono-baremetal/target/
+# The plugin crates and the host signer are outside the workspace too; a
+# stray in-place build leaves a target/ that must never be committed.
+/crates/nanochrono-plugins/*/target/
+/tools/ncplu-sign/target/
 
 # Cross-build output (packaging/android/build.sh)
 /dist/
@@ -41,6 +45,15 @@ desktop.ini
 *.p12
 /kernel/windows/certs-private/
 
+# .ncplu hybrid signing keys (tools/ncplu-sign keygen). The private halves —
+# the ML-DSA-87 seed and the P-521 scalar — never enter the repository; a key
+# directory belongs outside it. Ignored by name in case one is generated here
+# by mistake. root_pubkeys.bin is public, but a key dir is not committed.
+mldsa.seed
+p521.scalar
+*.ncplu-key
+/keys/
+
 # Per-machine notes for Claude (paths on the maintainer's PC)
 /CLAUDE.local.md
 
@@ -51,3 +64,9 @@ desktop.ini
 
 # Release output (packaging/release/build-all.sh); binaries, not source
 /build/
+
+# C plugin build output (sdk/Makefile)
+/sdk/build/
+
+# Python bytecode from running tools/*.py
+__pycache__/

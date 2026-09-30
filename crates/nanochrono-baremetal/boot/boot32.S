@@ -557,16 +557,21 @@ setup_exceptions:
     and $0xFF, %r8                  /* base[31:24] -> bits 56..63       */
     shl $56, %r8
     or %r8, %rcx
-    mov %rcx, gdt64 + 16(%rip)
+    mov %rcx, gdt64 + 48(%rip)      /* the TSS descriptor is at 0x30    */
     shr $32, %rax                   /* base[63:32] in the high quadword */
-    mov %rax, gdt64 + 24(%rip)
+    mov %rax, gdt64 + 56(%rip)
 
+    /* RSP0: the stack the CPU switches to when an interrupt or exception is
+     * taken while running a ring-3 plugin. A dedicated stack, not the kernel's
+     * main one, whose frames the plugin's syscall path must return into. */
+    lea nc_ring3_kstack_top(%rip), %rax
+    mov %rax, tss64 + 4(%rip)       /* RSP0                             */
     lea ist1_top(%rip), %rax
     mov %rax, tss64 + 36(%rip)      /* IST1                             */
     lea ist2_top(%rip), %rax
     mov %rax, tss64 + 44(%rip)      /* IST2: page faults                */
     movw $104, tss64 + 102(%rip)    /* I/O map base past the limit: none */
-    mov $0x10, %ax
+    mov $0x30, %ax
     ltr %ax
 
     /* 32 interrupt gates, one per stub, 16 bytes apart. */
@@ -633,7 +638,7 @@ isr_stubs:
 isr_common:
     cld
     /* In reverse, so that in memory they read RAX first: the layout of
-     * `crashdump::TrapFrame`. Nothing here returns, so nothing pops them. */
+     * `crashdump::TrapFrame`. */
     push %r15
     push %r14
     push %r13
@@ -649,8 +654,37 @@ isr_common:
     push %rcx
     push %rbx
     push %rax
-    mov %rsp, %rdi                  /* the frame, as the first argument */
+    mov %rsp, %rbx                  /* the frame, kept across the call  */
+    mov %rsp, %rdi                  /* ...and as the first argument     */
     and $-16, %rsp                  /* System V alignment for the call  */
+    /* A fault the plugin runtime contains (one in a plugin's own code, or on
+     * its stack guards) comes back with the frame rewritten to resume on
+     * the kernel's stack: pop it and return there. Anything else goes on to
+     * the crash path, which does not return. */
+    call nanochrono_x86_trap
+    test %rax, %rax
+    jz 2f
+    mov %rbx, %rsp
+    pop %rax
+    pop %rbx
+    pop %rcx
+    pop %rdx
+    pop %rsi
+    pop %rdi
+    pop %rbp
+    pop %r8
+    pop %r9
+    pop %r10
+    pop %r11
+    pop %r12
+    pop %r13
+    pop %r14
+    pop %r15
+    add $16, %rsp                   /* vector and error code            */
+    iretq
+2:  mov %rbx, %rdi
+    mov %rbx, %rsp
+    and $-16, %rsp
     call nanochrono_x86_exception
     cli
 1:  hlt
@@ -662,12 +696,20 @@ isr_common:
 /* In .data, not .rodata: `ltr` writes the busy bit into the TSS descriptor. */
 .section .data
 .align 16
+/* Long mode ignores base and limit, so only the flag bits matter. The order
+ * is fixed by SYSCALL/SYSRET: STAR points the kernel pair at 0x08 (SYSCALL
+ * loads CS=0x08, SS=0x10) and the user base at 0x18 (SYSRET loads CS=base+16
+ * =0x28, SS=base+8=0x20, both with RPL 3). So the six segments must sit in
+ * exactly this order; the TSS follows, out of the SYSRET arithmetic's way.
+ *   43 executable  44 S (code/data)  47 present  53 long  41 writable  45..46 DPL */
 gdt64:
-    .quad 0                                     /* the mandatory null entry */
-    /* Code segment: executable, descriptor type, present, 64-bit.
-     * Long mode ignores base and limit, so only the flags matter. */
-    .quad (1<<43) | (1<<44) | (1<<47) | (1<<53)
-    /* 0x10: the TSS, 16 bytes, filled in by `setup_exceptions`. */
+    .quad 0                                              /* 0x00 null */
+    .quad (1<<43)|(1<<44)|(1<<47)|(1<<53)                /* 0x08 kernel code64 DPL0 */
+    .quad (1<<41)|(1<<44)|(1<<47)                        /* 0x10 kernel data DPL0 */
+    .quad (1<<41)|(1<<44)|(1<<47)|(3<<45)                /* 0x18 user data DPL3 (STAR base) */
+    .quad (1<<41)|(1<<44)|(1<<47)|(3<<45)                /* 0x20 user data DPL3 (SYSRET SS) */
+    .quad (1<<43)|(1<<44)|(1<<47)|(1<<53)|(3<<45)        /* 0x28 user code64 DPL3 (SYSRET CS) */
+    /* 0x30: the TSS, 16 bytes, filled in by `setup_exceptions`. */
     .quad 0
     .quad 0
 gdt64_end:
@@ -744,3 +786,12 @@ ist2_bottom:
     .skip 32768
 nc_ist2_top:
 ist2_top:
+.align 16
+/* The stack a ring-3 plugin's traps and syscalls run on at ring 0 (TSS.RSP0,
+ * and where the SYSCALL entry switches to). Separate from the kernel's main
+ * stack, which holds the frames the plugin run must return into. 64 KiB, the
+ * same as the main stack. */
+.global nc_ring3_kstack_bottom, nc_ring3_kstack_top
+nc_ring3_kstack_bottom:
+    .skip 65536
+nc_ring3_kstack_top:

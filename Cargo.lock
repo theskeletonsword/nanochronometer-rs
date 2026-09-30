@@ -2127,7 +2127,7 @@ dependencies = [
 
 [[package]]
 name = "nanochrono-android"
-version = "3.0.0"
+version = "4.0.0"
 dependencies = [
  "libc",
  "nanochrono-bench",
@@ -2136,7 +2136,7 @@ dependencies = [
 
 [[package]]
 name = "nanochrono-bench"
-version = "3.0.0"
+version = "4.0.0"
 dependencies = [
  "nanochrono-core",
  "nanochrono-crypto",
@@ -2144,7 +2144,7 @@ dependencies = [
 
 [[package]]
 name = "nanochrono-cli"
-version = "3.0.0"
+version = "4.0.0"
 dependencies = [
  "clap",
  "ctrlc",
@@ -2156,7 +2156,7 @@ dependencies = [
 
 [[package]]
 name = "nanochrono-core"
-version = "3.0.0"
+version = "4.0.0"
 dependencies = [
  "libc",
  "windows-sys 0.61.2",
@@ -2164,7 +2164,7 @@ dependencies = [
 
 [[package]]
 name = "nanochrono-crypto"
-version = "3.0.0"
+version = "4.0.0"
 dependencies = [
  "ring",
  "rustls",
@@ -2174,7 +2174,7 @@ dependencies = [
 
 [[package]]
 name = "nanochrono-ffi"
-version = "3.0.0"
+version = "4.0.0"
 dependencies = [
  "libloading 0.8.9",
  "nanochrono-core",
@@ -2183,7 +2183,7 @@ dependencies = [
 
 [[package]]
 name = "nanochrono-gui"
-version = "3.0.0"
+version = "4.0.0"
 dependencies = [
  "iced",
  "image",

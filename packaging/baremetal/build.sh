@@ -13,8 +13,21 @@
 #   packaging/baremetal/build.sh run x86_64      # build and boot under QEMU
 #   packaging/baremetal/build.sh test            # the host-side unit tests
 #   packaging/baremetal/build.sh debug [arch]    # -O0 -g + frame pointers
-#   packaging/baremetal/build.sh gdb x86_64 [crashtest=<de|pf|gp|ud|so|df|panic>]
+#   packaging/baremetal/build.sh gdb x86_64 [crashtest=<de|pf|gp|ud|so|df|panic>] [plugin=<name>]
 #                                                # debug build, QEMU stopped for GDB
+#   packaging/baremetal/build.sh boot x86_64 [crashtest=...] [plugin=<name>]
+#                                                # the same, running at once (no GDB wait)
+#
+# NCPLU_EXTRA="a.NCPLU b.NCPLU" adds plugins built elsewhere (the C SDK's, in
+# sdk/) to the ISO's FAT partition beside the in-tree ones.
+#
+# Plugin signing (ML-DSA-87 + P-521; keys from tools/ncplu-sign, kept OUTSIDE
+# the repository):
+#   NCPLU_ROOT_PUBKEYS=KEYDIR/root_pubkeys.bin   the public keys the x86_64
+#                                                kernel trusts (Official tier)
+#   NCPLU_SIGN_KEYS=KEYDIR                       sign every plugin on the ISO
+#   PLUGIN_PROFILE=debug|release                 plugins at -O0 or -O3; by
+#                                                default they follow the kernel
 #
 # The release build (no mode) strips the kernel that goes into the ISO and
 # keeps the symbols in `nanochrono-kernel.sym.elf`, next to it, for
@@ -41,7 +54,9 @@ declare -A arch_target=(
     [riscv32]="riscv32imac-unknown-none-elf"
 )
 declare -A arch_features=(
-    [x86_64]="--features simd"
+    # plugin-verify: the ML-DSA-87 + P-521 check on .ncplu plugins, against
+    # the root keys in NCPLU_ROOT_PUBKEYS (none given: every plugin Community).
+    [x86_64]="--features simd,plugin-verify"
     [i386]="--features simd"
     [aarch64]="--features simd"
     [arm32]="--features simd"
@@ -315,9 +330,10 @@ run_gdb() {
     local accel=()
     accel_for x86_64 max
     local iso="${out_dir}/nanochronometer_x86_64.iso"
-    if [[ -n "${crashtest}" ]]; then
-        iso="${out_dir}/gdb-${crashtest#crashtest=}.iso"
-        build_iso_x86 x86_64 "${iso}" "${crashtest}"
+    local extra="${crashtest}${kernel_extra}"
+    if [[ -n "${extra}" ]]; then
+        iso="${out_dir}/gdb.iso"
+        build_iso_x86 x86_64 "${iso}" "${extra# }"
     fi
     if [[ ! -f "${iso}" ]]; then
         echo "error: no ISO to boot (is grub-mkrescue installed?)" >&2
@@ -330,9 +346,16 @@ run_gdb() {
 
     local log="${out_dir}/qemu-int.log" serial="${out_dir}/serial.log"
     rm -f "${log}" "${serial}" "${out_dir}/CRASH.DMP" "${out_dir}/CRASH-usb.DMP"
-    echo "=== QEMU is stopped at the reset vector, GDB stub on localhost:1234"
-    echo "    in another terminal, from ${repo_root}:"
-    echo "        gdb -x packaging/baremetal/gdb/x86_64.gdb"
+    # `boot`: the same machine, running at once instead of waiting for GDB.
+    local stop=(-s -S)
+    if [[ "${mode}" == "boot" ]]; then
+        stop=()
+        echo "=== booting the -O0 build under QEMU (not waiting for GDB)"
+    else
+        echo "=== QEMU is stopped at the reset vector, GDB stub on localhost:1234"
+        echo "    in another terminal, from ${repo_root}:"
+        echo "        gdb -x packaging/baremetal/gdb/x86_64.gdb"
+    fi
     echo "    booting ${iso##*/} as a USB stick (copy: ${stick##*/})"
     echo "    exceptions and resets: ${log}"
     echo "    serial (and any crash dump): ${serial}"
@@ -347,7 +370,7 @@ run_gdb() {
         -device qemu-xhci,id=xhci \
         -drive "if=none,id=stick,file=${stick},format=raw" \
         -device usb-storage,bus=xhci.0,drive=stick,bootindex=0 \
-        -s -S -no-reboot -d int,cpu_reset -D "${log}" \
+        "${stop[@]}" -no-reboot -d int,cpu_reset -D "${log}" \
         -chardev "stdio,id=com1,logfile=${serial}" -serial chardev:com1 || true
 
     if grep -q "BEGIN NANOCHRONO DUMP" "${serial}" 2>/dev/null; then
@@ -368,28 +391,30 @@ run_gdb() {
 }
 
 mode="build"
-if [[ "${1:-}" == "run" || "${1:-}" == "test" || "${1:-}" == "debug" || "${1:-}" == "gdb" ]]; then
+if [[ "${1:-}" == "run" || "${1:-}" == "test" || "${1:-}" == "debug" || "${1:-}" == "gdb" || "${1:-}" == "boot" ]]; then
     mode="$1"
     shift
 fi
 
 crashtest=""
-if [[ "${mode}" == "debug" || "${mode}" == "gdb" ]]; then
+kernel_extra=""
+if [[ "${mode}" == "debug" || "${mode}" == "gdb" || "${mode}" == "boot" ]]; then
     build_kind="debug"
     # Beside the release output, not over it: a debug kernel is 8 MiB of
     # DWARF and never ships.
     out_dir="${repo_root}/dist/baremetal-debug"
-    if [[ "${mode}" == "gdb" ]]; then
+    if [[ "${mode}" == "gdb" || "${mode}" == "boot" ]]; then
         args=()
         for a in "$@"; do
             case "${a}" in
                 crashtest=*) crashtest="${a}" ;;
+                plugin=*) kernel_extra="${kernel_extra} ${a}" ;;
                 *) args+=("${a}") ;;
             esac
         done
         set -- "${args[@]:-x86_64}"
         if [[ "$*" != "x86_64" ]]; then
-            echo "error: gdb mode supports x86_64 only (packaging/baremetal/gdb/x86_64.gdb)" >&2
+            echo "error: ${mode} mode supports x86_64 only (packaging/baremetal/gdb/x86_64.gdb)" >&2
             exit 1
         fi
     fi
@@ -449,6 +474,87 @@ build_iso_ppc_of() {
 # on real hardware. grub-mkrescue produces a hybrid ISO: an MBR with a boot
 # signature plus El Torito images for both BIOS and UEFI, which is what makes
 # it work with dd, Rufus, Ventoy, YUMI and UNetbootin alike.
+# Builds every plugin under crates/nanochrono-plugins/ at -O0 and packs each
+# into dist/.../plugins/<NAME>.NCPLU, ready to drop onto the crash partition.
+# A plugin is a shared object on the -dylib target; tools/ncplu.py flattens it
+# into the loader's format. GPL plugins (DOOM, a GPL decoder) are built the
+# same way but live outside this repository.
+build_plugins() {
+    local plugins_dir="${repo_root}/crates/nanochrono-plugins"
+    [[ -d "${plugins_dir}" ]] || return 0
+    mkdir -p "${out_dir}/plugins"
+
+    # Debug plugins are -O0 with debug info, to step through under GDB;
+    # release plugins are -O3 (their Cargo.toml's [profile.release]) — the
+    # build a user runs, and the one that gets signed. They follow the
+    # kernel's build unless PLUGIN_PROFILE=debug|release says otherwise, so a
+    # release plugin can be tried on the -O0 kernel.
+    local profile="${PLUGIN_PROFILE:-${build_kind}}"
+    local profile_args=() opt="-O0"
+    if [[ "${profile}" == "release" ]]; then
+        profile_args=(--release)
+        opt="-O3"
+    fi
+
+    local crate name target so out
+    for crate in "${plugins_dir}"/*/; do
+        [[ -f "${crate}Cargo.toml" ]] || continue
+        name="$(basename "${crate}")"
+        echo "=== plugin ${name} (${profile}, ${opt})"
+        # Its own .cargo/config selects the -dylib target and build-std. A
+        # target dir of its own, off the (exFAT) repo, so it neither collides
+        # with the kernel's shared object nor trips the incremental-cache ICE.
+        target="${HOME}/.cache/nanochrono/plugin-${name}"
+        # shellcheck disable=SC2086
+        if ! (cd "${crate}" && CARGO_INCREMENTAL=0 CARGO_TARGET_DIR="${target}" \
+            cargo ${toolchain} build "${profile_args[@]}"); then
+            echo "note: plugin ${name} failed to build; skipping"
+            continue
+        fi
+        so="$(ls "${target}/x86_64-nanochrono-none-dylib/${profile}/"*.so 2>/dev/null | head -1)"
+        if [[ -z "${so}" ]]; then
+            echo "note: no shared object for plugin ${name}; skipping"
+            continue
+        fi
+        out="${out_dir}/plugins/${name^^}.NCPLU"
+        "${repo_root}/tools/ncplu.py" pack "${so}" -o "${out}" >/dev/null
+        echo "    packed ${out##*/} ($(stat -c%s "${out}") bytes)"
+    done
+    # Plugins built outside the tree (sdk/: C plugins), already packed.
+    local extra
+    for extra in ${NCPLU_EXTRA:-}; do
+        if [[ -f "${extra}" ]]; then
+            command cp -f "${extra}" "${out_dir}/plugins/"
+            echo "=== plugin ${extra##*/} (NCPLU_EXTRA)"
+        else
+            echo "note: NCPLU_EXTRA: ${extra} not found; skipping"
+        fi
+    done
+    sign_plugins
+}
+
+# With NCPLU_SIGN_KEYS pointing at a key directory from `ncplu-sign keygen`
+# (outside the repository), every plugin on the ISO is signed with ML-DSA-87
+# and P-521. A kernel built with the matching NCPLU_ROOT_PUBKEYS then loads
+# them as Official. Without it the plugins keep an empty signature block and
+# load as Community. The private keys are only ever read by the host tool.
+sign_plugins() {
+    [[ -n "${NCPLU_SIGN_KEYS:-}" ]] || return 0
+    if [[ ! -f "${NCPLU_SIGN_KEYS}/mldsa.seed" || ! -f "${NCPLU_SIGN_KEYS}/p521.scalar" ]]; then
+        echo "error: NCPLU_SIGN_KEYS=${NCPLU_SIGN_KEYS} holds no ncplu-sign keys" >&2
+        return 1
+    fi
+    local tool_dir="${HOME}/.cache/nanochrono/ncplu-sign"
+    (cd "${repo_root}/tools/ncplu-sign" && CARGO_INCREMENTAL=0 CARGO_TARGET_DIR="${tool_dir}" \
+        cargo build --quiet) || return 1
+    local plug
+    for plug in "${out_dir}/plugins/"*.NCPLU; do
+        [[ -f "${plug}" ]] || continue
+        "${tool_dir}/debug/ncplu-sign" sign "${plug}" --keys "${NCPLU_SIGN_KEYS}" >/dev/null || return 1
+        echo "    signed ${plug##*/} (ML-DSA-87 + P-521)"
+    done
+}
+
 # The crash dump's partition, for the x86_64 ISO: a 4 MiB FAT16 volume
 # labelled NANOCRASH holding a pre-allocated CRASH.DMP. Appended to the hybrid
 # ISO as a GPT partition, it makes a stick written from the ISO with `dd` its
@@ -465,7 +571,10 @@ make_crash_partition() {
         return 1
     fi
     rm -f "${img}"
-    dd if=/dev/zero of="${img}" bs=1M count=4 status=none
+    # 16 MiB: room for CRASH.DMP and a handful of plugins (a -O0 Snake is
+    # ~90 KiB; a packed DOOM is a few hundred). Still a FAT16 with 512-byte
+    # clusters, which the kernel reads.
+    dd if=/dev/zero of="${img}" bs=1M count=16 status=none
     mkfs.vfat -F 16 -s 1 -n NANOCRASH "${img}" >/dev/null
     local files
     files="$(mktemp -d)"
@@ -483,6 +592,13 @@ never allocates space for it. All zeros means nothing has crashed since.
 Read it with:  tools/nanodump.py show CRASH.DMP --elf nanochrono-kernel.sym.elf
 TXT
     MTOOLS_SKIP_CHECK=1 mcopy -i "${img}" "${files}/CRASH.DMP" "${files}/README.TXT" ::/
+    # Every packed plugin, if any were built. mtools writes a proper VFAT long
+    # name for the five-character .NCPLU extension.
+    local plug
+    for plug in "${out_dir}/plugins/"*.NCPLU; do
+        [[ -e "${plug}" ]] || continue
+        MTOOLS_SKIP_CHECK=1 mcopy -i "${img}" "${plug}" "::/${plug##*/}"
+    done
     rm -rf "${files}"
 }
 
@@ -552,6 +668,7 @@ CFG
     # which is where the kernel looks when it sees the protective entry.
     local xorriso_args=()
     if [[ "${arch}" == "x86_64" ]]; then
+        build_plugins
         local fat="${staging}.crashfat.img"
         if make_crash_partition "${fat}"; then
             xorriso_args=(-- -append_partition 3 0x0e "${fat}"
@@ -730,7 +847,7 @@ if [[ "${mode}" == "run" ]]; then
     exit 0
 fi
 
-if [[ "${mode}" == "gdb" ]]; then
+if [[ "${mode}" == "gdb" || "${mode}" == "boot" ]]; then
     run_gdb
     exit 0
 fi

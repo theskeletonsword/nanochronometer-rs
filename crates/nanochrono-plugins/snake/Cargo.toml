@@ -1,0 +1,25 @@
+[package]
+name = "nanochrono-plugin-snake"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Snake, as a NanoChronometer .ncplu plugin. An original, not a port."
+
+[lib]
+# A shared object (ET_DYN) is what tools/ncplu.py packs into a .ncplu: the
+# loader wants position-independent code with only dynamic relocations.
+crate-type = ["cdylib"]
+
+# Debug: -O0 with debug info, to step through under GDB. Release: -O3 — the
+# build a user gets, and the one that is signed. No unwinder on bare metal.
+[profile.dev]
+opt-level = 0
+debug = true
+panic = "abort"
+
+[profile.release]
+opt-level = 3
+debug = false
+lto = true
+codegen-units = 1
+panic = "abort"

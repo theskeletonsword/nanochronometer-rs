@@ -1,0 +1,18 @@
+[package]
+name = "ncplu-sign"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Generates the developer keys and signs .ncplu plugins (host tool)."
+
+[[bin]]
+name = "ncplu-sign"
+path = "src/main.rs"
+
+[dependencies]
+ml-dsa = "0.1"
+p521 = { version = "0.14", features = ["ecdsa", "arithmetic"] }
+signature = "3"
+sha2 = "0.11"
+hybrid-array = "0.4"
+getrandom = "0.2"

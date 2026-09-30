@@ -1196,6 +1196,9 @@ pub unsafe fn run(fb: &Framebuffer, memory: Memory) -> ! {
     // SAFETY: as above.
     let mut machine = unsafe { Machine::probe() };
     machine.memory = memory;
+    // From here on every jitter measurement NC_RNG takes also carries a PMU
+    // cycle-count difference, where the machine has a PMU to read.
+    crate::rng::attach_pmu(&machine.pmu);
 
     progress::enter(Phase::Interface);
 
@@ -1254,6 +1257,32 @@ pub unsafe fn run(fb: &Framebuffer, memory: Memory) -> ! {
         // stick already handed over, so the forced dump reaches it too.
         // SAFETY: CPL 0, the IDT is installed; faulting is the point.
         unsafe { crate::crashdump::fire_pending_crashtest() };
+
+        // `plugin=<name>` on the command line: load <NAME>.ncplu from the boot
+        // medium's FAT partition and run it, then repaint the interface it
+        // drew over. The launch path used from the APPS panel (phase 3) is the
+        // same call.
+        if let Some((name, len)) = crate::ncplu::take_pending_plugin() {
+            let name = core::str::from_utf8(&name[..len]).unwrap_or("");
+            // SAFETY: ring 0; the controller enumerated a stick at boot.
+            match unsafe { input.load_plugin_image(name) } {
+                Some(n) => {
+                    // SAFETY: ring 0; `fb` and `input` outlive the call.
+                    unsafe { crate::ncplu::run_loaded(name, n, fb, &mut input, &machine.pmu, clock.calibration.hz) };
+                }
+                None => crate::println!("plugin: {name} not found on the boot medium"),
+            }
+            // Repaint the chrome the plugin cleared; the loop redraws content.
+            fb.clear(p.background);
+            header(fb, &p, &layout, &mut ui, &machine);
+            tab_bar(fb, &p, &layout, &mut ui);
+            hint_bar(fb, &p, &layout, &mut ui, clock.elapsed_ns());
+            status_frame(fb, &p, &layout);
+            ui.cards_dirty = true;
+            ui.bench_dirty = true;
+            fb.present(0, 0, fb.width, fb.height);
+            fb.discard_damage();
+        }
     }
 
     // If a stack came up short, open on the panel that says which. The
@@ -1321,6 +1350,9 @@ pub unsafe fn run(fb: &Framebuffer, memory: Memory) -> ! {
         // overran does not leave the loop trying to catch up with a burst of
         // frames it cannot draw either.
         next_frame = now_ns + FRAME_NS;
+        // A frame's start lands wherever the previous one's work and the
+        // pacing wait left it: uncredited, but not predictable to the tick.
+        crate::rng::stir(nanochrono_core::rng::EVENT_FRAME, now_ns);
 
         // --- the space-mode scrub: once a second in Normal mode, never inside
         // a measurement (every counter read above has already happened).
@@ -1448,10 +1480,12 @@ unsafe fn handle(
         ui.refresh_cards();
     }
 
-    // Every event's arrival time goes into the confirmation's pool: the
-    // nanosecond a human or a USB poll lands on is not something a script
-    // typing blind can choose.
-    ui.power.stir(crate::arch::counter_ordered() ^ hw_entropy());
+    // Every event's arrival time goes into NC_RNG and into the
+    // confirmation's pool: the nanosecond a human or a USB poll lands on is
+    // not something a script typing blind can choose.
+    let (tag, value) = rng_event(&event);
+    crate::rng::stir(tag, value);
+    ui.power.stir(crate::arch::counter_ordered() ^ value);
     let now_ns = clock.elapsed_ns();
 
     // While a code is on screen every key belongs to it: digits answer, Esc
@@ -1939,91 +1973,34 @@ fn digit_of(scancode: u8) -> Option<u8> {
     }
 }
 
-/// Bits from every independent source this CPU has, folded together.
+/// Entropy for the confirmation codes, from NC_RNG.
 ///
-/// No single generator is trusted. RDRAND is a DRBG whose design cannot be
-/// audited from here; RDSEED taps the noise source before that DRBG; the
-/// counter's jitter across a short busy loop depends on the cache, the bus
-/// and SMM, none of which the instruction set controls. The confirmation's
-/// pool folds this through a non-linear mix, so a source that is broken — or
-/// hostile, and trying to cancel the others — cannot undo them without
-/// knowing the pool, which it never sees.
+/// No single generator is trusted: the pool behind this mixes the timer's
+/// jitter, RDSEED and RDRAND, the PMU and every input event, and its output
+/// stage is AES-256-CTR or ChaCha20 keyed from XDRBG-256 (see `crate::rng`).
+/// If the pool is out of service the counter's jitter still spreads the
+/// codes — they guard against a script, not a cryptanalyst.
 fn hw_entropy() -> u64 {
-    // Off x86 there is no RDRAND/RDSEED to consult (ARMv8.5's RNDR is
-    // optional and absent on the parts this runs on); the counter's jitter
-    // is the source, alongside the event timings already stirred in.
-    #[cfg(not(x86_any))]
-    {
-        counter_jitter()
+    let mut bytes = [0u8; 8];
+    match crate::rng::fill(&mut bytes, nanochrono_core::rng::Mode::Fast) {
+        Ok(_) => u64::from_le_bytes(bytes),
+        Err(_) => counter_jitter(),
     }
-    #[cfg(x86_any)]
-    hw_entropy_x86()
 }
 
-/// x86: jitter, RDRAND and RDSEED, folded.
-#[cfg(x86_any)]
-fn hw_entropy_x86() -> u64 {
-    let leaf1 = crate::arch::x86::cpuid(1, 0);
-    // Leaf 7 reads as zeros where it is not implemented.
-    let leaf7 = crate::arch::x86::cpuid(7, 0);
-    let mut acc = counter_jitter();
-    if leaf1[2] & (1 << 30) != 0 {
-        // SAFETY: CPUID said RDRAND exists.
-        acc = acc.rotate_left(21) ^ unsafe { rdrand() };
+/// The tag and value an input event is stirred into NC_RNG with.
+fn rng_event(event: &Event) -> (u64, u64) {
+    use nanochrono_core::rng::{EVENT_KEY, EVENT_POINTER};
+    match *event {
+        Event::Key(k) => (EVENT_KEY, k.scancode as u64 | (k.pressed as u64) << 8),
+        Event::Motion(m) => (
+            EVENT_POINTER,
+            (m.dx as u32 as u64) | (m.dy as u32 as u64) << 32 ^ (m.wheel as u32 as u64).rotate_left(16)
+                ^ (m.left as u64) << 61
+                ^ (m.right as u64) << 62
+                ^ (m.middle as u64) << 63,
+        ),
     }
-    if leaf7[1] & (1 << 18) != 0 {
-        // SAFETY: CPUID said RDSEED exists.
-        acc = acc.rotate_left(21) ^ unsafe { rdseed() };
-    }
-    acc
-}
-
-#[cfg(x86_any)]
-/// RDRAND, or 0 if it reported failure (CF clear).
-///
-/// # Safety
-/// The CPU must implement RDRAND.
-unsafe fn rdrand() -> u64 {
-    // One register's worth per read: 64 bits on x86_64, 32 on i386, where
-    // two reads fill the word.
-    let mut acc = 0u64;
-    for _ in 0..(8 / core::mem::size_of::<usize>()) {
-        let (value, ok): (usize, u8);
-        // SAFETY: the caller checked CPUID; it only writes the named registers.
-        unsafe {
-            core::arch::asm!("rdrand {v}", "setc {ok}", v = out(reg) value, ok = out(reg_byte) ok,
-                options(nomem, nostack));
-        }
-        if ok == 0 {
-            return 0;
-        }
-        acc = acc.rotate_left(32) ^ value as u64;
-    }
-    acc
-}
-
-#[cfg(x86_any)]
-/// RDSEED, or 0 if the noise source had nothing ready (CF clear).
-///
-/// # Safety
-/// The CPU must implement RDSEED.
-unsafe fn rdseed() -> u64 {
-    // One register's worth per read: 64 bits on x86_64, 32 on i386, where
-    // two reads fill the word.
-    let mut acc = 0u64;
-    for _ in 0..(8 / core::mem::size_of::<usize>()) {
-        let (value, ok): (usize, u8);
-        // SAFETY: the caller checked CPUID; it only writes the named registers.
-        unsafe {
-            core::arch::asm!("rdseed {v}", "setc {ok}", v = out(reg) value, ok = out(reg_byte) ok,
-                options(nomem, nostack));
-        }
-        if ok == 0 {
-            return 0;
-        }
-        acc = acc.rotate_left(32) ^ value as u64;
-    }
-    acc
 }
 
 /// The low bits of how long each of a few tiny intervals took, packed.

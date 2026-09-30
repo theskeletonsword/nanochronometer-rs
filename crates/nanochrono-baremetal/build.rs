@@ -10,6 +10,7 @@
 fn main() {
     // Every architecture, before the x86-only assembly below returns early.
     logo_assets();
+    root_keys();
 
     // Matched on what the target *is*, not what it is called: there are two
     // x86 bare-metal targets here — the stable `x86_64-unknown-none` and the
@@ -142,3 +143,66 @@ fn logo_assets() {
         std::fs::write(out.join(format!("logo_{h}.rgba")), bytes).expect("writing the logo");
     }
 }
+
+/// Embeds the plugin-signature root **public** keys. Two roots, both read
+/// from files outside the repository: the creator's (✅), named by
+/// `NCPLU_ROOT_CREATOR`, and the machine owner's local tree root (🌳), named
+/// by `NCPLU_ROOT_TREE`. `NCPLU_ROOT_PUBKEYS` is accepted as an older name
+/// for the creator root. Private keys never appear here or in the tree; the
+/// signer holds them (see tools/ncplu-sign).
+///
+/// Each file is `b"NCROOT01"` then the 2592-byte ML-DSA-87 verifying key then
+/// the 133-byte P-521 SEC1 public key. A root that is absent or malformed is
+/// simply not embedded; a plugin it would have vouched for then loads without
+/// that badge — a safe default, never a hardcoded key.
+fn root_keys() {
+    let out = std::path::PathBuf::from(std::env::var("OUT_DIR").unwrap());
+
+    const MAGIC: &[u8; 8] = b"NCROOT01";
+    const MLDSA: usize = 2592;
+    const P521: usize = 133;
+
+    // Embeds one named root under `prefix`, returning whether it was present.
+    let embed = |vars: &[&str], prefix: &str| -> bool {
+        for var in vars {
+            println!("cargo:rerun-if-env-changed={var}");
+        }
+        let path = vars.iter().find_map(std::env::var_os);
+        let Some(path) = path else { return false };
+        println!("cargo:rerun-if-changed={}", path.to_string_lossy());
+        let data = match std::fs::read(&path) {
+            Ok(d) => d,
+            Err(e) => {
+                println!("cargo:warning={prefix} root {path:?}: {e}; not embedded");
+                return false;
+            }
+        };
+        if data.len() != MAGIC.len() + MLDSA + P521 || &data[..8] != MAGIC {
+            println!("cargo:warning={prefix} root {path:?} is not a root-key file; not embedded");
+            return false;
+        }
+        std::fs::write(out.join(format!("{prefix}_mldsa.bin")), &data[8..8 + MLDSA]).unwrap();
+        std::fs::write(out.join(format!("{prefix}_p521.bin")), &data[8 + MLDSA..]).unwrap();
+        true
+    };
+
+    let creator = embed(&["NCPLU_ROOT_CREATOR", "NCPLU_ROOT_PUBKEYS"], "creator");
+    let tree = embed(&["NCPLU_ROOT_TREE"], "tree");
+
+    let one = |present: bool, prefix: &str, name: &str, n: usize| {
+        if present {
+            format!(
+                "pub const {name}: Option<&[u8; {n}]> = Some(include_bytes!(concat!(env!(\"OUT_DIR\"), \"/{prefix}.bin\")));\n"
+            )
+        } else {
+            format!("pub const {name}: Option<&[u8; {n}]> = None;\n")
+        }
+    };
+    let mut body = String::new();
+    body += &one(creator, "creator_mldsa", "CREATOR_MLDSA", MLDSA);
+    body += &one(creator, "creator_p521", "CREATOR_P521", P521);
+    body += &one(tree, "tree_mldsa", "TREE_MLDSA", MLDSA);
+    body += &one(tree, "tree_p521", "TREE_P521", P521);
+    std::fs::write(out.join("ncplu_root_keys.rs"), body).unwrap();
+}
+

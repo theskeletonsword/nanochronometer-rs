@@ -1,8 +1,8 @@
 [package]
 name = "nanochrono-baremetal"
-version = "3.0.0"
+version = "4.0.0"
 edition = "2021"
-rust-version = "1.85"
+rust-version = "1.89"
 license = "Apache-2.0"
 repository = "https://github.com/nanochronometer/nanochronometer"
 description = "Freestanding NanoChronometer: counters and PMU with no operating system underneath"
@@ -19,6 +19,10 @@ crypto = ["dep:sha2", "dep:hmac", "dep:aes-gcm", "dep:chacha20poly1305", "dep:cp
 # Test-only: skip the 8042 so the USB stack is exercised on a machine
 # whose emulated PS/2 controller always answers. Not for release.
 force-usb = []
+# Hybrid signature verification for .ncplu plugins: ML-DSA-87 (FIPS 204) +
+# P-521 ECDSA, both no_std and allocation-free. Off => every plugin loads as
+# "community" (the loader still runs). The shipped x86_64 ISO turns it on.
+plugin-verify = ["dep:ml-dsa", "dep:p521", "dep:sha512"]
 
 [dependencies]
 # The same crate the hosted build uses, with the OS-dependent half switched
@@ -32,6 +36,12 @@ sha2 = { version = "0.10", default-features = false, optional = true }
 hmac = { version = "0.12", default-features = false, optional = true }
 aes-gcm = { version = "0.10", default-features = false, features = ["aes"], optional = true }
 chacha20poly1305 = { version = "0.10", default-features = false, optional = true }
+# Plugin signature verification (feature `plugin-verify`). Verify-only, so no
+# RNG and no allocator; confirmed to build on the freestanding target. Named
+# `sha512` to coexist with the 0.10 `sha2` the benchmark uses.
+ml-dsa = { version = "0.1", default-features = false, optional = true }
+p521 = { version = "0.14", default-features = false, features = ["ecdsa"], optional = true }
+sha512 = { package = "sha2", version = "0.11", default-features = false, optional = true }
 # Asked directly, with the crates' own feature tokens, so the benchmark says
 # which path they took. Only where the crates use it (x86, AArch64).
 [target.'cfg(any(target_arch = "x86_64", target_arch = "x86", target_arch = "aarch64"))'.dependencies]

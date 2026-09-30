@@ -14,20 +14,23 @@ members = [
 # `main`, and links through its own script. `cargo build --workspace` would try
 # to build it for the host and fail, so it is its own root and is built by
 # packaging/baremetal/build.sh.
-exclude = ["crates/nanochrono-baremetal"]
+exclude = ["crates/nanochrono-baremetal", "crates/nanochrono-plugins", "tools/ncplu-sign"]
 
 [workspace.package]
-version = "3.0.0"
+version = "4.0.0"
 edition = "2021"
-rust-version = "1.85"
+# 1.89: the AVX-512 target features and intrinsics (the AVX-512 probes, and
+# NC_RNG's VAES-512 output path) were stabilised there; nothing older builds
+# the workspace.
+rust-version = "1.89"
 license = "Apache-2.0"
 repository = "https://github.com/nanochronometer/nanochronometer"
 description = "Nanosecond-resolution chronometer, clock and ISA microbenchmark toolkit"
 
 [workspace.dependencies]
-nanochrono-core = { path = "crates/nanochrono-core", version = "3.0.0" }
-nanochrono-crypto = { path = "crates/nanochrono-crypto", version = "3.0.0" }
-nanochrono-bench = { path = "crates/nanochrono-bench", version = "3.0.0" }
+nanochrono-core = { path = "crates/nanochrono-core", version = "4.0.0" }
+nanochrono-crypto = { path = "crates/nanochrono-crypto", version = "4.0.0" }
+nanochrono-bench = { path = "crates/nanochrono-bench", version = "4.0.0" }
 
 # Two optimised profiles.
 #

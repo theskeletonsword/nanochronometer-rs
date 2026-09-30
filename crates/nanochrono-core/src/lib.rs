@@ -83,6 +83,11 @@ pub mod hypercall_hal;
 /// The microbenchmark kernels per ISA family. `no_std`; shared by the
 /// hosted dispatcher and the freestanding benchmark tab.
 pub mod kernels;
+/// The `.ncplu` plugin format and its validating parser.
+///
+/// `no_std` and pure: the freestanding kernel parses untrusted plugins with
+/// it, and the hosted test build fuzzes it — the same code on the same bytes.
+pub mod ncplu;
 pub mod pmu_leaf;
 /// The typed code a restart or power-off waits for (BadUSB defence).
 ///
@@ -90,6 +95,12 @@ pub mod pmu_leaf;
 pub mod power_confirm;
 pub mod redundancy;
 pub mod reprobe;
+/// NC_RNG: the entropy pool — timing jitter, `RDSEED`/`RDRAND`, event
+/// timings and a PMU side counter, conditioned into XDRBG-256.
+///
+/// `no_std` and allocation-free: the caller lends the memory region, so the
+/// freestanding kernel, a plugin host and the hosted library share it.
+pub mod rng;
 /// When to scrub protected state, and when to escalate to verified reads.
 ///
 /// `no_std` and pure: the caller supplies the clock and the outcomes.

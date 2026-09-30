@@ -60,7 +60,124 @@ pub unsafe fn run() {
     #[cfg(x86_any)]
     progress::leave(Phase::Hypervisor);
 
+    report_rng();
     report_integrity();
+}
+
+/// NC_RNG: starts the pool — known answers, sources, the timer's start-up
+/// test, the first seed — and shows what it found and a first read.
+///
+/// Started here rather than on first use so the ~2000 timed measurements a
+/// first seed takes happen during boot, not under the first key press.
+fn report_rng() {
+    use nanochrono_core::rng::{self, Mode};
+
+    println!("== NC_RNG entropy pool ==");
+    let t0 = arch::counter_ordered();
+    let started = crate::rng::start();
+    let ticks = arch::counter_ordered().wrapping_sub(t0);
+    let s = crate::rng::status();
+
+    match started {
+        Ok(()) => println!("  start-up       : ok, {} counter ticks", ticks),
+        Err(e) => println!("  start-up       : FAILED: {} (code {})", e.name(), e.code()),
+    }
+    // Only what actually ran: the AES known answers run only where the CPU
+    // has an AES path to test.
+    let aes_tested = (s.engine != 0 && s.engine != rng::Engine::ChaCha20 as u32)
+        || s.flags & rng::FLAG_ENGINE_FALLBACK != 0;
+    println!(
+        "  known answers  : {}{}",
+        if s.flags & rng::FLAG_SELFTEST_PASSED != 0 {
+            "pass (SHA3-256, SHAKE256, XDRBG-256, ChaCha20"
+        } else {
+            "FAIL (SHA3-256, SHAKE256, XDRBG-256, ChaCha20"
+        },
+        if aes_tested { ", AES-256)" } else { ")" }
+    );
+    println!(
+        "  output engine  : {}{}",
+        crate::rng::engine_name(),
+        if s.flags & rng::FLAG_ENGINE_FALLBACK != 0 {
+            " (the CPU's AES path failed its known answers)"
+        } else {
+            ""
+        }
+    );
+    // The register state the AES paths stand on, read back rather than
+    // assumed: CR4.OSFXSR (9) and OSXMMEXCPT (10) for any XMM instruction —
+    // AES-NI included — and OSXSAVE (18) plus XCR0's YMM/ZMM components for
+    // VAES. boot32.S / boot_i386.S set them before any Rust runs.
+    #[cfg(x86_any)]
+    {
+        let cr4: usize;
+        // SAFETY: reading CR4 at CPL 0 has no side effects.
+        unsafe { core::arch::asm!("mov {}, cr4", out(reg) cr4, options(nomem, nostack, preserves_flags)) };
+        let bit = |b: usize| if cr4 & (1 << b) != 0 { "on" } else { "OFF" };
+        println!(
+            "  cr4 / xcr0     : osfxsr(9) {} osxmmexcpt(10) {} osxsave(18) {}, xcr0 {:#x}",
+            bit(9),
+            bit(10),
+            bit(18),
+            nanochrono_core::arch::x86::xcr0_safe()
+        );
+    }
+    print_sources("  sources here   :", s.available);
+    print_sources("  first seed     :", s.sources);
+    println!(
+        "  jitter         : granularity {}, OSR {}, start-up stuck {}.{}%",
+        s.granularity,
+        s.osr,
+        s.startup_stuck_permille / 10,
+        s.startup_stuck_permille % 10
+    );
+    println!(
+        "  counters       : {} reseed(s), {} samples ({} stuck), {} hw words, {} events",
+        s.reseeds, s.jitter_samples, s.jitter_stuck, s.hw_words, s.events
+    );
+
+    let mut sample = [0u8; 16];
+    match crate::rng::fill(&mut sample, Mode::Fast) {
+        Ok(_) => {
+            crate::serial::_print(format_args!("  sample         : "));
+            for b in sample {
+                crate::serial::_print(format_args!("{:02x}", b));
+            }
+            println!();
+        }
+        Err(e) => println!("  sample         : refused: {} (code {})", e.name(), e.code()),
+    }
+    let s = crate::rng::status();
+    println!(
+        "  state          : {}{}{}, nonces used {}",
+        if s.flags & rng::FLAG_READY != 0 { "ready" } else { "not ready" },
+        if s.flags & rng::FLAG_DEGRADED != 0 { ", degraded (no jitter credit)" } else { "" },
+        if s.flags & rng::FLAG_FAILED != 0 { ", OUT OF SERVICE" } else { "" },
+        s.nonces
+    );
+    println!();
+}
+
+/// A `SOURCE_*` bitmask, by name.
+fn print_sources(label: &str, bits: u32) {
+    use nanochrono_core::rng::*;
+    crate::serial::_print(format_args!("{}", label));
+    for (bit, name) in [
+        (SOURCE_JITTER, "jitter"),
+        (SOURCE_RDSEED, "rdseed"),
+        (SOURCE_RDRAND, "rdrand"),
+        (SOURCE_PMU, "pmu"),
+        (SOURCE_EVENTS, "events"),
+        (SOURCE_EXTERNAL, "external"),
+    ] {
+        if bits & bit != 0 {
+            crate::serial::_print(format_args!(" {}", name));
+        }
+    }
+    if bits == 0 {
+        crate::serial::_print(format_args!(" none"));
+    }
+    println!();
 }
 
 /// What USB host controllers this machine has.
@@ -656,10 +773,16 @@ fn report_simd() {
     println!("== SIMD (state enabled by the boot stub) ==");
 
     // Stack buffers: there is no allocator. 64 bytes covers every family up
-    // to AVX-512's 64-byte vectors.
-    let mut a = [0x5Au8; 64];
-    let mut b = [0xA5u8; 64];
-    let mut out = [0u8; 64];
+    // to AVX-512's 64-byte vectors — and 64-byte *alignment* covers the
+    // legacy SSE forms, whose memory operands must be 16-byte aligned
+    // (`xorps xmm0, [mem]` is #GP otherwise). Bare `[u8; 64]` arrays have
+    // alignment 1; on i386 they landed misaligned and the SSE probe's #GP
+    // became a triple fault at boot.
+    #[repr(C, align(64))]
+    struct Vector([u8; 64]);
+    let mut a = Vector([0x5A; 64]);
+    let mut b = Vector([0xA5; 64]);
+    let mut out = Vector([0; 64]);
 
     let mut ran = 0;
     for family in SimdFamily::ALL.iter().copied() {
@@ -667,9 +790,9 @@ fn report_simd() {
             continue;
         }
         let buffers = ProbeBuffers {
-            a: &mut a,
-            b: &mut b,
-            out: &mut out,
+            a: &mut a.0,
+            b: &mut b.0,
+            out: &mut out.0,
         };
         match simd::probe(family, ProbeKind::VectorXor, Some(buffers), 1) {
             Some(r) => {

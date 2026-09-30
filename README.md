@@ -312,7 +312,7 @@ Supplying both register sets is only possible from a hosted test.
 
 ```console
 $ ./packaging/baremetal/build.sh run aarch64
-NanoChronometer 3.0.0 — freestanding
+NanoChronometer 4.0.0 — freestanding
 arch: arm64
 
 == CPU ==
@@ -414,6 +414,125 @@ fault on purpose, to check a machine end to end. `build.sh gdb` boots the
 `-O0` build as a USB stick under QEMU, stopped for
 `gdb -x packaging/baremetal/gdb/x86_64.gdb`. See
 [docs/CRASH_DUMPS.md](docs/CRASH_DUMPS.md).
+
+#### Plugins (`.ncplu`)
+
+The x86-64 kernel loads plugins — games, tools, anything that draws on the
+screen — from the boot stick's FAT partition at run time. A plugin is a
+`.ncplu` file: a position-independent `cdylib` packed by `tools/ncplu.py`
+into sections, relocations and a symbol table, loaded into a fixed 1 MiB
+arena with no allocator and no dynamic linker. It reaches the kernel through
+a table of function pointers (`NcApi`) handed to its entry point, and can
+import kernel data symbols by name (`nc_resolve_symbol`).
+
+| Services | What |
+|---|---|
+| screen, input, log | `fill_rect`, `clear`, `present`, `poll_event`, `log` |
+| NC_TIMER | serialised counter reads (`LFENCE; RDTSC` / `RDTSCP; LFENCE`), frequency, ticks to ns |
+| NC_PMU | cycles and retired instructions, `perf_event_open`-style open/read/close |
+| NC_RNG | `rng_fill`, `rng_status`, `rng_stir`: the entropy pool below |
+
+##### Trust tiers and badges
+
+Every plugin carries a reserved **ML-DSA-87 + P-521** signature block over the
+SHA-512 digest of its image (a hybrid so a break in either the post-quantum or
+the classical scheme alone is not enough). `tools/ncplu-sign` makes the keys
+and signs; the private keys live outside the repository, and the kernel embeds
+only the public halves. There are two trusted roots, and three tiers:
+
+| Tier | Badge | When | Runs in |
+|---|---|---|---|
+| Creator | ✅ | signed by the creator's root (`NCPLU_ROOT_CREATOR`) | the kernel |
+| Trusted root | 🌳 | signed by a root the machine's owner trusts (`NCPLU_ROOT_TREE`) | the kernel |
+| Community | *(none)* | unsigned, or signed by no trusted root | ring 3 (user mode, isolated) |
+
+The kernel checks the header digest first — a file changed after packing is
+**refused**, at every tier — then both signatures against each root. The
+launch card shows the tier, the signature, the file's SHA-512 and the root
+fingerprints before the plugin runs; a community plugin waits five seconds in
+which Esc cancels it. Verifying ML-DSA-87 needs about 768 KiB of stack, far
+past the kernel's 64 KiB, so it runs on a dedicated guarded stack.
+
+```sh
+# One key directory is the creator's; another (per machine) is the tree root.
+tools/ncplu-sign/... keygen --out ~/keys/creator     # ML-DSA-87 + P-521, prints a fingerprint
+make -C sdk gdb PLUGIN=rng_demo KEYS=~/keys/creator   # signs, trusts that root, boots ✅
+packaging/baremetal/build.sh gdb x86_64 plugin=snake  # unsigned → community, ring 3
+```
+
+##### A malformed `.ncplu` cannot reach the kernel
+
+A plugin is untrusted input from a USB stick, and a community plugin runs
+unsigned. The loader treats every byte as hostile:
+
+* The format is validated **completely before anything is copied**, by a pure
+  parser ([`nanochrono_core::ncplu`](crates/nanochrono-core/src/ncplu.rs))
+  with no indexing that can panic: total size, the signature block, every
+  table and section bound, section overlap and alignment, each relocation's
+  8-byte write landing inside a non-code section, and the entry inside the
+  code. The hosted build fuzzes it with tens of thousands of corrupted images
+  under overflow checks; none escapes and none panics.
+* The copy and relocations index the arena only through checked slices, so no
+  file value can drive a write outside it.
+* A running plugin gets its **own stack between two guard pages**; overflowing
+  it faults instead of reaching kernel memory.
+* Every buffer a plugin hands a kernel service (`nc_rng_fill`, `nc_log`, …)
+  is checked to lie in the plugin's own arena or stack — the kernel never
+  reads or writes where a plugin merely points it.
+* A fault in a plugin — bad opcode, null write, stack overflow — is **caught
+  and the plugin abandoned**; the kernel returns to the interface instead of
+  triple-faulting. A fault in kernel code still crashes honestly.
+
+##### A community plugin runs at ring 3
+
+A community plugin is untrusted, so it does not run with the kernel's
+privilege. It runs at **ring 3** (CPL 3), with hardware between it and the
+kernel:
+
+* Its arena and a user stack are the only pages mapped user-accessible (the
+  user bit set on their own 2 MiB pages); every kernel page has that bit clear
+  at the leaf, so a ring-3 read or write into kernel memory **faults** — a
+  plugin cannot even read the kernel image. The fault is delivered to the
+  kernel, which ends the plugin.
+* It reaches kernel services only through `nccall` (`SYSCALL`), the sole door
+  from ring 3 to ring 0. The same `NcApi` table is built in the plugin's user
+  memory, its function pointers aimed at stubs that each issue one `nccall`, so
+  one plugin binary runs at either privilege unchanged — only its signature
+  decides which. Every pointer a call carries is still checked to be the
+  plugin's own before the kernel follows it.
+* A creator (✅) or trusted-root (🌳) plugin has been vouched for, so it runs
+  in the kernel (ring 0), called directly — the tier is the privilege boundary.
+
+The GDT carries the ring-3 code and data segments and a TSS whose RSP0 is a
+kernel stack for ring-3 traps (boot32.S); `crate::ring3` arms SYSCALL/SYSRET,
+maps the user pages, and owns the entry, the `nccall` dispatcher and the
+fault path.
+
+##### Capabilities: least privilege per plugin
+
+A plugin declares which service groups it needs — `screen`, `input`, `log`,
+`timer`, `pmu`, `rng` — in its header (`tools/ncplu.py pack --caps ...`), and
+the kernel grants no more. The launch card shows the granted set. A community
+(ring-3) plugin that calls past what it declared is **stopped**; a kernel-tier
+plugin's ungranted calls are refused (the service is a no-op), so even a
+trusted plugin is held to what it asked for. So a plugin — or a bug or an
+exploit inside one — is confined to the surface it declared, not the whole
+`NcApi`.
+
+The wall is also a licence boundary: Apache-2.0 plugins (Snake) live in
+`crates/nanochrono-plugins/`; GPL programs such as DOOM are only ever loaded
+from the user's own stick, never built into this tree.
+
+Plugins can be written in C. [`sdk/`](sdk) has the ABI header
+(`include/ncplu.h`, layout pinned by static asserts on both sides), the
+freestanding runtime the compiler expects (`memcpy` & co.), an example that
+uses NC_RNG and NC_TIMER, and a Makefile with the exact clang/lld flags —
+`--target=x86_64-unknown-none-elf -ffreestanding -fPIC -fvisibility=hidden
+-mno-red-zone`, linked `-shared` for the packer:
+
+```sh
+make -C sdk run PLUGIN=rng_demo   # C plugin + -O0 kernel + ISO, booted under QEMU
+```
 
 ### Linux on other architectures
 
@@ -1020,6 +1139,86 @@ total=85.724 ms (TLS is 12.0% of it)
 
 ---
 
+## NC_RNG — the entropy pool
+
+[`nanochrono_core::rng`](crates/nanochrono-core/src/rng) is one pool for
+everything that needs unpredictable bytes: the freestanding kernel, its
+`.ncplu` plugins, and — through `libnanochrono` — any program, including an
+operating system built on these libraries. `no_std`, allocation-free (the
+caller lends the memory it walks), the same code on all nine kernel
+architectures and the hosted builds.
+
+No single generator is trusted. Every source is absorbed into one Keccak
+sponge; a broken or hostile source cannot cancel the others without knowing
+them, and never sees them:
+
+| Source | Credited |
+|---|---|
+| CPU timing jitter | 1/OSR bit per healthy sample — the primary source |
+| `RDSEED` | ½ bit per bit, only if the timer fails its start-up test |
+| OS generator (`/dev/urandom`, hosted) | only if the timer fails |
+| `RDRAND`, PMU cycle counts, events (keys, mouse, USB and storage transfers, frames) | never — additional input |
+
+The jitter source follows the entropy manual the project uses as its
+specification: a memory walk with stride 127 over a power-of-two region
+(256 KiB by default) plus a hash loop, timed with the unserialised counter;
+the triple-derivative stuck test; granularity learned by GCD; start-up with
+100 + 1024 measurements (≤ 3 backward steps, < 90 % stuck); SP 800-90B
+repetition-count, adaptive-proportion and lag-predictor tests at the
+manual's cutoffs (the permanent lag cutoffs, which it does not tabulate, were
+derived with the same formulas after reproducing its intermittent tables
+exactly). A seed is `(256 + 65)·OSR` healthy samples — 963 at the default
+OSR 3. An intermittent failure discards the block, raises the OSR and
+re-validates; past OSR 20, or on a permanent failure, the pool stops and
+every read fails. Never a partial buffer.
+
+```
+sources ──► Keccak-f[1600] sponge ──► XDRBG-256 ──► key ──► output stage ──► bytes
+            (rate 136)                (seed, reseed,          VAES-512 │ VAES-256 │ AES-NI │ ARMv8 AES
+                                       generate)              └──► ChaCha20 (software)
+```
+
+**The output stage is chosen at run time**, by CPUID and XCR0 on x86 and the
+ID registers (or the OS) on ARM: AES-256-CTR with VAES on ZMM (four blocks per
+instruction), VAES on YMM (parts with VAES but no AVX-512 — Alder Lake,
+Raptor Lake, Zen 3), AES-NI on XMM, or the ARMv8 AES instructions; without
+AES hardware — or by choice — ChaCha20 in portable 32-bit software. There is
+no table-driven AES, and the key schedule runs on the AES instructions too.
+Each engine passes its known-answer test before it is used; a hardware path
+that fails is replaced by ChaCha20 and flagged. On x86 those paths stand on
+CR4.OSFXSR (bit 9), OSXMMEXCPT (10) and OSXSAVE (18) plus XCR0, which the
+boot stubs set before any Rust runs; the boot self-test reads them back.
+
+**No nonce is ever reused.** The stage is fast-key-erasure: every request
+takes the next value of a 64-bit counter that nothing resets — not a rekey,
+not a reseed — and the first keystream block(s) become the next key, which is
+never handed out. A key serves one request (at most 4 KiB) and is erased
+before the caller sees the output. `NC_RNG_TRUE` bypasses the stage and
+reseeds before every 32 bytes, for long-term keys.
+
+```c
+#include "nanochrono.h"            /* the same calls exist in the kernel for plugins */
+
+uint8_t key[32];
+if (nc_rng_fill(key, sizeof key, NC_RNG_TRUE) != sizeof key) { /* NC_RNG_E* */ }
+nc_rng_stir(NC_RNG_EVENT_USER, my_event);    /* mix in your own timings */
+
+nc_rng_status_t st = { .size = sizeof st };
+nc_rng_status(&st);                           /* sources, engine, health, nonces */
+```
+
+The known answers come from an implementation that shares no code with this
+one: `tools/nc_rng_kat.py` rebuilds them from OpenSSL (via `hashlib` and
+`cryptography`) — FIPS 202, FIPS 197, RFC 8439, and XDRBG and the stage's
+counter layout re-implemented in a few lines. Verified so far: VAES-256,
+AES-NI and ChaCha20 natively (and under `qemu-x86_64`), AES-NI on the i386
+kernel, ARMv8 AES on the aarch64 kernel under QEMU, ChaCha20 on every other
+kernel architecture, big-endian PowerPC included. The VAES-512 path has not
+run on AVX-512 hardware yet; until it does, its known-answer test is what
+stands between it and the output.
+
+---
+
 ## Language wrappers
 
 `crates/nanochrono-ffi` exports the 2.x `nc_*` C ABI — same symbol names,
@@ -1092,7 +1291,7 @@ calibration that silently went unpinned is worse than one known to be.
 ```
 Cargo.toml                  workspace
 crates/
-  nanochrono-core/          counters, inline asm, dispatch, calibration, NTP, probes
+  nanochrono-core/          counters, inline asm, dispatch, calibration, NTP, probes, NC_RNG, .ncplu parser
   nanochrono-crypto/        rustls provider primitives + TLS handshake timing
   nanochrono-bench/         the three benchmark modes and the three-pass harness
   nanochrono-cli/           command-line front end
@@ -1101,11 +1300,18 @@ crates/
   nanochrono-baremetal/     freestanding kernel: direct PMU, no syscalls
     boot/boot32.S             the only loose assembly file in the project
     boot/*.ld                 linker scripts
+    src/ncplu.rs              the .ncplu loader, signature tiers and containment
+    src/ring3.rs              ring 3 for community plugins: user mapping, nccall
+  nanochrono-plugins/       Apache-2.0 .ncplu plugins (Snake), built by build.sh
+sdk/                        C plugin SDK: ncplu.h, runtime, Makefile, examples
 include/nanochrono.h        C header
 packaging/linux/            .desktop entry and installer
 packaging/macos/            osxcross cross-build, lipo, .app bundle
 packaging/baremetal/        freestanding kernel build, QEMU boot, gdb/ scripts
 tools/nanodump.py           reads the bare-metal kernel's crash dumps
+tools/ncplu.py              packs a plugin cdylib into a .ncplu
+tools/ncplu-sign/           plugin keys, ML-DSA-87 + P-521 signing and verifying (host tool)
+tools/nc_rng_kat.py         NC_RNG's known answers, from OpenSSL
 packaging/android/          NDK cross-build for the four ABIs
 kernel/linux/               optional ring 0 module, nanochrono.ko (Rust, Dual MIT/GPL)
 kernel/windows/             the same for Windows, nanochrono.sys (Rust, MIT), osslsigncode signing

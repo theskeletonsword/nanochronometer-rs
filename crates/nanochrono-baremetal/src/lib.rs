@@ -120,6 +120,9 @@ pub mod panic_screen;
 #[cfg(x86_any)]
 pub mod pci;
 pub mod pmu;
+/// NC_RNG: the machine's entropy pool (timing jitter, RDSEED/RDRAND, the
+/// PMU, input and USB event timings) and the `nc_rng_*` C ABI plugins use.
+pub mod rng;
 /// x86 only: it needs the multiboot framebuffer.
 #[cfg(x86_any)]
 pub mod progress;
@@ -147,6 +150,18 @@ pub mod xhci;
 /// to. Needs the xHCI mass-storage path, which is x86-only.
 #[cfg(target_arch = "x86_64")]
 pub mod usb_storage;
+/// x86_64 only: the `.ncplu` loadable-plugin format, its loader, and the
+/// kernel symbol table exported to plugins.
+#[cfg(target_arch = "x86_64")]
+pub mod ncplu;
+/// x86_64 only: the launch card a plugin passes before it gets the screen —
+/// its signature tier (✅ Official / 🌳 Community), or why it was refused.
+#[cfg(target_arch = "x86_64")]
+pub mod plugin_card;
+/// x86_64 only: ring 3 for community plugins — the GDT user segments, the
+/// user page mapping, SYSCALL/SYSRET (`nccall`) and fault containment.
+#[cfg(target_arch = "x86_64")]
+pub mod ring3;
 
 pub use nanochrono_core::{arch as core_arch, cpu, Backend, Integrity, Protected, SimdFamily};
 

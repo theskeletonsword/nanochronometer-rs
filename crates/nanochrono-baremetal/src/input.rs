@@ -483,6 +483,21 @@ impl Input {
     /// loop never returns, so the `Input` it owns is such a home — this is
     /// called from there, once, and not from `init`, whose `Input` is still
     /// about to be moved to the caller.
+    /// Reads a plugin's `.ncplu` file from the boot medium's FAT partition
+    /// into the plugin loader's image buffer, returning how many bytes were
+    /// read. `name` is the long file name, e.g. `SNAKE.NCPLU`.
+    ///
+    /// # Safety
+    /// Drives the USB storage controller; requires ring 0.
+    #[cfg(target_arch = "x86_64")]
+    pub unsafe fn load_plugin_image(&mut self, name: &str) -> Option<usize> {
+        let usb = self.usb.as_mut()?;
+        // SAFETY: forwarded; the controller enumerated a stick at boot.
+        let buf = unsafe { crate::ncplu::image_buffer() };
+        // SAFETY: as above.
+        unsafe { crate::usb_storage::read_file(&mut usb.controller, name, buf) }
+    }
+
     #[cfg(target_arch = "x86_64")]
     pub fn install_crash_sink(&mut self) {
         if let Some(usb) = self.usb.as_mut() {
@@ -742,6 +757,15 @@ impl Input {
                 // SAFETY: the status bit says a byte is waiting.
                 let byte = unsafe { inb(DATA) };
                 self.remember(byte);
+                // Every byte's arrival time, keyboard or mouse, into NC_RNG.
+                crate::rng::stir(
+                    if status & STATUS_AUX_DATA == 0 {
+                        nanochrono_core::rng::EVENT_KEY
+                    } else {
+                        nanochrono_core::rng::EVENT_POINTER
+                    },
+                    byte as u64,
+                );
                 let event = if status & STATUS_AUX_DATA == 0 {
                     self.keystroke(byte)
                 } else {

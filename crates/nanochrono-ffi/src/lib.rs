@@ -2277,6 +2277,206 @@ fn integrity_to_u32(integrity: nanochrono_core::Integrity) -> u32 {
     }
 }
 
+// -- NC_RNG: the entropy pool ------------------------------------------------
+//
+// nanochrono_core::rng, one pool per process: CPU timing jitter (credited),
+// RDSEED/RDRAND, the OS's generator (/dev/urandom, credited only if the
+// timer fails) and any events the caller stirs in, conditioned through a
+// Keccak sponge into XDRBG-256, whose key drives the output stage —
+// AES-256-CTR on VAES/AES-NI/ARMv8 AES, or ChaCha20 — with fast key
+// erasure and a nonce counter that never goes back. The same functions, with
+// the same meaning, exist in the freestanding kernel for `.ncplu` plugins.
+
+/// `nc_rng_fill` flag: a fresh credited seed before every 32-byte block
+/// (slow; for long-term keys). Without it the output stage serves the read.
+pub const NC_RNG_TRUE: u32 = 1;
+/// `nc_rng_fill` flags value for the output stage (the default).
+pub const NC_RNG_FAST: u32 = 0;
+
+/// Error codes (negative), as the entropy manual numbers them.
+pub const NC_RNG_EMISUSE: i32 = -1;
+pub const NC_RNG_ERCT: i32 = -2;
+pub const NC_RNG_EAPT: i32 = -3;
+pub const NC_RNG_ETIMER: i32 = -4;
+pub const NC_RNG_ELAG: i32 = -5;
+pub const NC_RNG_ERCT_PERMANENT: i32 = -6;
+pub const NC_RNG_EAPT_PERMANENT: i32 = -7;
+pub const NC_RNG_ELAG_PERMANENT: i32 = -8;
+pub const NC_RNG_EMEMORY: i32 = -9;
+pub const NC_RNG_EMEMORY_PERMANENT: i32 = -10;
+pub const NC_RNG_ESELFTEST: i32 = -11;
+pub const NC_RNG_ENOSOURCE: i32 = -12;
+
+/// `nc_rng_status_t::flags` bits.
+pub const NC_RNG_READY: u32 = 1 << 0;
+pub const NC_RNG_DEGRADED: u32 = 1 << 1;
+pub const NC_RNG_FAILED: u32 = 1 << 2;
+pub const NC_RNG_SELFTEST_PASSED: u32 = 1 << 3;
+pub const NC_RNG_ENGINE_FALLBACK: u32 = 1 << 4;
+
+/// `nc_rng_status_t::sources` / `available` bits.
+pub const NC_RNG_SOURCE_JITTER: u32 = 1 << 0;
+pub const NC_RNG_SOURCE_RDSEED: u32 = 1 << 1;
+pub const NC_RNG_SOURCE_RDRAND: u32 = 1 << 2;
+pub const NC_RNG_SOURCE_PMU: u32 = 1 << 3;
+pub const NC_RNG_SOURCE_EVENTS: u32 = 1 << 4;
+pub const NC_RNG_SOURCE_EXTERNAL: u32 = 1 << 5;
+
+/// `nc_rng_status_t::engine` values: the output stage's path.
+pub const NC_RNG_ENGINE_VAES512: u32 = 1;
+pub const NC_RNG_ENGINE_VAES256: u32 = 2;
+pub const NC_RNG_ENGINE_AESNI: u32 = 3;
+pub const NC_RNG_ENGINE_ARM_AES: u32 = 4;
+pub const NC_RNG_ENGINE_CHACHA20: u32 = 5;
+
+/// First event tag that belongs to the caller (`nc_rng_stir`).
+pub const NC_RNG_EVENT_USER: u64 = 0x100;
+
+/// A snapshot of the pool. Set `size` to `sizeof(nc_rng_status_t)` before
+/// calling `nc_rng_status`; it comes back as the number of bytes written.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct nc_rng_status_t {
+    pub size: u32,
+    /// `NC_RNG_READY`, `NC_RNG_DEGRADED`, … bits.
+    pub flags: u32,
+    /// `NC_RNG_SOURCE_*` bits that fed the most recent seed.
+    pub sources: u32,
+    /// `NC_RNG_SOURCE_*` bits this machine offers.
+    pub available: u32,
+    /// Latched health-test failures.
+    pub health: u32,
+    /// The last error code, 0 if none.
+    pub last_error: i32,
+    /// Current oversampling rate (jitter samples per credited bit).
+    pub osr: u32,
+    /// Stuck samples in the timer's start-up test, per mille.
+    pub startup_stuck_permille: u32,
+    /// `NC_RNG_ENGINE_*`; 0 before the pool has started.
+    pub engine: u32,
+    pub reserved: u32,
+    /// The timer's granularity, learned at start-up.
+    pub granularity: u64,
+    pub reseeds: u64,
+    pub bytes_out: u64,
+    pub jitter_samples: u64,
+    pub jitter_stuck: u64,
+    pub events: u64,
+    pub hw_words: u64,
+    /// Output-stage nonces consumed: one per request, never reused.
+    pub nonces: u64,
+}
+
+// The two layouts must stay identical: the kernel hands plugins the core
+// struct under this same C name.
+const _: () = assert!(
+    std::mem::size_of::<nc_rng_status_t>() == std::mem::size_of::<nanochrono_core::rng::Status>()
+);
+
+mod rng_host {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::Mutex;
+
+    use nanochrono_core::rng::{jitter::DEFAULT_REGION_LEN, Config, EntropyPool, External};
+
+    static POOL: Mutex<Option<EntropyPool<'static>>> = Mutex::new(None);
+    /// The process the pool was last used in. A `fork` copies the pool;
+    /// without this, parent and child would hand out the same bytes.
+    static OWNER: AtomicU32 = AtomicU32::new(0);
+
+    /// The OS's generator, as the embedder's source: mixed into every seed,
+    /// credited only when the timer cannot run.
+    #[cfg(unix)]
+    fn os_read(buf: &mut [u8]) -> bool {
+        use std::io::Read;
+        std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(buf)).is_ok()
+    }
+
+    pub(super) fn with_pool<T>(f: impl FnOnce(&mut EntropyPool<'static>) -> T) -> Option<T> {
+        let mut guard = POOL.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let pid = std::process::id();
+        if OWNER.swap(pid, Ordering::Relaxed) != pid {
+            if let Some(pool) = guard.as_mut() {
+                // A child of a fork: erase the inherited state; the next read
+                // starts over with its own self-tests and seed.
+                pool.wipe();
+            }
+        }
+        if guard.is_none() {
+            let region: &'static mut [u8] = Box::leak(vec![0u8; DEFAULT_REGION_LEN].into_boxed_slice());
+            let mut pool = EntropyPool::new(region, Config::DEFAULT).ok()?;
+            #[cfg(unix)]
+            pool.set_external(Some(External { read: os_read, credit_eighths: 8 }));
+            #[cfg(not(unix))]
+            let _: Option<External> = None;
+            *guard = Some(pool);
+        }
+        guard.as_mut().map(f)
+    }
+}
+
+/// Fills `len` bytes at `buf` from the pool. `flags` is `NC_RNG_FAST` or
+/// `NC_RNG_TRUE`. Returns `len`, or a negative `NC_RNG_E*` code with the
+/// buffer zeroed — never a partial fill. Thread-safe.
+#[no_mangle]
+pub unsafe extern "C" fn nc_rng_fill(buf: *mut c_void, len: usize, flags: u32) -> i64 {
+    if len == 0 {
+        return 0;
+    }
+    if buf.is_null() || len > i64::MAX as usize {
+        return NC_RNG_EMISUSE as i64;
+    }
+    // SAFETY: the caller passes `len` writable bytes at `buf`.
+    let out = unsafe { std::slice::from_raw_parts_mut(buf.cast::<u8>(), len) };
+    let mode = nanochrono_core::rng::Mode::from_flags(flags);
+    match rng_host::with_pool(|pool| pool.fill(out, mode)) {
+        Some(Ok(n)) => n as i64,
+        Some(Err(error)) => error.code() as i64,
+        None => NC_RNG_EMISUSE as i64,
+    }
+}
+
+/// Fills `*out`, which the caller has prepared with `out->size =
+/// sizeof(nc_rng_status_t)`. Returns 0 or a negative code.
+#[no_mangle]
+pub unsafe extern "C" fn nc_rng_status(out: *mut nc_rng_status_t) -> i32 {
+    if out.is_null() {
+        return NC_RNG_EMISUSE;
+    }
+    // SAFETY: the caller's struct starts with its size.
+    let capacity = unsafe { std::ptr::read_unaligned(out.cast::<u32>()) } as usize;
+    if capacity < 8 {
+        return NC_RNG_EMISUSE;
+    }
+    let status = rng_host::with_pool(|pool| pool.status()).unwrap_or_default();
+    let n = capacity.min(std::mem::size_of::<nc_rng_status_t>());
+    // SAFETY: `n` bytes fit in the caller's struct by its own declaration;
+    // both layouts are `repr(C)` and identical (asserted above).
+    unsafe {
+        std::ptr::copy_nonoverlapping((&raw const status).cast::<u8>(), out.cast::<u8>(), n);
+        std::ptr::write_unaligned(out.cast::<u32>(), n as u32);
+    }
+    0
+}
+
+/// Mixes an event into the pool: `tag` (from `NC_RNG_EVENT_USER` up), a
+/// value, and the counter at the moment of the call. Never credited.
+#[no_mangle]
+pub extern "C" fn nc_rng_stir(tag: u64, value: u64) {
+    rng_host::with_pool(|pool| pool.stir(tag, value));
+}
+
+/// Re-runs the known-answer tests. 0, or `NC_RNG_ESELFTEST` with the pool out
+/// of service.
+#[no_mangle]
+pub extern "C" fn nc_rng_selftest() -> i32 {
+    match rng_host::with_pool(|pool| pool.selftest()) {
+        Some(Ok(())) => 0,
+        Some(Err(error)) => error.code(),
+        None => NC_RNG_EMISUSE,
+    }
+}
+
 #[cfg(test)]
 mod integrity_tests {
     use super::*;
@@ -2336,5 +2536,40 @@ mod integrity_tests {
             );
             nc_inject_calibration_flip(std::ptr::null_mut(), 0);
         }
+    }
+}
+
+#[cfg(test)]
+mod rng_tests {
+    use super::*;
+
+    #[test]
+    fn fill_status_and_errors_through_the_abi() {
+        let mut a = [0u8; 48];
+        let mut b = [0u8; 48];
+        unsafe {
+            assert_eq!(nc_rng_fill(a.as_mut_ptr().cast(), a.len(), NC_RNG_FAST), 48);
+            assert_eq!(nc_rng_fill(b.as_mut_ptr().cast(), b.len(), NC_RNG_TRUE), 48);
+            assert_eq!(nc_rng_fill(std::ptr::null_mut(), 4, 0), NC_RNG_EMISUSE as i64);
+        }
+        assert_ne!(a, b);
+        nc_rng_stir(NC_RNG_EVENT_USER, 42);
+
+        let mut s = nc_rng_status_t { size: std::mem::size_of::<nc_rng_status_t>() as u32, ..Default::default() };
+        assert_eq!(unsafe { nc_rng_status(&mut s) }, 0);
+        assert_ne!(s.flags & NC_RNG_READY, 0);
+        assert_ne!(s.flags & NC_RNG_SELFTEST_PASSED, 0);
+        assert_ne!(s.sources & NC_RNG_SOURCE_JITTER, 0);
+        assert!((NC_RNG_ENGINE_VAES512..=NC_RNG_ENGINE_CHACHA20).contains(&s.engine));
+        assert!(s.nonces >= 1);
+        assert_eq!(nc_rng_selftest(), 0);
+    }
+
+    #[test]
+    fn a_short_status_struct_gets_only_what_fits() {
+        let mut s = nc_rng_status_t { size: 12, ..Default::default() };
+        assert_eq!(unsafe { nc_rng_status(&mut s) }, 0);
+        assert_eq!(s.size, 12);
+        assert_eq!(s.available, 0, "past the caller's size, nothing is written");
     }
 }

@@ -164,6 +164,27 @@ const EXCEPTION_NAMES: [&str; 32] = [
 ];
 
 #[cfg(target_arch = "x86_64")]
+/// First stage of every CPU exception, before the crash path. A fault that
+/// belongs to the running plugin — in its own code, or on its stack's guard
+/// pages — is contained: the plugin runtime rewrites `frame` to resume on the
+/// kernel's stack, and this returns 1 so the stub pops it and `iretq`s. Any
+/// other fault returns 0 and goes on to [`nanochrono_x86_exception`]: a fault
+/// in kernel code is never hidden.
+#[no_mangle]
+extern "C" fn nanochrono_x86_trap(frame: *mut crate::crashdump::TrapFrame) -> u64 {
+    // CR2 first, before anything else can fault and replace it.
+    let cr2: u64;
+    // SAFETY: reading CR2 at CPL 0 has no side effects.
+    unsafe {
+        core::arch::asm!("mov {v}, cr2", v = out(reg) cr2, options(nomem, nostack, preserves_flags));
+    }
+    // SAFETY: the stub passes the frame it and the CPU just pushed, and only
+    // this function touches it until the stub resumes from it.
+    let f = unsafe { &mut *frame };
+    crate::ncplu::contain_fault(f, cr2) as u64
+}
+
+#[cfg(target_arch = "x86_64")]
 /// Set on entry to the handler, so a fault *inside* the report — a bad
 /// framebuffer, a UART that is not there — halts instead of recursing.
 static IN_EXCEPTION: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
