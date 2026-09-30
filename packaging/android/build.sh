@@ -15,7 +15,10 @@
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-out_dir="${repo_root}/dist/android"
+out_dir="${repo_root}/build/android"
+# Where cargo builds. The repository may sit on a filesystem that corrupts
+# incremental caches (exFAT), so a caller can point this somewhere else.
+target_dir="${CARGO_TARGET_DIR:-${repo_root}/target}"
 
 # API 21 is the NDK r27 floor and covers every device still receiving apps.
 api="${ANDROID_API:-21}"
@@ -65,6 +68,10 @@ if [[ ${#abis[@]} -eq 0 ]]; then
     abis=(arm64-v8a armeabi-v7a x86_64 x86)
 fi
 
+# A target with no prebuilt standard library (x86_64-linux-android on some
+# nightlies) gets one built from rust-src, which needs a nightly `cargo`.
+sysroot="$(rustc --print sysroot)"
+
 # Archiver and ranlib are ABI-independent in a unified NDK toolchain.
 export AR="${bin}/llvm-ar"
 export RANLIB="${bin}/llvm-ranlib"
@@ -95,29 +102,53 @@ for abi in "${abis[@]}"; do
         "RANLIB_${target}=${RANLIB}"
     )
 
+    extra=()
+    if [[ ! -d "${sysroot}/lib/rustlib/${target}" ]]; then
+        extra=(-Zbuild-std=std,panic_abort)
+        echo "    (no prebuilt std for ${target}; building it from rust-src)"
+    fi
+
     # Dynamically linked against bionic: the shared library an app loads, and
     # the static archive an NDK build links.
     env "${build_env[@]}" \
-        cargo build --profile dist --target "${target}" \
+        cargo build --profile dist --target "${target}" "${extra[@]}" \
             --manifest-path "${repo_root}/Cargo.toml" \
+            --target-dir "${target_dir}" \
             -p nanochrono-ffi -p nanochrono-cli
 
+    # Each ABI is an install prefix of its own: bin/, lib64/ (lib/ for the
+    # 32-bit ABIs) and include/nanochrono.h beside it.
     staging="${out_dir}/${abi}"
-    mkdir -p "${staging}"
-    install -m644 "${repo_root}/target/${target}/dist/libnanochrono.so" "${staging}/"
-    install -m644 "${repo_root}/target/${target}/dist/libnanochrono.a"  "${staging}/"
-    install -m755 "${repo_root}/target/${target}/dist/nanochrono"       "${staging}/"
+    libdir="lib64"
+    case "${abi}" in armeabi-v7a | x86) libdir="lib" ;; esac
+    rm -rf "${staging}"
+    mkdir -p "${staging}/bin" "${staging}/${libdir}"
+    install -m644 "${target_dir}/${target}/dist/libnanochrono.so" "${staging}/${libdir}/"
+    install -m644 "${target_dir}/${target}/dist/libnanochrono.a"  "${staging}/${libdir}/"
+    install -m755 "${target_dir}/${target}/dist/nanochrono"       "${staging}/bin/"
 
     # A second, statically linked CLI. `adb push` plus `chmod +x` is enough to
     # run this on any device of the right ABI — no library path to arrange, and
     # no dependency on the device's bionic version.
-    env "${build_env[@]}" RUSTFLAGS="-C target-feature=+crt-static" \
-        cargo build --profile dist --target "${target}" \
+    #
+    # Two things NDK r30's static libc.a needs that rustc's -nodefaultlibs link
+    # does not bring:
+    #  * It carries a Rust standard library of its own (bionic has Rust parts),
+    #    with its own `rust_eh_personality`, so the link sees that symbol
+    #    twice. Both are Rust's GCC personality routine; the program's own
+    #    comes first on the link line and is the one kept.
+    #  * Its clone() calls compiler-rt's SME support (`__arm_za_disable` on
+    #    arm64), which the NDK's clang would link by default. The driver names
+    #    the builtins archive for this ABI.
+    builtins="$("${cc}" -rtlib=compiler-rt --print-libgcc-file-name)"
+    env "${build_env[@]}" \
+        RUSTFLAGS="-C target-feature=+crt-static -C link-arg=-Wl,--allow-multiple-definition -C link-arg=${builtins}" \
+        cargo build --profile dist --target "${target}" "${extra[@]}" \
             --manifest-path "${repo_root}/Cargo.toml" \
-            --target-dir "${repo_root}/target/static-android" \
+            --target-dir "${target_dir}/static-android" \
             -p nanochrono-cli
-    install -m755 "${repo_root}/target/static-android/${target}/dist/nanochrono" \
-        "${staging}/nanochrono-static"
+    install -m755 "${target_dir}/static-android/${target}/dist/nanochrono" \
+        "${staging}/bin/nanochrono-static"
 
     # The GUI is deliberately excluded: iced needs a windowing system, and
     # Android's is not one winit drives from a plain executable.
@@ -125,17 +156,19 @@ for abi in "${abis[@]}"; do
     # Stripping is what makes these shippable: debug info dominates the size of
     # a Rust cdylib and an Android package has no use for it.
     "${bin}/llvm-strip" --strip-unneeded \
-        "${staging}/libnanochrono.so" \
-        "${staging}/nanochrono" \
-        "${staging}/nanochrono-static"
+        "${staging}/${libdir}/libnanochrono.so" \
+        "${staging}/bin/nanochrono" \
+        "${staging}/bin/nanochrono-static"
     echo
 done
 
 # The header is generated from the Rust FFI crate, never hand-written.
 "${repo_root}/tools/gen-header.sh"
-install -Dm644 "${repo_root}/include/nanochrono.h" "${out_dir}/include/nanochrono.h"
+for abi in "${abis[@]}"; do
+    install -Dm644 "${repo_root}/include/nanochrono.h" "${out_dir}/${abi}/include/nanochrono.h"
+done
 install -Dm644 "${repo_root}/LICENSE"              "${out_dir}/LICENSE"
 install -Dm644 "${repo_root}/NOTICE"               "${out_dir}/NOTICE"
 
-echo "=== dist/android ==="
+echo "=== build/android ==="
 find "${out_dir}" -type f -printf '%-46p %8s bytes\n' | sort

@@ -1,12 +1,26 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: Apache-2.0
 #
-# Builds every release — CLI, desktop GUI and C library — for every desktop
-# OS and architecture, plus the universal Android APK, and copies the results
-# to build/<os>-<arch>/.
+# Builds every release into build/:
+#
+#   build/<os>-<arch>/    for every desktop OS and architecture, laid out as
+#                         an install prefix: bin/ (CLI, desktop GUI; the DLL
+#                         on Windows), lib64/ or lib/ (libnanochrono shared
+#                         and static) and include/nanochrono.h beside it;
+#                         build/macos-universal/ joins both Macs
+#   build/android/        the libraries and the terminal CLI per ABI, and the
+#                         universal APK
+#   build/baremetal/      the freestanding kernels, their static and shared
+#                         libraries per architecture, and the bootable ISOs
 #
 #   packaging/release/build-all.sh               # everything
 #   packaging/release/build-all.sh linux-aarch64 macos-aarch64   # some
+#   packaging/release/build-all.sh android baremetal             # by name
+#
+# The bare-metal kernels trust the plugin signing roots named by
+# NCPLU_ROOT_CREATOR / NCPLU_ROOT_TREE and sign the bundled plugins with
+# NCPLU_SIGN_KEYS, when those are set (see packaging/baremetal/build.sh);
+# without them every plugin runs as a community plugin, at ring 3.
 #
 # Run it as the user who owns the toolchains, not as root. Build trees live
 # on a real filesystem (CARGO_HOME-style cache under ~/.cache/nanochrono),
@@ -37,6 +51,32 @@ mkdir -p "${logs}" "${out}"
 
 toolchain_bin() { echo "${rustup_home}/toolchains/$1-${host}/bin"; }
 
+# The C header ships next to every library. It is generated from the Rust
+# source when cbindgen is available; otherwise the checked-out copy is used.
+header="${repo}/include/nanochrono.h"
+if command -v cbindgen >/dev/null 2>&1; then
+    "${repo}/tools/gen-header.sh" >/dev/null
+elif [[ ! -f "${header}" ]]; then
+    echo "note: no cbindgen and no include/nanochrono.h; the libraries ship without it"
+fi
+
+# Where a platform keeps its libraries: lib64/ for 64-bit Linux, as the
+# distributions do; lib/ for 32-bit Linux, and for macOS and Windows, which
+# have no lib64 whatever the width.
+lib_dir() {
+    case "$1" in
+        linux-x86_64 | linux-aarch64 | linux-riscv64) echo lib64 ;;
+        *) echo lib ;;
+    esac
+}
+
+# The header and the licence texts, beside a directory of libraries.
+ship_header() {
+    local dest="$1"
+    [[ -f "${header}" ]] && install -Dm644 "${header}" "${dest}/include/nanochrono.h"
+    command cp -f "${repo}/LICENSE" "${repo}/NOTICE" "${dest}/"
+}
+
 # name | rust target | rust toolchain
 targets=(
     "linux-x86_64|x86_64-unknown-linux-gnu|stable"
@@ -47,6 +87,10 @@ targets=(
     "windows-x86_64|x86_64-pc-windows-gnullvm|stable"
     "windows-aarch64|aarch64-pc-windows-gnullvm|stable"
     "windows-i686|i686-pc-windows-gnullvm|nightly"
+    # No 32-bit Arm Windows build: Windows 11 24H2 and later no longer run
+    # 32-bit Arm programs at all, and Rust has only tier-3 MSVC targets for
+    # them (thumbv7a-pc-windows-msvc), with no prebuilt std and no gnullvm
+    # variant for llvm-mingw to link.
     "macos-x86_64|x86_64-apple-darwin|nightly"
     "macos-aarch64|aarch64-apple-darwin|nightly"
 )
@@ -119,12 +163,25 @@ build_one() {
         return 1
     fi
 
-    local rel="${tdir}/${target}/dist" dest="${out}/${name}"
-    mkdir -p "${dest}"
+    local rel="${tdir}/${target}/dist" dest="${out}/${name}" libdir f
+    libdir="$(lib_dir "${name}")"
+    # A fresh prefix. Only what this script writes is cleared — the flat
+    # layout of older releases included — so anything else kept here (a
+    # kernel driver built on its own) stays.
+    command rm -rf "${dest}/bin" "${dest}/lib" "${dest}/lib64" "${dest}/include"
     for f in nanochrono nanochrono-gui nanochrono.exe nanochrono-gui.exe nanochrono.dll \
              libnanochrono.so libnanochrono.dylib libnanochrono.a libnanochrono.dll.a; do
-        [[ -f "${rel}/${f}" ]] && command cp -f "${rel}/${f}" "${dest}/"
+        command rm -f "${dest}/${f}"
     done
+    mkdir -p "${dest}/bin" "${dest}/${libdir}"
+    # Programs in bin/. So is the DLL: Windows finds it beside the .exe.
+    for f in nanochrono nanochrono-gui nanochrono.exe nanochrono-gui.exe nanochrono.dll; do
+        [[ -f "${rel}/${f}" ]] && command cp -f "${rel}/${f}" "${dest}/bin/"
+    done
+    for f in libnanochrono.so libnanochrono.dylib libnanochrono.a libnanochrono.dll.a; do
+        [[ -f "${rel}/${f}" ]] && command cp -f "${rel}/${f}" "${dest}/${libdir}/"
+    done
+    ship_header "${dest}"
     dress "${name}"
     echo "    -> ${dest}"
 }
@@ -162,12 +219,12 @@ dress() {
             ;;
         macos-*)
             # The GUI only gets a Dock icon and keyboard focus as a bundle.
-            [[ -f "${dest}/nanochrono-gui" ]] || return 0
+            [[ -f "${dest}/bin/nanochrono-gui" ]] || return 0
             local app="${dest}/NanoChronometer.app" version
             version="$(sed -n 's/^version *= *"\(.*\)"/\1/p' "${repo}/Cargo.toml" | head -1)"
             command rm -rf "${app}"
             mkdir -p "${app}/Contents/MacOS" "${app}/Contents/Resources"
-            command cp -f "${dest}/nanochrono-gui" "${app}/Contents/MacOS/NanoChronometer"
+            command cp -f "${dest}/bin/nanochrono-gui" "${app}/Contents/MacOS/NanoChronometer"
             command cp -f "${icons}/macos/nanochrono.icns" "${app}/Contents/Resources/NanoChronometer.icns"
             sed -e "s/@VERSION@/${version}/g" "${repo}/packaging/macos/Info.plist.in" \
                 > "${app}/Contents/Info.plist"
@@ -180,24 +237,55 @@ dress() {
 universal_macos() {
     local a="${out}/macos-x86_64" b="${out}/macos-aarch64" u="${out}/macos-universal"
     [[ -d "${a}" && -d "${b}" ]] || return 0
-    mkdir -p "${u}"
-    for f in nanochrono nanochrono-gui libnanochrono.dylib libnanochrono.a; do
+    command rm -rf "${u}"
+    mkdir -p "${u}/bin" "${u}/lib"
+    for f in bin/nanochrono bin/nanochrono-gui lib/libnanochrono.dylib lib/libnanochrono.a; do
         [[ -f "${a}/${f}" && -f "${b}/${f}" ]] &&
             "${osxcross}/bin/lipo" -create "${a}/${f}" "${b}/${f}" -output "${u}/${f}"
     done
+    ship_header "${u}"
     dress macos-universal
     echo "=== macos-universal -> ${u}"
 }
 
+# Android: the libraries and the terminal CLI per ABI (build/android/<abi>/),
+# then the universal APK (build/android/). Nightly, for the ABIs whose std has
+# to be built from rust-src.
 android() {
+    local sdk="${ANDROID_HOME:-${HOME}/Android/Sdk}" ndk
+    ndk="${ANDROID_NDK_HOME:-$(ls -d "${sdk}"/ndk/*/ 2>/dev/null | sort -V | tail -1)}"
+    ndk="${ndk%/}"
+    echo "=== android libraries and CLI (arm64-v8a, armeabi-v7a, x86_64, x86)"
+    if PATH="$(toolchain_bin nightly):${PATH}" ANDROID_NDK_HOME="${ndk}" CARGO_INCREMENTAL=0 \
+            CARGO_TARGET_DIR="${cache}/android-libs" \
+            "${repo}/packaging/android/build.sh" > "${logs}/android-libs.log" 2>&1; then
+        echo "    -> ${out}/android/<abi>"
+    else
+        echo "!!! android libraries FAILED — see ${logs}/android-libs.log"
+        failed=$((failed + 1))
+    fi
     echo "=== android (universal APK: arm64-v8a, armeabi-v7a, x86_64, x86)"
-    if RUST_BIN="$(toolchain_bin nightly)" CARGO_INCREMENTAL=0 \
+    if ANDROID_HOME="${sdk}" ANDROID_NDK_HOME="${ndk}" RUST_BIN="$(toolchain_bin nightly)" \
+            CARGO_INCREMENTAL=0 CARGO_TARGET_DIR="${cache}/android-app" \
             "${repo}/packaging/android/build-app.sh" > "${logs}/android.log" 2>&1; then
-        mkdir -p "${out}/android"
-        command cp -f "${repo}"/dist/android-app/nanochronometer-*.apk "${out}/android/"
         echo "    -> ${out}/android"
     else
-        echo "!!! android FAILED — see ${logs}/android.log"
+        echo "!!! android APK FAILED — see ${logs}/android.log"
+        failed=$((failed + 1))
+    fi
+}
+
+# Bare metal: every architecture's kernel, static archive and shared object,
+# and the ISOs (packaging/baremetal/build.sh, release mode). It runs `cargo
+# +nightly` through rustup, so the caller's PATH is kept as it is.
+baremetal() {
+    echo "=== baremetal (kernels, static and shared libraries, ISOs)"
+    if CARGO_INCREMENTAL=0 CARGO_TARGET_DIR="${cache}/baremetal" \
+            "${repo}/packaging/baremetal/build.sh" > "${logs}/baremetal.log" 2>&1; then
+        echo "    -> ${out}/baremetal"
+    else
+        echo "!!! baremetal FAILED — see ${logs}/baremetal.log"
+        failed=$((failed + 1))
     fi
 }
 
@@ -215,5 +303,8 @@ if [[ ${#wanted[@]} -eq 0 || " ${wanted[*]} " =~ " macos-universal " ]]; then
 fi
 if [[ ${#wanted[@]} -eq 0 || " ${wanted[*]} " =~ " android " ]]; then
     android
+fi
+if [[ ${#wanted[@]} -eq 0 || " ${wanted[*]} " =~ " baremetal " ]]; then
+    baremetal
 fi
 echo "failed: ${failed}"

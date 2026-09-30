@@ -159,7 +159,7 @@ do on such a PC.
 
 ```console
 $ qemu-system-x86_64 -machine q35,i8042=off -accel kvm -cpu host \
-      -cdrom dist/baremetal/nanochronometer_x86_64.iso \
+      -cdrom build/baremetal/nanochronometer_x86_64.iso \
       -device qemu-xhci -device usb-kbd
 ```
 

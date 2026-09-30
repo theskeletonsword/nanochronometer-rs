@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 #
-# Generates include/nanochrono.h from crates/nanochrono-ffi.
+# Generates include/nanochrono.h from crates/nanochrono-ffi (the hosted
+# library). The bare-metal one is cbindgen-baremetal.toml.
 #
 # The Rust source is the single source of truth for the C ABI. Nothing in this
 # repository is hand-written C: run tools/gen-header.sh to regenerate.
@@ -23,6 +24,12 @@ header = """/* SPDX-License-Identifier: Apache-2.0 */
  * Link against libnanochrono.so / .dll / .dylib (shared) or
  * libnanochrono.a / nanochrono.lib (static), built with:
  *     cargo build --release -p nanochrono-ffi
+ * A release carries them in lib/ or lib64/ (the .dll in bin/ on Windows),
+ * with this header in include/ beside it.
+ *
+ * Assembly: this header can be #included from a .S file. The constants are
+ * plain #defines; the C declarations sit under #ifndef __ASSEMBLER__. Call a
+ * function by its name with the platform's C calling convention.
  *
  * Contract:
  *   - A NULL nc_ctx_t* is never a crash. Accessors return documented defaults.

@@ -2404,6 +2404,9 @@ mod rng_host {
         }
         if guard.is_none() {
             let region: &'static mut [u8] = Box::leak(vec![0u8; DEFAULT_REGION_LEN].into_boxed_slice());
+            // Only unix wires the OS generator in below; elsewhere the pool
+            // runs on its own sources and is never changed after this.
+            #[cfg_attr(not(unix), allow(unused_mut))]
             let mut pool = EntropyPool::new(region, Config::DEFAULT).ok()?;
             #[cfg(unix)]
             pool.set_external(Some(External { read: os_read, credit_eighths: 8 }));

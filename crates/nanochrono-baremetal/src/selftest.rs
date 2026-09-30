@@ -155,6 +155,24 @@ fn report_rng() {
         if s.flags & rng::FLAG_FAILED != 0 { ", OUT OF SERVICE" } else { "" },
         s.nonces
     );
+
+    // The ring-0 C ABI over the same pool: the functions include/nanochrono.h
+    // declares, which C or assembly linked against libnanochrono calls.
+    let mut c_sample = [0u8; 16];
+    // SAFETY: a buffer of ours, at ring 0 / EL1.
+    let filled = unsafe {
+        crate::abi::nc_rng_fill(c_sample.as_mut_ptr().cast(), c_sample.len(), crate::abi::NC_RNG_FAST)
+    };
+    let mut c_status = crate::abi::nc_rng_status_t {
+        size: core::mem::size_of::<crate::abi::nc_rng_status_t>() as u32,
+        ..Default::default()
+    };
+    // SAFETY: a struct of ours, whose `size` says how large it is.
+    let status_rc = unsafe { crate::abi::nc_rng_status(&mut c_status) };
+    println!(
+        "  C ABI          : nc_rng_fill {}, nc_rng_status {} (engine {}, nonces {})",
+        filled, status_rc, c_status.engine, c_status.nonces
+    );
     println!();
 }
 

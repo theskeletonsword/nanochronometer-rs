@@ -162,3 +162,36 @@ rustflags = [
     "-C", "target-feature=+neon,+v7,+vfp3,+strict-align",
     "-C", "link-arg=-Tboot/arm32.ld",
 ]
+
+# The shared objects, one per architecture (packaging/baremetal/build.sh,
+# build_shared): each `-dylib` spec is its kernel target made position
+# independent and dynamically linkable. The flags match the static build's
+# for the same architecture — only the relocation model and the linker script
+# differ — so the .so and the .a hold the same code.
+[target.i686-nanochrono-none-dylib]
+rustflags = ["-Z", "unstable-options", "-C", "no-redzone=yes"]
+
+[target.aarch64-unknown-none-dylib]
+rustflags = ["-Z", "unstable-options", "-C", "no-redzone=yes"]
+
+[target.armv7a-none-eabihf-dylib]
+rustflags = [
+    "-Z", "unstable-options",
+    "-C", "no-redzone=yes",
+    "-C", "target-feature=+neon,+v7,+vfp3,+strict-align",
+]
+
+[target.powerpc64-nanochrono-none-dylib]
+rustflags = ["-Z", "unstable-options", "-C", "no-redzone=yes"]
+
+[target.powerpc64le-nanochrono-none-dylib]
+rustflags = ["-Z", "unstable-options", "-C", "no-redzone=yes"]
+
+[target.powerpc-nanochrono-none-dylib]
+rustflags = ["-Z", "unstable-options", "-C", "no-redzone=yes"]
+
+[target.riscv64gc-unknown-none-elf-dylib]
+rustflags = ["-Z", "unstable-options", "-C", "no-redzone=yes"]
+
+[target.riscv32imac-unknown-none-elf-dylib]
+rustflags = ["-Z", "unstable-options", "-C", "no-redzone=yes"]

@@ -20,7 +20,10 @@
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-out_dir="${repo_root}/dist/macos"
+# The same layout packaging/release/build-all.sh writes: build/macos-aarch64,
+# build/macos-x86_64 and build/macos-universal.
+out_root="${repo_root}/build"
+target_dir="${CARGO_TARGET_DIR:-${repo_root}/target}"
 
 # The deployment target. 11.0 is the first release that ran on Apple Silicon,
 # so it is the floor for a universal binary; going lower would build an arm64
@@ -77,12 +80,22 @@ declare -A arch_clang=(
     [arm64]="oa64-clang"
     [x86_64]="o64-clang"
 )
+# Architecture -> output directory under build/.
+declare -A arch_out=(
+    [arm64]="macos-aarch64"
+    [x86_64]="macos-x86_64"
+)
 
 requested=("$@")
 [[ ${#requested[@]} -eq 0 ]] && requested=(arm64 x86_64)
 
-rm -rf "${out_dir}"
-mkdir -p "${out_dir}"
+# Only the directories this run rebuilds are cleared: build/ holds every other
+# platform's release too.
+produced=()
+for arch in "${requested[@]}"; do
+    [[ -n "${arch_out[${arch}]:-}" ]] && rm -rf "${out_root:?}/${arch_out[${arch}]}"
+done
+rm -rf "${out_root:?}/macos-universal"
 
 built=()
 for arch in "${requested[@]}"; do
@@ -105,29 +118,34 @@ for arch in "${requested[@]}"; do
     echo "=== ${arch} (${target})"
     rustup target add "${target}" >/dev/null 2>&1 || true
     cargo build --profile dist --target "${target}" \
+        --target-dir "${target_dir}" \
         -p nanochrono-cli -p nanochrono-ffi -p nanochrono-gui
 
-    src="${repo_root}/target/${target}/dist"
-    dst="${out_dir}/${arch}"
-    mkdir -p "${dst}"
-    cp "${src}/nanochrono" "${dst}/"
-    cp "${src}/nanochrono-gui" "${dst}/"
-    cp "${src}/libnanochrono.dylib" "${dst}/"
-    cp "${src}/libnanochrono.a" "${dst}/"
+    src="${target_dir}/${target}/dist"
+    # An install prefix: bin/, lib/ (Darwin has no lib64) and include/.
+    dst="${out_root}/${arch_out[${arch}]}"
+    mkdir -p "${dst}/bin" "${dst}/lib"
+    cp "${src}/nanochrono" "${dst}/bin/"
+    cp "${src}/nanochrono-gui" "${dst}/bin/"
+    cp "${src}/libnanochrono.dylib" "${dst}/lib/"
+    cp "${src}/libnanochrono.a" "${dst}/lib/"
     built+=("${arch}")
+    produced+=("${dst}")
 done
 
 # A universal binary is only possible with both slices present.
 if [[ ${#built[@]} -eq 2 ]]; then
     echo
     echo "=== universal (arm64 + x86_64)"
-    mkdir -p "${out_dir}/universal"
-    for artifact in nanochrono nanochrono-gui libnanochrono.dylib libnanochrono.a; do
+    universal="${out_root}/macos-universal"
+    mkdir -p "${universal}/bin" "${universal}/lib"
+    for artifact in bin/nanochrono bin/nanochrono-gui lib/libnanochrono.dylib lib/libnanochrono.a; do
         "${lipo_bin}" -create \
-            "${out_dir}/arm64/${artifact}" \
-            "${out_dir}/x86_64/${artifact}" \
-            -output "${out_dir}/universal/${artifact}"
+            "${out_root}/macos-aarch64/${artifact}" \
+            "${out_root}/macos-x86_64/${artifact}" \
+            -output "${universal}/${artifact}"
     done
+    produced+=("${universal}")
 fi
 
 # The GUI is only launchable from Finder as a bundle: macOS refuses to give a
@@ -137,7 +155,7 @@ make_app_bundle() {
     local arch_dir="$1"
     local app="${arch_dir}/NanoChronometer.app"
     mkdir -p "${app}/Contents/MacOS" "${app}/Contents/Resources"
-    cp "${arch_dir}/nanochrono-gui" "${app}/Contents/MacOS/NanoChronometer"
+    cp "${arch_dir}/bin/nanochrono-gui" "${app}/Contents/MacOS/NanoChronometer"
 
     # The Dock and Finder icon. Built from the same assets/nanochrono.ico that
     # Windows and Linux use, so there is one drawing in the tree.
@@ -157,19 +175,22 @@ make_app_bundle() {
 }
 
 version="$(sed -n 's/^version *= *"\(.*\)"/\1/p' "${repo_root}/Cargo.toml" | head -1)"
-for dir in "${out_dir}"/*/; do
-    [[ -f "${dir}/nanochrono-gui" ]] && make_app_bundle "${dir%/}"
+for dir in "${produced[@]}"; do
+    [[ -f "${dir}/bin/nanochrono-gui" ]] && make_app_bundle "${dir}"
 done
 
-# The header the C ABI is consumed through, generated from the Rust source.
+# The header the C ABI is consumed through, generated from the Rust source,
+# next to each set of libraries.
 "${repo_root}/tools/gen-header.sh" >/dev/null
-mkdir -p "${out_dir}/include"
-cp "${repo_root}/include/nanochrono.h" "${out_dir}/include/"
-cp "${repo_root}/LICENSE" "${repo_root}/NOTICE" "${out_dir}/"
+for dir in "${produced[@]}"; do
+    mkdir -p "${dir}/include"
+    cp "${repo_root}/include/nanochrono.h" "${dir}/include/"
+    cp "${repo_root}/LICENSE" "${repo_root}/NOTICE" "${dir}/"
+done
 
 echo
-echo "=== ${out_dir}"
-find "${out_dir}" -maxdepth 2 \( -type f -o -name '*.app' \) -print0 \
+echo "=== ${produced[*]}"
+find "${produced[@]}" -maxdepth 2 \( -type f -o -name '*.app' \) -print0 \
     | sort -z | while IFS= read -r -d '' path; do
     if [[ -d "${path}" ]]; then
         printf '%s  (bundle)\n' "${path}"

@@ -1,11 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
-//! The C ABI a loaded module is reached through.
+//! The C ABI: what C and assembly reach, through the static archive
+//! (`libnanochrono.a`) or the shared object (`libnanochrono.so`).
 //!
-//! Only meaningful for the shared object: a kernel linking the static archive
-//! calls the Rust API directly and needs none of this. It exists because a
-//! symbol resolver looks names up, and Rust's mangled names are not a stable
-//! thing to look up — see `docs/BAREMETAL_LIBRARIES.md` for the loader that
-//! has to exist on the other side.
+//! `include/nanochrono.h` is generated from this file and nothing else
+//! (`tools/gen-header.sh`), so every name here is the stable, unmangled one a
+//! linker or a symbol resolver looks up — Rust's mangled names are not a
+//! stable thing to look up. A Rust kernel can call the Rust API directly
+//! instead. For the shared object, see `docs/BAREMETAL_LIBRARIES.md` for the
+//! loader that has to exist on the other side.
 //!
 //! Every function here is safe to call at ring 0 / EL1 and nowhere else, and
 //! several program the PMU. There is no way to express that in a C signature,
@@ -180,4 +182,150 @@ fn route_code(route: crate::pmu::CounterRoute) -> u32 {
         CounterRoute::Fixed => 1,
         CounterRoute::General(_) => 2,
     }
+}
+
+// ===========================================================================
+// NC_RNG: the entropy pool.
+//
+// The same names, values, struct and meaning as libnanochrono's hosted
+// functions (crates/nanochrono-ffi), so C written against one builds against
+// the other. These are the ring-0 entry points: the caller vouches for its
+// own pointers, as with any C function. A plugin reaches the pool through its
+// NcApi instead, where its pointers and capabilities are checked
+// (`crate::rng::nc_rng_fill` and friends).
+// ===========================================================================
+
+/// `nc_rng_fill` flag: a fresh credited seed before every 32-byte block
+/// (slow; for long-term keys). Without it the output stage serves the read.
+pub const NC_RNG_TRUE: u32 = 1;
+/// `nc_rng_fill` flags value for the output stage (the default).
+pub const NC_RNG_FAST: u32 = 0;
+/// Most bytes one `nc_rng_fill` call may ask for.
+pub const NC_RNG_MAX_FILL: u32 = 1 << 20;
+
+/// Error codes (negative), as the entropy manual numbers them.
+pub const NC_RNG_EMISUSE: i32 = -1;
+pub const NC_RNG_ERCT: i32 = -2;
+pub const NC_RNG_EAPT: i32 = -3;
+pub const NC_RNG_ETIMER: i32 = -4;
+pub const NC_RNG_ELAG: i32 = -5;
+pub const NC_RNG_ERCT_PERMANENT: i32 = -6;
+pub const NC_RNG_EAPT_PERMANENT: i32 = -7;
+pub const NC_RNG_ELAG_PERMANENT: i32 = -8;
+pub const NC_RNG_EMEMORY: i32 = -9;
+pub const NC_RNG_EMEMORY_PERMANENT: i32 = -10;
+pub const NC_RNG_ESELFTEST: i32 = -11;
+pub const NC_RNG_ENOSOURCE: i32 = -12;
+
+/// `nc_rng_status_t::flags` bits.
+pub const NC_RNG_READY: u32 = 1 << 0;
+pub const NC_RNG_DEGRADED: u32 = 1 << 1;
+pub const NC_RNG_FAILED: u32 = 1 << 2;
+pub const NC_RNG_SELFTEST_PASSED: u32 = 1 << 3;
+pub const NC_RNG_ENGINE_FALLBACK: u32 = 1 << 4;
+
+/// `nc_rng_status_t::sources` / `available` bits.
+pub const NC_RNG_SOURCE_JITTER: u32 = 1 << 0;
+pub const NC_RNG_SOURCE_RDSEED: u32 = 1 << 1;
+pub const NC_RNG_SOURCE_RDRAND: u32 = 1 << 2;
+pub const NC_RNG_SOURCE_PMU: u32 = 1 << 3;
+pub const NC_RNG_SOURCE_EVENTS: u32 = 1 << 4;
+pub const NC_RNG_SOURCE_EXTERNAL: u32 = 1 << 5;
+
+/// `nc_rng_status_t::engine` values: the output stage's path.
+pub const NC_RNG_ENGINE_VAES512: u32 = 1;
+pub const NC_RNG_ENGINE_VAES256: u32 = 2;
+pub const NC_RNG_ENGINE_AESNI: u32 = 3;
+pub const NC_RNG_ENGINE_ARM_AES: u32 = 4;
+pub const NC_RNG_ENGINE_CHACHA20: u32 = 5;
+
+/// First event tag that belongs to the caller (`nc_rng_stir`).
+pub const NC_RNG_EVENT_USER: u64 = 0x100;
+
+/// A snapshot of the pool. Set `size` to `sizeof(nc_rng_status_t)` before
+/// calling `nc_rng_status`; it comes back as the number of bytes written.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct nc_rng_status_t {
+    pub size: u32,
+    /// `NC_RNG_READY`, `NC_RNG_DEGRADED`, … bits.
+    pub flags: u32,
+    /// `NC_RNG_SOURCE_*` bits that fed the most recent seed.
+    pub sources: u32,
+    /// `NC_RNG_SOURCE_*` bits this machine offers.
+    pub available: u32,
+    /// Latched health-test failures.
+    pub health: u32,
+    /// The last error code, 0 if none.
+    pub last_error: i32,
+    /// Current oversampling rate (jitter samples per credited bit).
+    pub osr: u32,
+    /// Stuck samples in the timer's start-up test, per mille.
+    pub startup_stuck_permille: u32,
+    /// `NC_RNG_ENGINE_*`; 0 before the pool has started.
+    pub engine: u32,
+    pub reserved: u32,
+    /// The timer's granularity, learned at start-up.
+    pub granularity: u64,
+    pub reseeds: u64,
+    pub bytes_out: u64,
+    pub jitter_samples: u64,
+    pub jitter_stuck: u64,
+    pub events: u64,
+    pub hw_words: u64,
+    /// Output-stage nonces consumed: one per request, never reused.
+    pub nonces: u64,
+}
+
+// The pool's own struct is copied out byte for byte, so the two layouts must
+// stay identical — as they must with the hosted library's, which states the
+// same check.
+const _: () = assert!(
+    core::mem::size_of::<nc_rng_status_t>()
+        == core::mem::size_of::<nanochrono_core::rng::Status>()
+);
+const _: () = assert!(
+    core::mem::align_of::<nc_rng_status_t>()
+        == core::mem::align_of::<nanochrono_core::rng::Status>()
+);
+
+/// A ring-0 caller's pointer is its own: nothing to check it against.
+fn ring0_owns(_ptr: usize, _len: usize) -> bool {
+    true
+}
+
+/// Fills `buf` with `len` bytes and returns `len`, or a negative `NC_RNG_E*`
+/// code with `buf` zeroed. `flags` is `NC_RNG_FAST` or `NC_RNG_TRUE`; at most
+/// `NC_RNG_MAX_FILL` bytes per call.
+///
+/// # Safety
+/// `buf` must be valid for writes of `len` bytes. Ring 0 / EL1.
+#[no_mangle]
+pub unsafe extern "C" fn nc_rng_fill(buf: *mut core::ffi::c_void, len: usize, flags: u32) -> i64 {
+    crate::rng::fill_c(buf.cast::<u8>(), len, flags, ring0_owns)
+}
+
+/// Writes a snapshot of the pool into `out`: set `out->size` to
+/// `sizeof(nc_rng_status_t)` first. Returns 0 or a negative `NC_RNG_E*` code.
+///
+/// # Safety
+/// `out` must be valid for reads and writes of `out->size` bytes. Ring 0 /
+/// EL1.
+#[no_mangle]
+pub unsafe extern "C" fn nc_rng_status(out: *mut nc_rng_status_t) -> i32 {
+    crate::rng::status_c(out.cast::<u8>(), ring0_owns)
+}
+
+/// Mixes the caller's event into the pool, uncredited. Tags from
+/// `NC_RNG_EVENT_USER` up are the caller's.
+#[no_mangle]
+pub extern "C" fn nc_rng_stir(tag: u64, value: u64) {
+    crate::rng::stir(tag, value);
+}
+
+/// Re-runs the known-answer tests: 0, or `NC_RNG_ESELFTEST` with the pool out
+/// of service.
+#[no_mangle]
+pub extern "C" fn nc_rng_selftest() -> i32 {
+    crate::rng::selftest_c()
 }

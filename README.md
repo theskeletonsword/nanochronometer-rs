@@ -67,9 +67,12 @@ exist because a multiboot loader enters before Rust's ABI holds — see
 **There is no hand-written C anywhere in this project.** `include/nanochrono.h`
 is generated from `crates/nanochrono-ffi/src/lib.rs` by `tools/gen-header.sh`
 (cbindgen), which is why it is gitignored; the packaging scripts regenerate it.
-It exists only so C, cgo and Zig consumers have declarations — the Python,
-Java, C#, Node and Lua wrappers declare their own bindings and do not need it.
-The kernel module is Rust too.
+The bare-metal library's header, `include/baremetal/nanochrono.h`, is generated
+the same way from `crates/nanochrono-baremetal/src/abi.rs`. Both exist so C,
+assembly, cgo and Zig consumers have declarations, and both can be `#include`d
+from a `.S` file: the constants are plain `#define`s and the C declarations sit
+under `#ifndef __ASSEMBLER__`. The Python, Java, C#, Node and Lua wrappers
+declare their own bindings and do not need them. The kernel module is Rust too.
 
 | Artifact | Path |
 |---|---|
@@ -78,6 +81,36 @@ The kernel module is Rust too.
 | Shared library | `target/release/libnanochrono.so` (`.dll` / `.dylib`) |
 | Static library | `target/release/libnanochrono.a` |
 | C header | `include/nanochrono.h` (generated — see below) |
+
+### Release builds
+
+```sh
+packaging/release/build-all.sh                        # everything
+packaging/release/build-all.sh linux-aarch64 android  # some
+```
+
+Everything lands in `build/`, and every platform is laid out as an install
+prefix — the libraries in `lib64/` or `lib/`, `include/nanochrono.h` beside
+them — so C or assembly links with `-I include -L lib64 -lnanochrono` (or
+`lib`) on each one:
+
+| Directory | Contents |
+|---|---|
+| `build/linux-{x86_64,aarch64,riscv64}/` | `bin/` (CLI, GUI), `lib64/` (`.so`, `.a`), `include/`, `share/` (desktop entry, icons) |
+| `build/linux-{i686,armv7}/` | the same, with `lib/` |
+| `build/windows-{x86_64,aarch64,i686}/` | `bin/` (the `.exe`s and `nanochrono.dll`, which Windows finds beside them), `lib/` (`libnanochrono.a`, the `.dll.a` import library), `include/` |
+| `build/macos-{aarch64,x86_64,universal}/` | `bin/`, `lib/` (`.dylib`, `.a`), `include/`, `NanoChronometer.app` |
+| `build/android/<abi>/` | `bin/` (the CLI, dynamic and static), `lib64/` or `lib/` (`.so`, `.a`), `include/`; the universal APK in `build/android/` |
+| `build/baremetal/<arch>/` | the kernel, `lib64/` or `lib/` (`libnanochrono.a` and the complete `libnanochrono.so`), `include/` with the bare-metal ABI; the ISOs and a README in `build/baremetal/` |
+
+The shared libraries carry a portable name, not the path they were built at:
+`SONAME` `libnanochrono.so` on Linux and Android, and the install name
+`@rpath/libnanochrono.dylib` on macOS — so a program that links the dylib adds
+its own run path, e.g. `-Wl,-rpath,@executable_path/../lib`.
+
+The toolchains it expects are listed at the top of the script. There is no
+32-bit Arm Windows build: Windows 11 24H2 and later do not run 32-bit Arm
+programs, and Rust has only tier-3 MSVC targets for them.
 
 ### Android
 
@@ -89,21 +122,23 @@ ANDROID_API=24 packaging/android/build.sh  # raise the minimum API level
 
 Needs an NDK (r27 tested). The path comes from `ANDROID_NDK_HOME`,
 `ANDROID_NDK_ROOT` or `~/toolchains/android-ndk` — nothing is hardcoded in the
-repository. Output lands in `dist/android/<abi>/`:
+repository. Each ABI lands in `build/android/<abi>/`, laid out as an install
+prefix — `lib64/` for the 64-bit ABIs, `lib/` for `armeabi-v7a` and `x86`:
 
 | File | What it is |
 |---|---|
-| `libnanochrono.so` | Shared library, for an APK's `jniLibs/<abi>/` |
-| `libnanochrono.a` | Static archive, for an `ndk-build`/CMake link |
-| `nanochrono` | CLI, dynamically linked against bionic |
-| `nanochrono-static` | CLI, statically linked — `adb push` and run |
+| `lib64/libnanochrono.so` | Shared library, for an APK's `jniLibs/<abi>/` |
+| `lib64/libnanochrono.a` | Static archive, for an `ndk-build`/CMake link |
+| `include/nanochrono.h` | The C ABI, beside the libraries |
+| `bin/nanochrono` | CLI, dynamically linked against bionic |
+| `bin/nanochrono-static` | CLI, statically linked — `adb push` and run |
 
 All four ABIs are built and exercised: `arm64-v8a`, `armeabi-v7a`, `x86_64`
 and `x86`. The GUI is excluded — `iced` needs a windowing system that winit
 does not drive from a plain Android executable.
 
 ```sh
-adb push dist/android/arm64-v8a/nanochrono-static /data/local/tmp/nanochrono
+adb push build/android/arm64-v8a/bin/nanochrono-static /data/local/tmp/nanochrono
 adb shell chmod +x /data/local/tmp/nanochrono
 adb shell /data/local/tmp/nanochrono dispatch
 ```
@@ -146,10 +181,13 @@ Mac needs nothing but `cargo build --release`.
 
 | Output | What it is |
 |---|---|
-| `dist/macos/arm64/` | Apple Silicon |
-| `dist/macos/x86_64/` | Intel |
-| `dist/macos/universal/` | Both slices in one file, via `lipo` |
-| `NanoChronometer.app` | The GUI as a bundle, in each of the three |
+| `build/macos-aarch64/` | Apple Silicon |
+| `build/macos-x86_64/` | Intel |
+| `build/macos-universal/` | Both slices in one file, via `lipo` |
+
+Each is an install prefix: `bin/` (the CLI and the GUI), `lib/`
+(`libnanochrono.dylib` and `libnanochrono.a`), `include/nanochrono.h`, and
+`NanoChronometer.app` — the GUI as a bundle.
 
 The deployment target is **macOS 11.0**, the first release that ran on Apple
 Silicon — below that the arm64 slice would have no machine to run on.
@@ -175,6 +213,14 @@ certificate and a Mac — this project cannot do it for you.
 ./packaging/baremetal/build.sh debug        # x86_64 at -O0 -g, frame pointers
 ./packaging/baremetal/build.sh gdb x86_64 [crashtest=df]  # the same, stopped for GDB
 ```
+
+The output is `build/baremetal/` (`build/baremetal-debug/` for the debug
+modes): per architecture the kernel, `lib64/` or `lib/` with `libnanochrono.a`
+and `libnanochrono.so`, and `include/nanochrono.h`. The shared object is the
+whole library, but bare metal has no dynamic linker, so using it means writing a
+loader that resolves its symbols at run time — the `README.md` shipped beside it
+says what that takes, and [docs/BAREMETAL_LIBRARIES.md](docs/BAREMETAL_LIBRARIES.md)
+walks through it.
 
 | Architecture | Rust target | Machine (QEMU) | Enters via | Console |
 |---|---|---|---|---|
@@ -406,7 +452,7 @@ trace, then writes a `.DMP` crash dump:
 
 ```sh
 tools/nanodump.py show /run/media/$USER/NANOCRASH/CRASH.DMP \
-    --elf dist/baremetal/x86_64/nanochrono-kernel.sym.elf
+    --elf build/baremetal/x86_64/nanochrono-kernel.sym.elf
 ```
 
 `crashtest=<de|pf|gp|ud|so|df|panic>` on the kernel command line raises a
@@ -678,7 +724,7 @@ invariant_counter=true available=[legacy-asm mmx sse sse2 sse3 ssse3 sse4.1 sse4
 Android, cross-built and run under `qemu-user`:
 
 ```console
-$ qemu-aarch64 dist/android/arm64-v8a/nanochrono-static dispatch
+$ qemu-aarch64 build/android/arm64-v8a/bin/nanochrono-static dispatch
 arch=arm64 backend=sme (detected) simd=sme (detected) route=best-simd-counter (detected)
 invariant_counter=true available=[legacy-asm neon sve sve2 sme]
 ```

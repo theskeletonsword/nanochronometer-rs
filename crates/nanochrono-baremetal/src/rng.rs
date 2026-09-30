@@ -144,31 +144,33 @@ fn pmu_cycles() -> u64 {
 }
 
 // ===========================================================================
-// The C ABI: what a plugin reaches through NcApi / nc_resolve_symbol, with
-// the same names and meaning as libnanochrono's hosted functions.
+// The C ABI, twice over. A plugin reaches the functions below through NcApi
+// or nc_resolve_symbol: its pointers are checked against its own memory and
+// its capabilities. C or assembly linked into the kernel — through the
+// static archive or the shared object — reaches the `#[no_mangle]` ones in
+// `crate::abi`, which trust a ring-0 caller with its own pointers like any C
+// function does. Both do the work here, with the same names and meaning as
+// libnanochrono's hosted functions.
 // ===========================================================================
 
 /// Most bytes one `nc_rng_fill` call may ask for.
 pub const NC_RNG_MAX_FILL: usize = 1 << 20;
 
-/// `int64_t nc_rng_fill(void *buf, size_t len, uint32_t flags)`: fills
-/// `buf` and returns `len`, or a negative `NC_RNG_E*` code with `buf`
-/// zeroed. Bit 0 of `flags` selects `NC_RNG_TRUE`.
-#[allow(clippy::not_unsafe_ptr_arg_deref)] // C-ABI entry; the pointer is
-// checked with caller_owns before any access.
-pub extern "C" fn nc_rng_fill(buf: *mut u8, len: usize, flags: u32) -> i64 {
-    if !rng_cap_ok() {
-        return RngError::Misuse.code() as i64;
-    }
+/// Who may be written through a pointer handed to the C ABI: `owns(ptr,
+/// len)` says whether `[ptr, ptr + len)` is the caller's.
+pub(crate) type Owns = fn(usize, usize) -> bool;
+
+/// `nc_rng_fill`'s work: fills `buf` and returns `len`, or a negative
+/// `NC_RNG_E*` code with `buf` zeroed.
+pub(crate) fn fill_c(buf: *mut u8, len: usize, flags: u32, owns: Owns) -> i64 {
     if len == 0 {
         return 0;
     }
-    if buf.is_null() || len > NC_RNG_MAX_FILL || !caller_owns(buf as usize, len) {
+    if buf.is_null() || len > NC_RNG_MAX_FILL || !owns(buf as usize, len) {
         return RngError::Misuse.code() as i64;
     }
-    // SAFETY: `[buf, buf + len)` lies in the calling plugin's own memory
-    // (its arena or its stack), checked just above: the kernel never writes
-    // where a plugin merely points it.
+    // SAFETY: `[buf, buf + len)` is the caller's, by `owns`: for a plugin its
+    // own arena or stack, checked; for ring 0, the caller's word.
     let out = unsafe { core::slice::from_raw_parts_mut(buf, len) };
     match fill(out, Mode::from_flags(flags)) {
         Ok(n) => n as i64,
@@ -176,16 +178,11 @@ pub extern "C" fn nc_rng_fill(buf: *mut u8, len: usize, flags: u32) -> i64 {
     }
 }
 
-/// `int32_t nc_rng_status(nc_rng_status_t *out)`: the caller sets
-/// `out->size` to the size it was built with; up to that many bytes are
-/// written, and `size` is set to the number written. 0 or a negative code.
-#[allow(clippy::not_unsafe_ptr_arg_deref)] // C-ABI entry; the pointer is
-// checked with caller_owns before any access.
-pub extern "C" fn nc_rng_status(out: *mut Status) -> i32 {
-    if !rng_cap_ok() {
-        return RngError::Misuse.code();
-    }
-    if out.is_null() || !caller_owns(out as usize, 8) {
+/// `nc_rng_status`'s work: the caller sets `out->size` to the size it was
+/// built with; up to that many bytes are written, and `size` is set to the
+/// number written. 0 or a negative code.
+pub(crate) fn status_c(out: *mut u8, owns: Owns) -> i32 {
+    if out.is_null() || !owns(out as usize, 8) {
         return RngError::Misuse.code();
     }
     // SAFETY: the first 8 bytes are the caller's (checked above), and the
@@ -196,16 +193,47 @@ pub extern "C" fn nc_rng_status(out: *mut Status) -> i32 {
     }
     let status = status();
     let n = capacity.min(core::mem::size_of::<Status>());
-    if !caller_owns(out as usize, n) {
+    if !owns(out as usize, n) {
         return RngError::Misuse.code();
     }
     // SAFETY: `n` bytes fit in the caller's struct by its own declaration,
     // and `status` is a plain `repr(C)` value.
     unsafe {
-        core::ptr::copy_nonoverlapping((&raw const status).cast::<u8>(), out.cast::<u8>(), n);
+        core::ptr::copy_nonoverlapping((&raw const status).cast::<u8>(), out, n);
         core::ptr::write_unaligned(out.cast::<u32>(), n as u32);
     }
     0
+}
+
+/// `nc_rng_selftest`'s work: re-runs the known-answer tests; 0, or
+/// `NC_RNG_ESELFTEST` with the pool out of service.
+pub(crate) fn selftest_c() -> i32 {
+    match with_pool(|pool| pool.selftest()) {
+        Some(Ok(())) => 0,
+        Some(Err(error)) => error.code(),
+        None => RngError::Misuse.code(),
+    }
+}
+
+/// `int64_t nc_rng_fill(void *buf, size_t len, uint32_t flags)`, for a
+/// plugin: bit 0 of `flags` selects `NC_RNG_TRUE`.
+#[allow(clippy::not_unsafe_ptr_arg_deref)] // C-ABI entry; the pointer is
+// checked with caller_owns before any access.
+pub extern "C" fn nc_rng_fill(buf: *mut u8, len: usize, flags: u32) -> i64 {
+    if !rng_cap_ok() {
+        return RngError::Misuse.code() as i64;
+    }
+    fill_c(buf, len, flags, caller_owns)
+}
+
+/// `int32_t nc_rng_status(nc_rng_status_t *out)`, for a plugin.
+#[allow(clippy::not_unsafe_ptr_arg_deref)] // C-ABI entry; the pointer is
+// checked with caller_owns before any access.
+pub extern "C" fn nc_rng_status(out: *mut Status) -> i32 {
+    if !rng_cap_ok() {
+        return RngError::Misuse.code();
+    }
+    status_c(out.cast::<u8>(), caller_owns)
 }
 
 /// Whether a buffer passed through the C ABI belongs to the caller. Only
@@ -250,15 +278,10 @@ pub extern "C" fn nc_rng_stir(tag: u64, value: u64) {
     stir(tag, value);
 }
 
-/// `int32_t nc_rng_selftest(void)`: re-runs the known-answer tests; 0, or
-/// `NC_RNG_ESELFTEST` with the pool out of service.
+/// `int32_t nc_rng_selftest(void)`, for a plugin.
 pub extern "C" fn nc_rng_selftest() -> i32 {
     if !rng_cap_ok() {
         return RngError::Misuse.code();
     }
-    match with_pool(|pool| pool.selftest()) {
-        Some(Ok(())) => 0,
-        Some(Err(error)) => error.code(),
-        None => RngError::Misuse.code(),
-    }
+    selftest_c()
 }

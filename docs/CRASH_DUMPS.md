@@ -58,7 +58,7 @@ UART only (a text-mode screen would scroll the reason away).
 
 ```console
 $ tools/nanodump.py extract serial.log -o CRASH.DMP
-$ tools/nanodump.py show CRASH.DMP --elf dist/baremetal/x86_64/nanochrono-kernel.sym.elf
+$ tools/nanodump.py show CRASH.DMP --elf build/baremetal/x86_64/nanochrono-kernel.sym.elf
 ```
 
 The release ISO boots a stripped kernel. `build.sh` keeps the symbols in
@@ -108,7 +108,7 @@ protective as UEFI expects. Write the ISO to a stick and boot from it. The
 stick is then its own dump target:
 
 ```console
-$ sudo dd if=dist/baremetal/nanochronometer_x86_64.iso of=/dev/sdX bs=4M conv=fsync
+$ sudo dd if=build/baremetal/nanochronometer_x86_64.iso of=/dev/sdX bs=4M conv=fsync
 ```
 
 After a crash, plug the stick into any PC. The `NANOCRASH` volume mounts on
@@ -116,7 +116,7 @@ its own:
 
 ```console
 $ tools/nanodump.py show /run/media/$USER/NANOCRASH/CRASH.DMP \
-      --elf dist/baremetal/x86_64/nanochrono-kernel.sym.elf
+      --elf build/baremetal/x86_64/nanochrono-kernel.sym.elf
 ```
 
 A `CRASH.DMP` that is all zeros means nothing has crashed since the stick was
@@ -175,7 +175,7 @@ power-on.
 ## Debugging under GDB
 
 ```console
-$ packaging/baremetal/build.sh debug            # -O0 -g + frame pointers → dist/baremetal-debug/
+$ packaging/baremetal/build.sh debug            # -O0 -g + frame pointers → build/baremetal-debug/
 $ packaging/baremetal/build.sh gdb x86_64       # boots the debug ISO, stopped for GDB
 $ packaging/baremetal/build.sh gdb x86_64 crashtest=df
 $ gdb -x packaging/baremetal/gdb/x86_64.gdb     # in another terminal, from the repo root
@@ -193,9 +193,9 @@ because the exceptions are delivered by the CPU, not by QEMU. A triple fault
 still shows, as QEMU exiting and an extra `CPU Reset`.
 
 The ISO is booted **as a USB stick**, from a copy (`gdb-stick.img`) so
-nothing in `dist/` is written. That is how it runs on hardware, and it makes
+nothing in `build/` is written. That is how it runs on hardware, and it makes
 the stick the dump's USB target. The serial output is shown and saved to
-`dist/baremetal-debug/serial.log`. When QEMU exits, the dump is extracted
+`build/baremetal-debug/serial.log`. When QEMU exits, the dump is extracted
 from the serial log and also read back from the stick's `CRASH.DMP`. The two
 are compared. `QEMU_DISPLAY=none` runs it without a window.
 

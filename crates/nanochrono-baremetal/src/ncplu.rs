@@ -1331,14 +1331,15 @@ pub unsafe fn run(
         }
     };
     report(name, &loaded, hz);
-    // Grant exactly what the plugin declared; every service checks it.
-    GRANTED_CAPS.store(loaded.capabilities, Ordering::Relaxed);
 
     if !crate::plugin_card::confirm(fb, input, name, &loaded, hz) {
         crate::println!("plugin: {name}: cancelled at the launch card");
         return -2;
     }
 
+    // Grant exactly what the plugin declared, only for as long as it runs;
+    // every service checks it.
+    GRANTED_CAPS.store(loaded.capabilities, Ordering::Relaxed);
     let mut ctx = PluginCtx { fb, input, pmu };
     PLUGIN_TICKS_PER_SEC.store(hz, Ordering::Relaxed);
     PLUGIN_CTX.store(&mut ctx as *mut PluginCtx as usize, Ordering::Relaxed);

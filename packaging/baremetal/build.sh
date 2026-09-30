@@ -22,21 +22,32 @@
 # sdk/) to the ISO's FAT partition beside the in-tree ones.
 #
 # Plugin signing (ML-DSA-87 + P-521; keys from tools/ncplu-sign, kept OUTSIDE
-# the repository):
-#   NCPLU_ROOT_PUBKEYS=KEYDIR/root_pubkeys.bin   the public keys the x86_64
-#                                                kernel trusts (Official tier)
+# the repository). Without a root every plugin is a community one, at ring 3:
+#   NCPLU_ROOT_CREATOR=KEYDIR/root_pubkeys.bin   the creator's root (the green
+#                                                check tier; runs in the kernel)
+#   NCPLU_ROOT_TREE=KEYDIR/root_pubkeys.bin      a root the owner trusts (the
+#                                                tree tier; runs in the kernel)
+#   NCPLU_ROOT_PUBKEYS                           the old name for the creator's
 #   NCPLU_SIGN_KEYS=KEYDIR                       sign every plugin on the ISO
 #   PLUGIN_PROFILE=debug|release                 plugins at -O0 or -O3; by
 #                                                default they follow the kernel
 #
-# The release build (no mode) strips the kernel that goes into the ISO and
-# keeps the symbols in `nanochrono-kernel.sym.elf`, next to it, for
-# tools/nanodump.py to symbolise crash dumps against.
+# Output, build/baremetal/ (build/baremetal-debug/ for debug, gdb and boot):
+#   <arch>/nanochrono-kernel.elf        the kernel (stripped in a release)
+#   <arch>/nanochrono-kernel.sym.elf    release: its symbols, for
+#                                       tools/nanodump.py and GDB
+#   <arch>/lib64/ (lib/ when 32-bit)    libnanochrono.a, and in a release
+#                                       libnanochrono.so: the same library,
+#                                       position independent, which needs a
+#                                       loader of your own (README.md)
+#   <arch>/include/nanochrono.h         the C/assembly header for both
+#   nanochronometer_*.iso, plugins/     bootable images and packed plugins
+#   README.md                           what all of this is and how to use it
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 crate="${repo_root}/crates/nanochrono-baremetal"
-out_dir="${repo_root}/dist/baremetal"
+out_dir="${repo_root}/build/baremetal"
 
 # `x86_64-nanochrono-none` is a custom spec: the built-in `x86_64-unknown-none`
 # has a soft-float ABI where no vector register can be allocated, so the SIMD
@@ -73,10 +84,72 @@ export RUST_TARGET_PATH="${crate}/targets"
 # for the `debug` and `gdb` modes.
 build_kind="release"
 
+# Where an architecture's libraries go: lib64/ on a 64-bit target, lib/ on a
+# 32-bit one, as a Unix prefix lays them out, with include/ beside it.
+lib_dir() {
+    case "$1" in
+        i386 | arm32 | ppc | riscv32) echo lib ;;
+        *) echo lib64 ;;
+    esac
+}
+
+# The toolchain's own LLVM linker, which links every target here; it links
+# the shared objects (build_shared).
+rust_lld() {
+    local sysroot host
+    sysroot="$(rustc ${toolchain} --print sysroot)"
+    host="$(rustc ${toolchain} -vV | sed -n 's/^host: //p')"
+    echo "${sysroot}/lib/rustlib/${host}/bin/rust-lld"
+}
+
+# The C/assembly header, generated from src/abi.rs (tools/gen-header.sh) when
+# cbindgen is here; otherwise the copy a previous run generated is used.
+header="${repo_root}/include/baremetal/nanochrono.h"
+if command -v cbindgen >/dev/null 2>&1; then
+    "${repo_root}/tools/gen-header.sh" >/dev/null
+elif [[ ! -f "${header}" ]]; then
+    echo "note: no cbindgen and no include/baremetal/nanochrono.h; the libraries ship without it"
+fi
+
 # An objcopy that understands every target here. LLVM's does; the host's GNU
 # one may only know the host's formats.
 objcopy_tool() {
     command -v llvm-objcopy || command -v rust-objcopy || command -v objcopy
+}
+
+# The shared object: the same library as the static archive, not a trimmed
+# one. A `cdylib` would keep only the `#[no_mangle]` entry points and what
+# they reach. This builds the crate again, position independent (the arch's
+# `-dylib` spec: PIC, dynamically linkable, no kernel code model), with the
+# manifest's own crate types — rlib and staticlib, as the static archive is
+# built, so rustc makes the same symbols public (a staticlib-only build would
+# internalise the Rust-level ones) — and links every object of that archive
+# with --whole-archive. Every public symbol is exported, the same set the
+# static archive offers; what the compiler hid there (compiler_builtins, private
+# generic copies) stays inside, unexported, as it does in the archive.
+#
+# `-Bsymbolic` binds the library's references to its own symbols inside it —
+# there is no symbol interposition on bare metal — which is what lets the boot
+# and trap assembly address them PC- or TOC-relative. `__bss_end` comes from
+# the kernel's linker script, which a shared object does not use; here it is
+# the end of the object's own .bss (`_end`). `-z notext` lets an absolute
+# address stay in the text for the loader to relocate. It still needs a loader
+# of the kernel's own — bare metal has none; see README.md.
+build_shared() {
+    local arch="$1" spec="${arch_target[$1]}-dylib"
+    local target_dir="${CARGO_TARGET_DIR:-${crate}/target}"
+    local libdir so
+    libdir="$(lib_dir "${arch}")"
+    so="${out_dir}/${arch}/${libdir}/libnanochrono.so"
+    echo "=== ${arch} shared object (${spec})"
+    # shellcheck disable=SC2086
+    (cd "${crate}" && cargo ${toolchain} build --release --lib \
+        --target "${spec}" ${arch_features[${arch}]})
+    "$(rust_lld)" -flavor gnu -shared -Bsymbolic --defsym=__bss_end=_end \
+        --whole-archive "${target_dir}/${spec}/release/libnanochrono_baremetal.a" \
+        --no-whole-archive \
+        -soname libnanochrono.so -z notext --hash-style=both --build-id \
+        -o "${so}"
 }
 
 build_one() {
@@ -100,10 +173,18 @@ build_one() {
     (cd "${crate}" && cargo ${toolchain} build "${profile_args[@]}" --target "${target}" \
         ${arch_features[${arch}]})
 
-    mkdir -p "${out_dir}/${arch}"
+    local libdir
+    libdir="$(lib_dir "${arch}")"
+    mkdir -p "${out_dir}/${arch}/${libdir}"
     local elf="${target_dir}/${target}/${profile_dir}/nanochrono-kernel"
     cp "${elf}" "${out_dir}/${arch}/nanochrono-kernel.elf"
-    cp "${target_dir}/${target}/${profile_dir}/libnanochrono_baremetal.a" "${out_dir}/${arch}/"
+    # Shipped as libnanochrono, the name every platform's release uses, so a
+    # C kernel links it with -lnanochrono and includes nanochrono.h.
+    cp "${target_dir}/${target}/${profile_dir}/libnanochrono_baremetal.a" \
+        "${out_dir}/${arch}/${libdir}/libnanochrono.a"
+    if [[ -f "${header}" ]]; then
+        install -Dm644 "${header}" "${out_dir}/${arch}/include/nanochrono.h"
+    fi
 
     if [[ "${build_kind}" == "release" ]]; then
         # The image that boots carries no symbol table; the copy beside it
@@ -118,16 +199,8 @@ build_one() {
         fi
     fi
 
-    # The shared object needs its own spec: position independent, dynamically
-    # linkable, and without the kernel code model. It also needs a loader that
-    # does not exist on bare metal — see docs/BAREMETAL_LIBRARIES.md.
-    if [[ "${arch}" == "x86_64" && "${build_kind}" == "release" ]]; then
-        # shellcheck disable=SC2086
-        (cd "${crate}" && cargo ${toolchain} rustc --release --lib \
-            --target "${target}-dylib" --crate-type cdylib \
-            ${arch_features[${arch}]}) || true
-        local so="${target_dir}/${target}-dylib/release/libnanochrono_baremetal.so"
-        [[ -f "${so}" ]] && cp "${so}" "${out_dir}/${arch}/"
+    if [[ "${build_kind}" == "release" ]]; then
+        build_shared "${arch}"
     fi
 
     if [[ "${arch}" == "x86_64" ]]; then
@@ -320,7 +393,7 @@ run_one() {
 # exception and reset to qemu-int.log. The serial output goes to the terminal
 # and to serial.log, which is where a crash dump is read back from.
 #
-# The ISO is booted **as a USB stick** — a copy of it, so dist/ is not
+# The ISO is booted **as a USB stick** — a copy of it, so build/ is not
 # written to — because that is how it runs on hardware, and because the stick
 # is then the crash dump's USB target as well: a fault writes CRASH.DMP into
 # the stick's own NANOCRASH partition, and this reads it back afterwards.
@@ -402,7 +475,7 @@ if [[ "${mode}" == "debug" || "${mode}" == "gdb" || "${mode}" == "boot" ]]; then
     build_kind="debug"
     # Beside the release output, not over it: a debug kernel is 8 MiB of
     # DWARF and never ships.
-    out_dir="${repo_root}/dist/baremetal-debug"
+    out_dir="${repo_root}/build/baremetal-debug"
     if [[ "${mode}" == "gdb" || "${mode}" == "boot" ]]; then
         args=()
         for a in "$@"; do
@@ -475,7 +548,7 @@ build_iso_ppc_of() {
 # signature plus El Torito images for both BIOS and UEFI, which is what makes
 # it work with dd, Rufus, Ventoy, YUMI and UNetbootin alike.
 # Builds every plugin under crates/nanochrono-plugins/ at -O0 and packs each
-# into dist/.../plugins/<NAME>.NCPLU, ready to drop onto the crash partition.
+# into build/.../plugins/<NAME>.NCPLU, ready to drop onto the crash partition.
 # A plugin is a shared object on the -dylib target; tools/ncplu.py flattens it
 # into the loader's format. GPL plugins (DOOM, a GPL decoder) are built the
 # same way but live outside this repository.
@@ -863,6 +936,7 @@ if [[ "${mode}" == "build" ]]; then
     cp "${repo_root}/LICENSE" "${repo_root}/NOTICE" "${out_dir}/"
     cp "${repo_root}/docs/BAREMETAL_LIBRARIES.md" "${repo_root}/docs/BAREMETAL_DRIVERS.md" \
         "${out_dir}/"
+    cp "${repo_root}/packaging/baremetal/README.release.md" "${out_dir}/README.md"
     echo
     echo "=== ${out_dir}"
     find "${out_dir}" -type f -printf '%p  %s bytes\n' | sort

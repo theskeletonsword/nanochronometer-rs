@@ -7,19 +7,30 @@ Two artifacts, and one of them needs work from you before it does anything.
 ```
 
 ```
-dist/baremetal/x86_64/
-  libnanochrono_baremetal.a      static: link it and you are done
-  libnanochrono_baremetal.so     dynamic: read the second half of this file
+build/baremetal/x86_64/          every architecture has the same layout
+  lib64/                         lib/ on i386, arm32, ppc and riscv32
+    libnanochrono.a              static: link it and you are done
+    libnanochrono.so             dynamic: read the second half of this file
+  include/nanochrono.h           the C ABI, for C and for assembly
   nanochrono-kernel.elf          the demo kernel
-  nanochrono-kernel.mb.elf       the same, as ELF32 for QEMU's -kernel
+  nanochrono-kernel.mb.elf       x86_64: the same, as ELF32 for QEMU's -kernel
 ```
+
+Both libraries hold the same code and export the same C ABI, which
+`include/nanochrono.h` declares: the PMU (`nc_bm_pmu_*`), the counter
+(`nc_bm_counter*`) and NC_RNG (`nc_rng_*`, identical to the hosted
+libnanochrono's). The header is generated from
+`crates/nanochrono-baremetal/src/abi.rs`, is freestanding, and can be
+`#include`d from a `.S` file — the constants are plain `#define`s and the C
+declarations sit under `#ifndef __ASSEMBLER__`.
 
 ---
 
 ## Static — the one that just works
 
 ```sh
-ld -T your-linker.ld your-kernel.o -L dist/baremetal/x86_64 -lnanochrono_baremetal
+cc -ffreestanding -I build/baremetal/x86_64/include -c your-kernel.c
+ld -T your-linker.ld your-kernel.o -L build/baremetal/x86_64/lib64 -lnanochrono
 ```
 
 The archive carries the counter routes, the direct PMU, the ECC/TMR machinery,
@@ -46,7 +57,7 @@ does all of it and is a working reference. Without it every SIMD instruction is
 
 ## Dynamic — you must supply the runtime
 
-**`libnanochrono_baremetal.so` will not load itself.** There is no
+**`libnanochrono.so` will not load itself.** There is no
 `ld.so` on bare metal, so nothing exists to map the segments, apply the
 relocations and bind the symbols. Shipping the file without saying so would be
 shipping something that cannot work.
@@ -80,6 +91,16 @@ Relocations live in `DT_RELA` with `DT_RELASZ` bytes, and `DT_JMPREL` with
 address in the library is wrong until you have applied them, and the failure is
 a jump into nothing rather than a diagnostic.
 
+The other architectures carry the same four kinds under their own names —
+`R_386_*`, `R_AARCH64_*`, `R_ARM_*`, `R_PPC_*`, `R_PPC64_*`, `R_RISCV_*`
+(`RELATIVE`, `GLOB_DAT`, `JUMP_SLOT` or `JMP_SLOT`, and the plain absolute
+`_64`/`_32`/`ABS32`); i386 and 32-bit ARM use `DT_REL`, whose addend is the word
+already at the target. `readelf -r` shows exactly what a given object needs.
+
+Every object is flagged `TEXTREL`: the hand-written boot and trap assembly keeps
+a few absolute addresses in its text. Keep the text writable while you relocate
+it, then make it read-only and executable.
+
 ### 3. Resolve symbols
 
 `DT_SYMTAB` and `DT_STRTAB` give the symbol table and its strings;
@@ -87,9 +108,16 @@ a jump into nothing rather than a diagnostic.
 symbol table linearly instead — it is slower and much shorter to write, and a
 kernel resolving a few dozen symbols once will not notice.
 
-This library needs nothing from its host: it is `no_std` and calls no
-imports. So your resolver only has to satisfy references *into* the library,
-not out of it. That is what makes it a tractable first loader.
+The library was linked with `-Bsymbolic`, so its references to its own
+symbols are already bound inside it; your resolver satisfies lookups *into*
+the library, and a handful of imports. Those are symbols the NanoChronometer
+kernel image defines for itself — the image's bounds (`__kernel_start`,
+`__kernel_end`) everywhere; on x86_64 its stacks and text bounds; `kmain` on
+PowerPC and RISC-V; `__global_pointer$` on RISC-V — named only by the boot,
+trap and crash-dump code, which a loaded module does not run.
+`readelf --dyn-syms --wide libnanochrono.so | grep UND` lists them; bind each to
+your kernel's equivalent, or to a harmless address if you never call that
+code. That is what keeps this a tractable first loader.
 
 ### 4. Flush the instruction cache
 
@@ -97,13 +125,19 @@ On AArch64, after writing relocations into memory you are about to execute:
 `dc cvau` on each line, `dsb ish`, `ic ivau`, `dsb ish`, `isb`. Skipping this
 works right up until it does not, on a machine with a larger cache than yours.
 
-x86-64 keeps its caches coherent with instruction fetch and needs none of this.
+32-bit ARM needs the same maintenance for its caches; PowerPC `dcbst`, `sync`,
+`icbi`, `isync`; RISC-V `fence.i`. x86 keeps its caches coherent with
+instruction fetch and needs none of this.
+
+On ppc64 and ppc64le (ELFv2), call a function through its global entry point
+with `r12` holding that address, so it can find its TOC.
 
 ### 5. Then call it
 
 ```rust
-type Detect = unsafe extern "C" fn() -> u32;
-let detect: Detect = core::mem::transmute(resolve(b"nc_pmu_detect\0")?);
+type AbiVersion = unsafe extern "C" fn() -> u32;
+let version: AbiVersion = core::mem::transmute(resolve(b"nc_bm_abi_version\0")?);
+assert_eq!(version(), 1); // NC_BM_ABI_VERSION in nanochrono.h
 ```
 
 ### Why you might not want to

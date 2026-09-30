@@ -27,8 +27,8 @@ set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 app="${repo_root}/packaging/android/app"
-out="${repo_root}/dist/android-app"
-work="${repo_root}/target/android-app"
+out="${repo_root}/build/android"
+work="${CARGO_TARGET_DIR:-${repo_root}/target}/android-app"
 
 sdk="${ANDROID_HOME:-${HOME}/Android/Sdk}"
 ndk="${ANDROID_NDK_HOME:-$(ls -d "${sdk}"/ndk/*/ 2>/dev/null | sort -V | tail -1)}"

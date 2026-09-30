@@ -6,7 +6,7 @@ underwater code as the desktop and bare-metal builds.
 
 ```sh
 ANDROID_HOME=~/Android/Sdk RUST_BIN=~/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/bin \
-    packaging/android/build-app.sh            # -> dist/android-app/nanochronometer-<version>.apk
+    packaging/android/build-app.sh            # -> build/android/nanochronometer-<version>.apk
 ```
 
 The build uses no Gradle: aapt2, javac, d8, zipalign and apksigner come from

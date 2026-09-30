@@ -396,11 +396,20 @@ _start:
 5:  mr 30, 5
 6:
 
+    // Every address below is taken relative to this code (r7, from
+    // `bcl 20,31` — the get-the-PC form that leaves the return predictor
+    // alone) rather than as an absolute constant: the same, here, since the
+    // kernel runs where it is linked, and it lets this code link into the
+    // position-independent shared object too. ePAPR's r7 (the size of the
+    // initial mapped area) is never used.
+    bcl 20, 31, 8f
+8:  mflr 7
+
     // Zero .bss (4-byte stores; the linker script aligns both bounds).
-    lis 4, __bss_start@ha
-    addi 4, 4, __bss_start@l
-    lis 5, __bss_end@ha
-    addi 5, 5, __bss_end@l
+    addis 4, 7, (__bss_start - 8b)@ha
+    addi 4, 4, (__bss_start - 8b)@l
+    addis 5, 7, (__bss_end - 8b)@ha
+    addi 5, 5, (__bss_end - 8b)@l
     li 0, 0
 1:  cmplw 4, 5
     bge 2f
@@ -410,8 +419,8 @@ _start:
 
 2:  // Our stack, 16-byte aligned, one 16-byte SysV frame with a zero back
     // chain.
-    lis 1, nc_stack_top@ha
-    addi 1, 1, nc_stack_top@l
+    addis 1, 7, (nc_stack_top - 8b)@ha
+    addi 1, 1, (nc_stack_top - 8b)@l
     stwu 0, -16(1)
 
     // MSR[FP] on before any Rust. Book E keeps the classic FPU's bit.
@@ -433,8 +442,12 @@ _start:
     beq 7f
 
     // Exception vectors before anything can fault: IVPR holds the upper
-    // half of the table's address, IVORn the offset of each handler.
-    lis 3, nc_ivor_table@h
+    // half of the table's address, IVORn the offset of each handler. The
+    // table is 64 KiB aligned, so its address is its upper half; the mask
+    // keeps IVPR's reserved low bits clear regardless.
+    addis 3, 7, (nc_ivor_table - 8b)@ha
+    addi 3, 3, (nc_ivor_table - 8b)@l
+    rlwinm 3, 3, 0, 0, 15
     mtspr 63, 3
     li 3, nc_ivor_0 - nc_ivor_table
     mtspr 400, 3
@@ -491,9 +504,13 @@ nc_ivor_\\v:
 .endr
 
 nc_ppc32_fatal:
-    // A private stack: the fault may have been a stack overflow.
-    lis 1, nc_exc_stack_top@ha
-    addi 1, 1, nc_exc_stack_top@l
+    // A private stack: the fault may have been a stack overflow. Found
+    // relative to this code, like _start's (the interrupted LR is already
+    // lost to the `bl` below, and SRR0 holds the faulting address).
+    bcl 20, 31, 9f
+9:  mflr 1
+    addis 1, 1, (nc_exc_stack_top - 9b)@ha
+    addi 1, 1, (nc_exc_stack_top - 9b)@l
     li 0, 0
     stwu 0, -16(1)
     // Interrupt entry clears MSR[FP]; the reporter formats numbers.
