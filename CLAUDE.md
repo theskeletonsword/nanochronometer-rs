@@ -30,11 +30,16 @@ in `CLAUDE.local.md`.
   libunwind) `build-all.sh` rebuilt from `~/llvm-mingw` with the paths mapped.
 - Release assets: `packaging/release/package.sh` → `build/release-<version>/`:
   one `.zip` per OS holding all its architectures (linux, windows, macos,
-  android, baremetal), the APK and the ISOs, `SHA256SUMS` — only those go on
+  android, baremetal — the ISOs inside it, in `iso/`: x86_64, i386, aarch64,
+  ppc-openfirmware), the APK, `SHA256SUMS`
+  — only those go on
   the GitHub release. The `-debug.zip` files land in
   `build/release-<version>/debug/` and are **not published** (the
   maintainer's call). Each asset carries `LICENSE`, `NOTICE` and
   `THIRD-PARTY-LICENSES.txt` (`tools/third-party-licenses.py`).
+  The aarch64 ISO needs the arm64-efi GRUB modules: `dnf download
+  grub2-efi-aa64-modules` unpacked (`rpm2cpio | cpio -idm`) in
+  `~/.cache/nanochrono/grub` is enough; build.sh looks there.
 - Debug before release, at **both -O0 and -Og** (the latter catches what only
   optimised code shows): `cargo test` and `cargo test --profile debug-og`;
   bare metal `build.sh debug` and `build.sh debug-og`; C SDK `make MODE=debug`

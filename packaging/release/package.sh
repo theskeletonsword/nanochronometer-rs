@@ -12,13 +12,12 @@
 #                                     library keeps its symbol table, without
 #                                     its debug information
 #   nanochronometer-<v>.apk and its .idsig
-#   nanochronometer-<v>-baremetal-<arch>.iso   the bootable images, as they are
 #   SHA256SUMS
 #
 # for linux (x86_64, i686, aarch64, armv7, riscv64), windows (x86_64,
 # aarch64, i686), macos (x86_64, aarch64, universal), android (arm64-v8a,
 # armeabi-v7a, x86_64, x86) and baremetal (the nine architectures, with the
-# plugins and the documentation).
+# plugins, the documentation and the bootable ISOs in iso/).
 #
 # The debug information goes to debug/ beside them, and is not published:
 #
@@ -98,6 +97,11 @@ pack() {
         shift
     done
     [[ "${1:-}" == -- ]] && shift
+    # The kernel drivers are built on their own (kernel/) and may sit in a
+    # prefix — nanochrono.ko on Linux, driver/nanochrono.sys on Windows; they
+    # are not part of the release. ISOs come in only as an extra, renamed.
+    find "${main}/${top}" \( -name '*.ko' -o -name '*.iso' \) -delete
+    find "${main}/${top}" -type d -name driver -prune -exec rm -rf {} +
     local extra
     for extra in "$@"; do
         command cp -R "${extra}" "${main}/${top}/"
@@ -110,11 +114,6 @@ pack() {
         windows) install -Dm644 "${mingw_notice}" "${main}/${top}/licenses/MinGW-w64-runtime.txt" ;;
         android) install -Dm644 "${ndk_notice}" "${main}/${top}/licenses/Android-NDK-NOTICE.txt" ;;
     esac
-    # The kernel drivers are built on their own (kernel/) and may sit in a
-    # prefix — nanochrono.ko on Linux, driver/nanochrono.sys on Windows; they
-    # are not part of the release. The bootable images are assets of their own.
-    find "${main}/${top}" \( -name '*.ko' -o -name '*.iso' \) -delete
-    find "${main}/${top}" -type d -name driver -prune -exec rm -rf {} +
     # The debug information moves to the -debug.zip, at the same paths.
     local p items
     mapfile -t items < <(cd "${main}/${top}" &&
@@ -162,14 +161,15 @@ fi
 
 # Bare metal: build/baremetal as it is — a directory per architecture, the
 # plugins — with the documentation from the repository, as the licence texts
-# are. The ISOs stay images, to be written to a stick or a CD as they are.
+# are, and the bootable images in iso/.
 bm="${build}/baremetal"
 install -Dm644 "${repo}/packaging/baremetal/README.release.md" "${stage}/bmdocs/README.md"
-pack baremetal ":${bm}" -- "${stage}/bmdocs/README.md" \
-    "${repo}/docs/BAREMETAL_LIBRARIES.md" "${repo}/docs/BAREMETAL_DRIVERS.md"
-for row in x86_64:x86_64 i386:i386 ppc_of:ppc-openfirmware; do
-    install -m644 "${bm}/nanochronometer_${row%%:*}.iso" "${out}/nanochronometer-${version}-baremetal-${row#*:}.iso"
+for row in x86_64:x86_64 i386:i386 arm64:aarch64 ppc_of:ppc-openfirmware; do
+    [[ -f "${bm}/nanochronometer_${row%%:*}.iso" ]] || { echo "error: no ${row%%:*} ISO in ${bm}" >&2; exit 1; }
+    install -Dm644 "${bm}/nanochronometer_${row%%:*}.iso" "${stage}/iso/nanochronometer-${version}-${row#*:}.iso"
 done
+pack baremetal ":${bm}" -- "${stage}/bmdocs/README.md" \
+    "${repo}/docs/BAREMETAL_LIBRARIES.md" "${repo}/docs/BAREMETAL_DRIVERS.md" "${stage}/iso"
 
 # One SHA256SUMS per directory: the published one covers what is published.
 for d in "${out}" "${dbgout}"; do

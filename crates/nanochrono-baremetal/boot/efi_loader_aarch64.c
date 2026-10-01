@@ -17,7 +17,13 @@
  *
  *   1. allocates the needed pages at that exact address (AllocateAddress);
  *   2. copies each PT_LOAD segment to its linked virtual address;
- *   3. jumps to the ELF entry point `e_entry`.
+ *   3. leaves boot services (ExitBootServices), so no firmware timer or
+ *      driver runs on behind the kernel's back;
+ *   4. hands over the machine as a firmware's direct boot would: interrupts
+ *      masked, the image cleaned from the data cache to the point of
+ *      coherency, then the MMU and the caches off — the kernel's entry
+ *      assumes exactly that, and turns them back on with its own tables;
+ *   5. jumps to the ELF entry point `e_entry`.
  *
  * We cannot allocate at the base with a plain `chainloader`, which is why this
  * EFI wrapper exists: the image is embedded in the PE and copied to the
@@ -113,6 +119,12 @@ typedef EFI_STATUS (*EFI_ALLOCATE_PAGES)(
 
 typedef VOID (*EFI_COPY_MEM)(VOID *Dest, const VOID *Src, uint64_t Len);
 
+typedef EFI_STATUS (*EFI_GET_MEMORY_MAP)(
+    uint64_t *MemoryMapSize, VOID *MemoryMap, uint64_t *MapKey,
+    uint64_t *DescriptorSize, uint32_t *DescriptorVersion);
+
+typedef EFI_STATUS (*EFI_EXIT_BOOT_SERVICES)(EFI_HANDLE ImageHandle, uint64_t MapKey);
+
 typedef struct EFI_BOOT_SERVICES EFI_BOOT_SERVICES;
 
 struct EFI_BOOT_SERVICES {
@@ -121,7 +133,7 @@ struct EFI_BOOT_SERVICES {
     void  *RestoreTPL;
     EFI_ALLOCATE_PAGES AllocatePages;
     void  *FreePages;
-    void  *GetMemoryMap;
+    EFI_GET_MEMORY_MAP GetMemoryMap;
     void  *AllocatePool;
     void  *FreePool;
     void  *CreateEvent;
@@ -143,7 +155,7 @@ struct EFI_BOOT_SERVICES {
     void  *StartImage;
     void  *Exit;
     void  *UnloadImage;
-    void  *ExitBootServices;
+    EFI_EXIT_BOOT_SERVICES ExitBootServices;
     void  *GetNextMonotonicCount;
     void  *Stall;
     void  *SetWatchdogTimer;
@@ -203,6 +215,72 @@ static void put_string(EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL *con, const char *msg)
         *o++ = (uint16_t)*msg++;
     *o = 0;
     con->OutputString(con, buf);
+}
+
+/* The memory map ExitBootServices needs a key from. Sized for any firmware's
+ * map with room to spare; static, as no allocation may happen in between. */
+static uint8_t memory_map[64 * 1024];
+
+/* Leaves boot services. The map key must be the one of the latest map, and
+ * the call itself may change the map, so it is tried again with a fresh one
+ * as the specification says. */
+static int exit_boot_services(EFI_HANDLE image, EFI_SYSTEM_TABLE *st)
+{
+    for (int attempt = 0; attempt < 4; attempt++) {
+        uint64_t size = sizeof(memory_map), key = 0, desc_size = 0;
+        uint32_t desc_version = 0;
+        if (st->BootServices->GetMemoryMap(&size, memory_map, &key,
+                                           &desc_size, &desc_version) != EFI_SUCCESS)
+            continue;
+        if (st->BootServices->ExitBootServices(image, key) == EFI_SUCCESS)
+            return 1;
+    }
+    return 0;
+}
+
+/* Cleans and invalidates [start, end) from the data cache to the point of
+ * coherency, turns the MMU and both caches off at the current exception
+ * level (EL1 or EL2), and branches to `entry`. Nothing touches memory after
+ * the caches go off: what follows runs in registers, from the identity-mapped
+ * code UEFI loaded. */
+__attribute__((noreturn, naked))
+static void enter_kernel(uint64_t entry, uint64_t start, uint64_t end)
+{
+    __asm__ volatile(
+        "msr  daifset, #0xf\n"
+        "mrs  x3, ctr_el0\n"
+        "ubfx x3, x3, #16, #4\n"          /* DminLine: log2(words) */
+        "mov  x4, #4\n"
+        "lsl  x4, x4, x3\n"               /* line size in bytes */
+        "sub  x5, x4, #1\n"
+        "bic  x1, x1, x5\n"
+        "1:\n"
+        "dc   civac, x1\n"
+        "add  x1, x1, x4\n"
+        "cmp  x1, x2\n"
+        "b.lo 1b\n"
+        "dsb  sy\n"
+        "mrs  x3, CurrentEL\n"
+        "cmp  x3, #8\n"                   /* EL2 */
+        "b.eq 2f\n"
+        "mrs  x3, sctlr_el1\n"
+        "bic  x3, x3, #1\n"               /* M */
+        "bic  x3, x3, #4\n"               /* C */
+        "bic  x3, x3, #0x1000\n"          /* I */
+        "msr  sctlr_el1, x3\n"
+        "b    3f\n"
+        "2:\n"
+        "mrs  x3, sctlr_el2\n"
+        "bic  x3, x3, #1\n"
+        "bic  x3, x3, #4\n"
+        "bic  x3, x3, #0x1000\n"
+        "msr  sctlr_el2, x3\n"
+        "3:\n"
+        "isb\n"
+        "ic   iallu\n"
+        "dsb  sy\n"
+        "isb\n"
+        "br   x0\n");
 }
 
 void panic(EFI_SYSTEM_TABLE *st)
@@ -276,10 +354,10 @@ EFI_STATUS efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st)
     }
 
     /* The kernel `_start` zeroes .bss and sets up its own stack, then jumps
-     * to `kmain`.  Pass control at the relocated entry point. */
-    typedef void (*entry_fn)(void);
-    entry_fn entry = (entry_fn)(uintptr_t)(addr + (eh->Entry - base));
-    entry();
-
-    __builtin_unreachable();
+     * to `kmain`, which enables the MMU with its own tables: it has to find
+     * the machine as a firmware's direct boot leaves it (see the top). */
+    if (!exit_boot_services(image, st)) {
+        panic(st);
+    }
+    enter_kernel(addr + (eh->Entry - base), addr, addr + (cap - base));
 }

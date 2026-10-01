@@ -17,6 +17,7 @@ holds a directory per architecture, each laid out as an install prefix:
                               (what tools/nanodump.py resolves a crash dump with)
   nanochrono-kernel.mb.elf    x86_64: the same kernel as ELF32, for QEMU -kernel
 plugins/                      the .ncplu plugins the x86_64 ISO carries
+iso/                          the bootable images (below)
 BAREMETAL_LIBRARIES.md        the libraries in depth
 BAREMETAL_DRIVERS.md          the drivers in the kernel
 ```
@@ -33,10 +34,11 @@ it, each lands beside the file it describes:
                                      sections, to link instead
 ```
 
-The bootable images are separate downloads:
-`nanochronometer-<version>-baremetal-x86_64.iso` and `-i386.iso` (BIOS and
-UEFI, from a USB stick or a CD) and `-ppc-openfirmware.iso` (G3/G4 Macs
-through Open Firmware).
+The bootable images are in `iso/`: `nanochronometer-<version>-x86_64.iso`
+and `-i386.iso` (BIOS and UEFI, from a USB stick or a CD), `-aarch64.iso`
+(UEFI: GRUB starts a small EFI loader that places the kernel and hands it
+the machine with the MMU off) and `-ppc-openfirmware.iso` (G3/G4 Macs through
+Open Firmware).
 
 ## `include/nanochrono.h`
 

@@ -205,9 +205,8 @@ architecture — and nothing else:
 | `nanochronometer-<v>-windows.zip` | `x86_64/`, `aarch64/`, `i686/` |
 | `nanochronometer-<v>-macos.zip` | `x86_64/`, `aarch64/`, `universal/` |
 | `nanochronometer-<v>-android.zip` | `arm64-v8a/`, `armeabi-v7a/`, `x86_64/`, `x86/` (the NDK libraries and the terminal CLI) |
-| `nanochronometer-<v>-baremetal.zip` | the nine architectures, the plugins and the documentation |
+| `nanochronometer-<v>-baremetal.zip` | the nine architectures, the plugins, the documentation, and the bootable images in `iso/` (x86_64, i386, aarch64, ppc-openfirmware) |
 | `nanochronometer-<v>.apk` | the Android app |
-| `nanochronometer-<v>-baremetal-{x86_64,i386,ppc-openfirmware}.iso` | the bootable images, as they are |
 | `SHA256SUMS` | checksums of all of them |
 
 Each architecture's directory is that platform's prefix from `build/`, light:

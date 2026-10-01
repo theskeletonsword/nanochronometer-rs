@@ -908,6 +908,13 @@ build_iso_arm64() {
     if [[ -z "${grub_modules_dir}" || ! -d "${grub_modules_dir}" ]]; then
         grub_modules_dir="/usr/lib/grub/arm64-efi"
     fi
+    # Or the package unpacked into the cache, without installing it:
+    #   dnf download grub2-efi-aa64-modules; rpm2cpio *.rpm | cpio -idm
+    # run in ~/.cache/nanochrono/grub.
+    local cached="${NANOCHRONO_CACHE:-${HOME}/.cache/nanochrono}/grub/usr/lib/grub/arm64-efi"
+    if [[ ! -d "${grub_modules_dir}" && -d "${cached}" ]]; then
+        grub_modules_dir="${cached}"
+    fi
     if [[ ! -d "${grub_modules_dir}" ]]; then
         echo "note: no arm64-efi GRUB modules; skipping the ARM64 ISO"
         echo "      install grub2-efi-aa64-modules, or point"
