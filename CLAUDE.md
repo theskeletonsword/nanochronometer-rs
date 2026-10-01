@@ -29,8 +29,9 @@ in `CLAUDE.local.md`.
   Windows link uses a copy of llvm-mingw whose runtime (mingw-w64 CRT,
   libunwind) `build-all.sh` rebuilt from `~/llvm-mingw` with the paths mapped.
 - Release assets: `packaging/release/package.sh` → `build/release-<version>/`:
-  one `.zip` per OS and arch, the APK and the ISOs, `SHA256SUMS` — only those
-  go on the GitHub release. The `-debug.zip` files land in
+  one `.zip` per OS holding all its architectures (linux, windows, macos,
+  android, baremetal), the APK and the ISOs, `SHA256SUMS` — only those go on
+  the GitHub release. The `-debug.zip` files land in
   `build/release-<version>/debug/` and are **not published** (the
   maintainer's call). Each asset carries `LICENSE`, `NOTICE` and
   `THIRD-PARTY-LICENSES.txt` (`tools/third-party-licenses.py`).

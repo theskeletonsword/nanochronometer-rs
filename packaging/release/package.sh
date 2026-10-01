@@ -5,25 +5,27 @@
 # assets, in build/release-<version>/ (or the directory given) — exactly what
 # a release publishes, and nothing else:
 #
-#   nanochronometer-<v>-<os>-<arch>.zip        a platform's install prefix,
-#                                              light: every program and library
-#                                              keeps its symbol table, without
-#                                              its debug information
+#   nanochronometer-<v>-<os>.zip      an operating system's release: a
+#                                     directory per architecture, each an
+#                                     install prefix, and the licence texts at
+#                                     the top; light — every program and
+#                                     library keeps its symbol table, without
+#                                     its debug information
 #   nanochronometer-<v>.apk and its .idsig
 #   nanochronometer-<v>-baremetal-<arch>.iso   the bootable images, as they are
 #   SHA256SUMS
 #
-# for <os>-<arch> in linux-{x86_64,i686,aarch64,armv7,riscv64},
-# windows-{x86_64,aarch64,i686}, macos-{x86_64,aarch64,universal},
-# android-{arm64-v8a,armeabi-v7a,x86_64,x86} and the nine baremetal-<arch>.
+# for linux (x86_64, i686, aarch64, armv7, riscv64), windows (x86_64,
+# aarch64, i686), macos (x86_64, aarch64, universal), android (arm64-v8a,
+# armeabi-v7a, x86_64, x86) and baremetal (the nine architectures, with the
+# plugins and the documentation).
 #
 # The debug information goes to debug/ beside them, and is not published:
 #
-#   debug/nanochronometer-<v>-<os>-<arch>-debug.zip  a .debug per program and
-#                                              library (ELF, PE), the .dSYM
-#                                              bundles (macOS), and
-#                                              debug/<libdir>/, the static
-#                                              library with its debug sections
+#   debug/nanochronometer-<v>-<os>-debug.zip  a .debug per program and
+#                                     library (ELF, PE), the .dSYM bundles
+#                                     (macOS), and <arch>/debug/<libdir>/, the
+#                                     static library with its debug sections
 #   debug/nanochronometer-<v>-android-apk-debug.zip  the JNI libraries'
 #   debug/SHA256SUMS
 #
@@ -40,6 +42,10 @@ cache="${NANOCHRONO_CACHE:-${HOME}/.cache/nanochrono}"
 mkdir -p "${cache}"
 stage="$(mktemp -d "${cache}/package.XXXXXX")"
 trap 'command rm -rf "${stage}"' EXIT
+# Every file in a zip gets the same date — the release tag's commit time — so
+# packing the same build/ twice gives the same assets.
+epoch="${SOURCE_DATE_EPOCH:-$(git -C "${repo}" log -1 --format=%ct "v${version}" 2>/dev/null ||
+    git -C "${repo}" log -1 --format=%ct)}"
 
 command rm -rf "${out}"
 dbgout="${out}/debug"
@@ -72,37 +78,47 @@ modes() {
 # zip_tree <parent> <top> <zip>: <parent>/<top> as a zip, entries in a fixed
 # order and with no owner or extended timestamps in them.
 zip_tree() {
-    (cd "$1" && find "$2" -print | LC_ALL=C sort | zip -q -X -9 -@ "$3")
+    find "$1/$2" -exec touch -h -d "@${epoch}" {} +
+    (cd "$1" && find "$2" -print | LC_ALL=C sort | TZ=UTC zip -q -X -9 -@ "$3")
 }
 
-# pack <asset name> <prefix dir> [file or directory to add at the top...]:
-# the release zip and, if there is debug information, the -debug.zip.
+# pack <os> <dir>:<prefix>... [-- <file or directory for the top>...]: an
+# operating system's asset, each prefix from build/ as a directory of it (an
+# empty <dir> puts it at the top), and, if there is debug information, its
+# -debug.zip.
 pack() {
-    local name="$1" src="$2"; shift 2
-    local top="nanochronometer-${version}-${name}"
+    local os="$1"; shift
+    local top="nanochronometer-${version}-${os}"
     local main="${stage}/main" dbg="${stage}/debug"
     command rm -rf "${main}" "${dbg}"
     mkdir -p "${main}/${top}" "${dbg}/${top}"
-    command cp -R "${src}/." "${main}/${top}/"
+    while [[ $# -gt 0 && "$1" != -- ]]; do
+        mkdir -p "${main}/${top}/${1%%:*}"
+        command cp -R "${1#*:}/." "${main}/${top}/${1%%:*}/"
+        shift
+    done
+    [[ "${1:-}" == -- ]] && shift
     local extra
     for extra in "$@"; do
         command cp -R "${extra}" "${main}/${top}/"
     done
-    # The licence texts from the repository, whatever copy build/ holds.
+    # One copy of the licence texts, at the top and from the repository,
+    # whatever copies build/ holds.
+    find "${main}/${top}" -mindepth 2 -maxdepth 2 -type f \( -name LICENSE -o -name NOTICE \) -delete
     command cp -f "${repo}/LICENSE" "${repo}/NOTICE" "${stage}/THIRD-PARTY-LICENSES.txt" "${main}/${top}/"
-    case "${name}" in
-        windows-*) install -Dm644 "${mingw_notice}" "${main}/${top}/licenses/MinGW-w64-runtime.txt" ;;
-        android-*) install -Dm644 "${ndk_notice}" "${main}/${top}/licenses/Android-NDK-NOTICE.txt" ;;
+    case "${os}" in
+        windows) install -Dm644 "${mingw_notice}" "${main}/${top}/licenses/MinGW-w64-runtime.txt" ;;
+        android) install -Dm644 "${ndk_notice}" "${main}/${top}/licenses/Android-NDK-NOTICE.txt" ;;
     esac
     # The kernel drivers are built on their own (kernel/) and may sit in a
     # prefix — nanochrono.ko on Linux, driver/nanochrono.sys on Windows; they
-    # are not part of the release.
-    find "${main}/${top}" -name '*.ko' -delete
-    command rm -rf "${main}/${top}/driver"
+    # are not part of the release. The bootable images are assets of their own.
+    find "${main}/${top}" \( -name '*.ko' -o -name '*.iso' \) -delete
+    find "${main}/${top}" -type d -name driver -prune -exec rm -rf {} +
     # The debug information moves to the -debug.zip, at the same paths.
     local p items
     mapfile -t items < <(cd "${main}/${top}" &&
-        find . \( -name '*.dSYM' -o -path ./debug \) -prune -print -o -name '*.debug' -print)
+        find . \( -name '*.dSYM' -o \( -type d -name debug \) \) -prune -print -o -name '*.debug' -print)
     for p in "${items[@]}"; do
         mkdir -p "${dbg}/${top}/$(dirname "${p}")"
         mv "${main}/${top}/${p}" "${dbg}/${top}/${p}"
@@ -115,18 +131,24 @@ pack() {
     fi
 }
 
-for a in x86_64 i686 aarch64 armv7 riscv64; do
-    pack "linux-${a}" "${build}/linux-${a}"
-done
-for a in x86_64 aarch64 i686; do
-    pack "windows-${a}" "${build}/windows-${a}"
-done
-for a in x86_64 aarch64 universal; do
-    pack "macos-${a}" "${build}/macos-${a}"
-done
-for abi in arm64-v8a armeabi-v7a x86_64 x86; do
-    pack "android-${abi}" "${build}/android/${abi}"
-done
+# prefixes <build/ name pattern, with %s for the arch> <arch>...: the
+# <arch>:<prefix> arguments pack takes.
+prefixes() {
+    local pattern="$1" a; shift
+    for a in "$@"; do
+        # shellcheck disable=SC2059
+        printf '%s:%s\n' "${a}" "${build}/$(printf "${pattern}" "${a}")"
+    done
+}
+
+mapfile -t dirs < <(prefixes 'linux-%s' x86_64 i686 aarch64 armv7 riscv64)
+pack linux "${dirs[@]}"
+mapfile -t dirs < <(prefixes 'windows-%s' x86_64 aarch64 i686)
+pack windows "${dirs[@]}"
+mapfile -t dirs < <(prefixes 'macos-%s' x86_64 aarch64 universal)
+pack macos "${dirs[@]}"
+mapfile -t dirs < <(prefixes 'android/%s' arm64-v8a armeabi-v7a x86_64 x86)
+pack android "${dirs[@]}"
 install -m644 "${build}/android/nanochronometer-${version}.apk" \
     "${build}/android/nanochronometer-${version}.apk.idsig" "${out}/"
 if [[ -d "${build}/android/apk-debug" ]]; then
@@ -138,17 +160,13 @@ if [[ -d "${build}/android/apk-debug" ]]; then
     zip_tree "${stage}/apk" "${top}" "${dbgout}/${top}-debug.zip"
 fi
 
-# Bare metal: one asset per architecture, each with the documentation; the
-# plugins are x86_64 code and go with that one. The ISOs stay images, to be
-# written to a stick or a CD as they are.
+# Bare metal: build/baremetal as it is — a directory per architecture, the
+# plugins — with the documentation from the repository, as the licence texts
+# are. The ISOs stay images, to be written to a stick or a CD as they are.
 bm="${build}/baremetal"
-# The documentation from the repository, as the licence texts are.
 install -Dm644 "${repo}/packaging/baremetal/README.release.md" "${stage}/bmdocs/README.md"
-for a in x86_64 i386 aarch64 arm32 ppc64 ppc64le ppc riscv64 riscv32; do
-    docs=("${stage}/bmdocs/README.md" "${repo}/docs/BAREMETAL_LIBRARIES.md" "${repo}/docs/BAREMETAL_DRIVERS.md")
-    [[ "${a}" == x86_64 && -d "${bm}/plugins" ]] && docs+=("${bm}/plugins")
-    pack "baremetal-${a}" "${bm}/${a}" "${docs[@]}"
-done
+pack baremetal ":${bm}" -- "${stage}/bmdocs/README.md" \
+    "${repo}/docs/BAREMETAL_LIBRARIES.md" "${repo}/docs/BAREMETAL_DRIVERS.md"
 for row in x86_64:x86_64 i386:i386 ppc_of:ppc-openfirmware; do
     install -m644 "${bm}/nanochronometer_${row%%:*}.iso" "${out}/nanochronometer-${version}-baremetal-${row#*:}.iso"
 done

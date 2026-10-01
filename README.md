@@ -196,29 +196,32 @@ packaging/release/package.sh               # build/ -> build/release-<version>/
 ```
 
 [`packaging/release/package.sh`](packaging/release/package.sh) packs `build/`
-into what a release publishes — a `.zip` per operating system and
+into what a release publishes — a `.zip` per operating system, holding every
 architecture — and nothing else:
 
 | Asset | Contents |
 |---|---|
-| `nanochronometer-<v>-<os>-<arch>.zip` | the platform's prefix, light: programs and libraries with their symbol tables, without debug information |
+| `nanochronometer-<v>-linux.zip` | `x86_64/`, `i686/`, `aarch64/`, `armv7/`, `riscv64/` |
+| `nanochronometer-<v>-windows.zip` | `x86_64/`, `aarch64/`, `i686/` |
+| `nanochronometer-<v>-macos.zip` | `x86_64/`, `aarch64/`, `universal/` |
+| `nanochronometer-<v>-android.zip` | `arm64-v8a/`, `armeabi-v7a/`, `x86_64/`, `x86/` (the NDK libraries and the terminal CLI) |
+| `nanochronometer-<v>-baremetal.zip` | the nine architectures, the plugins and the documentation |
 | `nanochronometer-<v>.apk` | the Android app |
 | `nanochronometer-<v>-baremetal-{x86_64,i386,ppc-openfirmware}.iso` | the bootable images, as they are |
 | `SHA256SUMS` | checksums of all of them |
 
-for `linux-{x86_64,i686,aarch64,armv7,riscv64}`, `windows-{x86_64,aarch64,i686}`,
-`macos-{x86_64,aarch64,universal}`, `android-{arm64-v8a,armeabi-v7a,x86_64,x86}`
-and `baremetal-{x86_64,i386,aarch64,arm32,ppc64,ppc64le,ppc,riscv64,riscv32}`.
-Every asset carries `LICENSE`, `NOTICE` and `THIRD-PARTY-LICENSES.txt`, and on
-Windows and Android the toolchain runtime's notices under `licenses/`
-([`docs/THIRD_PARTY_NOTICES.md`](docs/THIRD_PARTY_NOTICES.md)).
+Each architecture's directory is that platform's prefix from `build/`, light:
+programs and libraries with their symbol tables, without debug information.
+Every zip carries `LICENSE`, `NOTICE` and `THIRD-PARTY-LICENSES.txt` at the
+top, and the Windows and Android ones the toolchain runtime's notices under
+`licenses/` ([`docs/THIRD_PARTY_NOTICES.md`](docs/THIRD_PARTY_NOTICES.md)).
 
 The debug information is packed apart, in `build/release-<v>/debug/`, and is
-not published: a `-debug.zip` per platform (each `.debug` or `.dSYM`, and
-`debug/<libdir>/libnanochrono.a`) and one for the app's JNI libraries, with
-their own `SHA256SUMS`. A `-debug.zip` has the same top directory as its
-release zip: unzip both in one place and each debug file lands beside the
-binary it belongs to, where the debugger finds it.
+not published: a `-debug.zip` per operating system (each `.debug` or `.dSYM`,
+and `<arch>/debug/<libdir>/libnanochrono.a`) and one for the app's JNI
+libraries, with their own `SHA256SUMS`. A `-debug.zip` has the same top
+directory as its release zip: unzip both in one place and each debug file
+lands beside the binary it belongs to, where the debugger finds it.
 
 ### Android
 
