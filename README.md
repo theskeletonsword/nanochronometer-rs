@@ -106,9 +106,10 @@ packaging/baremetal/build.sh debug-og           # the -Og debug build
 Nothing that ships is stripped of its symbols: every program, library and
 kernel keeps its symbol table. Its debug information — full for the
 libraries' own code (`nanochrono-core`, `-crypto`, `-ffi`, the Android JNI
-library and the bare-metal crate), line tables for the programs' — lives in a
-file of its own beside it, so a release stays light and can still be debugged
-as shipped ([`packaging/debuginfo.sh`](packaging/debuginfo.sh)):
+library and the bare-metal crate), line tables for the programs' — is built
+into a file of its own beside it ([`packaging/debuginfo.sh`](packaging/debuginfo.sh)),
+which a release does not publish: the downloads stay light, and whoever keeps
+the debug files can still debug a release exactly as it shipped:
 
 | Platform | Debug file | Found by |
 |---|---|---|
@@ -196,24 +197,28 @@ packaging/release/package.sh               # build/ -> build/release-<version>/
 
 [`packaging/release/package.sh`](packaging/release/package.sh) packs `build/`
 into what a release publishes — a `.zip` per operating system and
-architecture, with its debug information in a second one:
+architecture — and nothing else:
 
 | Asset | Contents |
 |---|---|
 | `nanochronometer-<v>-<os>-<arch>.zip` | the platform's prefix, light: programs and libraries with their symbol tables, without debug information |
-| `nanochronometer-<v>-<os>-<arch>-debug.zip` | its debug files: each `.debug` or `.dSYM`, and `debug/<libdir>/libnanochrono.a` |
-| `nanochronometer-<v>.apk`, `nanochronometer-<v>-android-apk-debug.zip` | the Android app, and its JNI libraries' debug files |
+| `nanochronometer-<v>.apk` | the Android app |
 | `nanochronometer-<v>-baremetal-{x86_64,i386,ppc-openfirmware}.iso` | the bootable images, as they are |
 | `SHA256SUMS` | checksums of all of them |
 
 for `linux-{x86_64,i686,aarch64,armv7,riscv64}`, `windows-{x86_64,aarch64,i686}`,
 `macos-{x86_64,aarch64,universal}`, `android-{arm64-v8a,armeabi-v7a,x86_64,x86}`
 and `baremetal-{x86_64,i386,aarch64,arm32,ppc64,ppc64le,ppc,riscv64,riscv32}`.
-A `-debug.zip` has the same top directory as its release zip: unzip both in one
-place and each debug file lands beside the binary it belongs to. Every asset
-carries `LICENSE`, `NOTICE` and `THIRD-PARTY-LICENSES.txt`, and on Windows and
-Android the toolchain runtime's notices under `licenses/`
+Every asset carries `LICENSE`, `NOTICE` and `THIRD-PARTY-LICENSES.txt`, and on
+Windows and Android the toolchain runtime's notices under `licenses/`
 ([`docs/THIRD_PARTY_NOTICES.md`](docs/THIRD_PARTY_NOTICES.md)).
+
+The debug information is packed apart, in `build/release-<v>/debug/`, and is
+not published: a `-debug.zip` per platform (each `.debug` or `.dSYM`, and
+`debug/<libdir>/libnanochrono.a`) and one for the app's JNI libraries, with
+their own `SHA256SUMS`. A `-debug.zip` has the same top directory as its
+release zip: unzip both in one place and each debug file lands beside the
+binary it belongs to, where the debugger finds it.
 
 ### Android
 

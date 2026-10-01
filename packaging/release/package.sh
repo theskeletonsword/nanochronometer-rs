@@ -2,24 +2,30 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # Packs what packaging/release/build-all.sh left in build/ into the release
-# assets, in build/release-<version>/ (or the directory given):
+# assets, in build/release-<version>/ (or the directory given) — exactly what
+# a release publishes, and nothing else:
 #
 #   nanochronometer-<v>-<os>-<arch>.zip        a platform's install prefix,
 #                                              light: every program and library
 #                                              keeps its symbol table, without
 #                                              its debug information
-#   nanochronometer-<v>-<os>-<arch>-debug.zip  that debug information: a .debug
-#                                              per program and library (ELF,
-#                                              PE), the .dSYM bundles (macOS),
-#                                              and debug/<libdir>/, the static
-#                                              library with its debug sections
-#   nanochronometer-<v>.apk, its .idsig and nanochronometer-<v>-android-apk-debug.zip
+#   nanochronometer-<v>.apk and its .idsig
 #   nanochronometer-<v>-baremetal-<arch>.iso   the bootable images, as they are
 #   SHA256SUMS
 #
 # for <os>-<arch> in linux-{x86_64,i686,aarch64,armv7,riscv64},
 # windows-{x86_64,aarch64,i686}, macos-{x86_64,aarch64,universal},
 # android-{arm64-v8a,armeabi-v7a,x86_64,x86} and the nine baremetal-<arch>.
+#
+# The debug information goes to debug/ beside them, and is not published:
+#
+#   debug/nanochronometer-<v>-<os>-<arch>-debug.zip  a .debug per program and
+#                                              library (ELF, PE), the .dSYM
+#                                              bundles (macOS), and
+#                                              debug/<libdir>/, the static
+#                                              library with its debug sections
+#   debug/nanochronometer-<v>-android-apk-debug.zip  the JNI libraries'
+#   debug/SHA256SUMS
 #
 # A -debug.zip holds the same top directory as its release zip: unzipped in
 # the same place, each .debug lands beside the file it belongs to, where GDB
@@ -36,7 +42,8 @@ stage="$(mktemp -d "${cache}/package.XXXXXX")"
 trap 'command rm -rf "${stage}"' EXIT
 
 command rm -rf "${out}"
-mkdir -p "${out}"
+dbgout="${out}/debug"
+mkdir -p "${out}" "${dbgout}"
 
 # Every asset carries the licence texts: NanoChronometer's (LICENSE, NOTICE),
 # those of the crates it links in (tools/third-party-licenses.py), and the
@@ -104,7 +111,7 @@ pack() {
     zip_tree "${main}" "${top}" "${out}/${top}.zip"
     if [[ -n "$(find "${dbg}/${top}" -type f -print -quit)" ]]; then
         modes "${dbg}"
-        zip_tree "${dbg}" "${top}" "${out}/${top}-debug.zip"
+        zip_tree "${dbg}" "${top}" "${dbgout}/${top}-debug.zip"
     fi
 }
 
@@ -128,7 +135,7 @@ if [[ -d "${build}/android/apk-debug" ]]; then
     mkdir -p "${stage}/apk/${top}"
     command cp -R "${build}/android/apk-debug/." "${stage}/apk/${top}/"
     modes "${stage}/apk"
-    zip_tree "${stage}/apk" "${top}" "${out}/${top}-debug.zip"
+    zip_tree "${stage}/apk" "${top}" "${dbgout}/${top}-debug.zip"
 fi
 
 # Bare metal: one asset per architecture, each with the documentation; the
@@ -146,8 +153,14 @@ for row in x86_64:x86_64 i386:i386 ppc_of:ppc-openfirmware; do
     install -m644 "${bm}/nanochronometer_${row%%:*}.iso" "${out}/nanochronometer-${version}-baremetal-${row#*:}.iso"
 done
 
-(cd "${out}" && sha256sum -- * > SHA256SUMS)
-for f in "${out}"/*; do
-    printf '%10s  %s\n' "$(numfmt --to=iec "$(stat -c %s "${f}")")" "$(basename "${f}")"
+# One SHA256SUMS per directory: the published one covers what is published.
+for d in "${out}" "${dbgout}"; do
+    (cd "${d}" && find . -maxdepth 1 -type f ! -name SHA256SUMS -printf '%P\n' | LC_ALL=C sort |
+        xargs -d '\n' sha256sum -- > SHA256SUMS)
 done
-echo "=== $(du -sh "${out}" | cut -f1) in ${out}"
+for f in "${out}"/* "${dbgout}"/*; do
+    [[ -f "${f}" ]] || continue
+    printf '%10s  %s\n' "$(numfmt --to=iec "$(stat -c %s "${f}")")" "${f#"${out}/"}"
+done
+echo "=== to publish: $(find "${out}" -maxdepth 1 -type f | wc -l) files, $(du -sh --exclude=debug "${out}" | cut -f1), in ${out}"
+echo "=== not published: the debug information, $(du -sh "${dbgout}" | cut -f1), in ${dbgout}"
