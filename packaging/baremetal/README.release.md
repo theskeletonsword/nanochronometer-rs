@@ -1,28 +1,42 @@
 # NanoChronometer for bare metal
 
 The freestanding kernel, and the same code as a library for your own kernel,
-for nine architectures. Each architecture's directory is laid out as an
-install prefix:
+for nine architectures. Each architecture is a download of its own,
+`nanochronometer-<version>-baremetal-<arch>.zip`, laid out as an install
+prefix:
 
 ```
-<arch>/
-  lib64/                      lib/ on the 32-bit targets (i386, arm32, ppc, riscv32)
-    libnanochrono.a           static library: link it and you are done
-    libnanochrono.so          shared library: the same code, but it needs a
+lib64/                        lib/ on the 32-bit targets (i386, arm32, ppc, riscv32)
+  libnanochrono.a             static library: link it and you are done
+  libnanochrono.so            shared library: the same code, but it needs a
                               runtime loader of yours (read below)
-  include/
-    nanochrono.h              the C ABI, for C and for assembly
-  nanochrono-kernel.elf       the NanoChronometer kernel, with its symbols
-                              (for GDB and tools/nanodump.py)
-  nanochrono-kernel.mb.elf    x86_64: the same kernel as ELF32, for QEMU -kernel
-
-nanochronometer_x86_64.iso    bootable (BIOS and UEFI) from a USB stick or CD
-nanochronometer_i386.iso
-nanochronometer_ppc_of.iso    G3/G4 Macs through Open Firmware
-plugins/                      the .ncplu plugins the ISOs carry
+include/
+  nanochrono.h                the C ABI, for C and for assembly
+nanochrono-kernel.elf         the NanoChronometer kernel, with its symbol table
+                              (what tools/nanodump.py resolves a crash dump with)
+nanochrono-kernel.mb.elf      x86_64: the same kernel as ELF32, for QEMU -kernel
+plugins/                      x86_64: the .ncplu plugins the ISO carries
 BAREMETAL_LIBRARIES.md        the libraries in depth
 BAREMETAL_DRIVERS.md          the drivers in the kernel
 ```
+
+Nothing here is stripped of its symbols. The debug information (DWARF) is a
+download of its own, `nanochronometer-<version>-baremetal-<arch>-debug.zip`,
+with the same top directory: unzip both in one place and each file lands
+beside the one it describes.
+
+```
+nanochrono-kernel.elf.debug   the kernel's; GDB finds it beside the kernel
+                              through the .gnu_debuglink section
+lib64/libnanochrono.so.debug  the shared library's, found the same way
+debug/lib64/libnanochrono.a   the static library with its debug sections, to
+                              link instead when you step into it
+```
+
+The bootable images are separate downloads too:
+`nanochronometer-<version>-baremetal-x86_64.iso` and `-i386.iso` (BIOS and
+UEFI, from a USB stick or a CD) and `-ppc-openfirmware.iso` (G3/G4 Macs
+through Open Firmware).
 
 ## `include/nanochrono.h`
 
@@ -39,8 +53,8 @@ function by its name with the target's C calling convention.
 Every function is a **ring 0 / EL1** interface.
 
 ```sh
-cc -ffreestanding -I x86_64/include -c kernel.c
-ld -T kernel.ld kernel.o -L x86_64/lib64 -lnanochrono
+cc -ffreestanding -I include -c kernel.c
+ld -T kernel.ld kernel.o -L lib64 -lnanochrono
 ```
 
 ## The static library
@@ -89,7 +103,7 @@ loader and runtime symbol resolver yourself.** It has to:
    but the relocations still name them. List them with
 
    ```sh
-   readelf --dyn-syms --wide <arch>/lib64/libnanochrono.so | grep UND
+   readelf --dyn-syms --wide lib64/libnanochrono.so | grep UND
    ```
 
    and bind each to your kernel's equivalent, or to a harmless address when

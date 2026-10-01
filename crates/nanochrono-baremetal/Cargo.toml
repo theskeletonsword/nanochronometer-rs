@@ -71,6 +71,10 @@ opt-level = 2
 # its symbol table (crash dumps resolve against it). Said outright because
 # Cargo would otherwise strip debug information from a profile without any.
 strip = "none"
+# Full debug information, which packaging/baremetal/build.sh moves into a
+# .debug file beside the kernel and each library: the image that boots stays
+# as light as it was.
+debug = true
 
 # The -Og build: the dev profile's symbols and checks (debug info, debug
 # assertions, overflow checks) with basic optimisation, so a bug that only

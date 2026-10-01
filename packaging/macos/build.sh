@@ -97,6 +97,10 @@ remap="$(remap_rustflags "${repo_root}")"
 # shellcheck source=packaging/opt-level.sh
 source "${repo_root}/packaging/opt-level.sh"
 set_opt_args dist
+# Debug information in files of its own (packaging/debuginfo.sh).
+# shellcheck source=packaging/debuginfo.sh
+source "${repo_root}/packaging/debuginfo.sh"
+debug_objcopy >/dev/null || exit 1
 # A .dSYM per binary, shipped beside it (packaging/remap-paths.sh): the debug
 # map written relative to $HOME, and a dsymutil that knows where that is.
 dsym_tools="${target_dir}/macos-tools"
@@ -150,6 +154,9 @@ for arch in "${requested[@]}"; do
     cp "${src}/nanochrono-gui" "${dst}/bin/"
     cp "${src}/libnanochrono.dylib" "${dst}/lib/"
     cp "${src}/libnanochrono.a" "${dst}/lib/"
+    # The static library as built under debug/lib/, without its debug
+    # sections in lib/ (packaging/debuginfo.sh).
+    split_debug_archive "${dst}" lib libnanochrono.a
     # Each .dSYM beside its binary (Cargo links them into the profile
     # directory; -L copies the bundle, not the link).
     for f in bin/nanochrono bin/nanochrono-gui lib/libnanochrono.dylib; do
@@ -164,8 +171,9 @@ if [[ ${#built[@]} -eq 2 ]]; then
     echo
     echo "=== universal (arm64 + x86_64)"
     universal="${out_root}/macos-universal"
-    mkdir -p "${universal}/bin" "${universal}/lib"
-    for artifact in bin/nanochrono bin/nanochrono-gui lib/libnanochrono.dylib lib/libnanochrono.a; do
+    mkdir -p "${universal}/bin" "${universal}/lib" "${universal}/debug/lib"
+    for artifact in bin/nanochrono bin/nanochrono-gui lib/libnanochrono.dylib lib/libnanochrono.a \
+                    debug/lib/libnanochrono.a; do
         "${lipo_bin}" -create \
             "${out_root}/macos-aarch64/${artifact}" \
             "${out_root}/macos-x86_64/${artifact}" \

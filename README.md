@@ -103,14 +103,24 @@ OPT=-O3 packaging/baremetal/build.sh x86_64     # one kernel at -O3
 packaging/baremetal/build.sh debug-og           # the -Og debug build
 ```
 
-Nothing that ships is stripped. Every binary and library keeps its symbol
-table; the libraries' own code (`nanochrono-core`, `-crypto`, `-ffi` and the
-Android JNI library) carries full debug information, and the programs' own
-code line tables, so a release can be debugged as it is shipped and a
-backtrace names file and line — on macOS through the `.dSYM` beside each
-binary.
-The bare-metal kernels keep their symbols as well; their debug information is
-in the `-O0` and `-Og` debug builds.
+Nothing that ships is stripped of its symbols: every program, library and
+kernel keeps its symbol table. Its debug information — full for the
+libraries' own code (`nanochrono-core`, `-crypto`, `-ffi`, the Android JNI
+library and the bare-metal crate), line tables for the programs' — lives in a
+file of its own beside it, so a release stays light and can still be debugged
+as shipped ([`packaging/debuginfo.sh`](packaging/debuginfo.sh)):
+
+| Platform | Debug file | Found by |
+|---|---|---|
+| Linux, Android, bare metal (ELF) | `<file>.debug` | GDB and LLDB, through the `.gnu_debuglink` section the binary keeps |
+| Windows (PE) | `<file>.debug` | GDB and LLDB, the same way |
+| macOS (Mach-O) | `<file>.dSYM` | LLDB, by the binary's UUID |
+| static libraries | `debug/<libdir>/libnanochrono.a`, the archive with its debug sections | linking it instead of the light one |
+
+On Windows the `.debug` file is what a `.pdb` is elsewhere: these builds use
+LLVM-MinGW, whose debug information is DWARF, which GDB and LLDB read. A
+`.pdb` holds CodeView, which rustc emits only for the MSVC targets; Visual
+Studio and WinDbg need that.
 
 Nor does a release carry a path of the machine that built it: the packaging
 scripts remap the repository, the Cargo registry, the toolchains and the
@@ -143,9 +153,14 @@ them — so C or assembly links with `-I include -L lib64 -lnanochrono` (or
 | `build/linux-{x86_64,aarch64,riscv64}/` | `bin/` (CLI, GUI), `lib64/` (`.so`, `.a`), `include/`, `share/` (desktop entry, icons) |
 | `build/linux-{i686,armv7}/` | the same, with `lib/` |
 | `build/windows-{x86_64,aarch64,i686}/` | `bin/` (the `.exe`s and `nanochrono.dll`, which Windows finds beside them), `lib/` (`libnanochrono.a`, the `.dll.a` import library), `include/` |
-| `build/macos-{aarch64,x86_64,universal}/` | `bin/`, `lib/` (`.dylib`, `.a`), each binary's `.dSYM` beside it, `include/`, `NanoChronometer.app` |
+| `build/macos-{aarch64,x86_64,universal}/` | `bin/`, `lib/` (`.dylib`, `.a`), `include/`, `NanoChronometer.app` |
 | `build/android/<abi>/` | `bin/` (the CLI, dynamic and static), `lib64/` or `lib/` (`.so`, `.a`), `include/`; the universal APK in `build/android/` |
 | `build/baremetal/<arch>/` | the kernel, `lib64/` or `lib/` (`libnanochrono.a` and the complete `libnanochrono.so`), `include/` with the bare-metal ABI; the ISOs and a README in `build/baremetal/` |
+
+Each prefix also holds its debug files, where the debuggers look for them: a
+`.debug` beside each program and library (a `.dSYM` on macOS) and
+`debug/<libdir>/` with the static library as built. The JNI libraries' are in
+`build/android/apk-debug/`.
 
 Each library directory has a `pkgconfig/nanochrono.pc` that finds the header
 and the library wherever the directory is unpacked:
@@ -172,6 +187,33 @@ its own run path, e.g. `-Wl,-rpath,@executable_path/../lib`.
 The toolchains it expects are listed at the top of the script. There is no
 32-bit Arm Windows build: Windows 11 24H2 and later do not run 32-bit Arm
 programs, and Rust has only tier-3 MSVC targets for them.
+
+### Release assets
+
+```sh
+packaging/release/package.sh               # build/ -> build/release-<version>/
+```
+
+[`packaging/release/package.sh`](packaging/release/package.sh) packs `build/`
+into what a release publishes — a `.zip` per operating system and
+architecture, with its debug information in a second one:
+
+| Asset | Contents |
+|---|---|
+| `nanochronometer-<v>-<os>-<arch>.zip` | the platform's prefix, light: programs and libraries with their symbol tables, without debug information |
+| `nanochronometer-<v>-<os>-<arch>-debug.zip` | its debug files: each `.debug` or `.dSYM`, and `debug/<libdir>/libnanochrono.a` |
+| `nanochronometer-<v>.apk`, `nanochronometer-<v>-android-apk-debug.zip` | the Android app, and its JNI libraries' debug files |
+| `nanochronometer-<v>-baremetal-{x86_64,i386,ppc-openfirmware}.iso` | the bootable images, as they are |
+| `SHA256SUMS` | checksums of all of them |
+
+for `linux-{x86_64,i686,aarch64,armv7,riscv64}`, `windows-{x86_64,aarch64,i686}`,
+`macos-{x86_64,aarch64,universal}`, `android-{arm64-v8a,armeabi-v7a,x86_64,x86}`
+and `baremetal-{x86_64,i386,aarch64,arm32,ppc64,ppc64le,ppc,riscv64,riscv32}`.
+A `-debug.zip` has the same top directory as its release zip: unzip both in one
+place and each debug file lands beside the binary it belongs to. Every asset
+carries `LICENSE`, `NOTICE` and `THIRD-PARTY-LICENSES.txt`, and on Windows and
+Android the toolchain runtime's notices under `licenses/`
+([`docs/THIRD_PARTY_NOTICES.md`](docs/THIRD_PARTY_NOTICES.md)).
 
 ### Android
 
@@ -1527,6 +1569,8 @@ declare and the migration had dropped.
 
 ## License
 
-Apache License 2.0. See [`LICENSE`](LICENSE) for the full text and
-[`NOTICE`](NOTICE) for attribution, and `docs/THIRD_PARTY_NOTICES.md` for
-dependency notices.
+Apache License 2.0. See [`LICENSE`](LICENSE) for the full text,
+[`NOTICE`](NOTICE) for attribution, and
+[`docs/THIRD_PARTY_NOTICES.md`](docs/THIRD_PARTY_NOTICES.md) for the licences of
+the third-party code a release contains, which every download carries in
+`THIRD-PARTY-LICENSES.txt`.

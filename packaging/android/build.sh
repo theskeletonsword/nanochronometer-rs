@@ -75,6 +75,10 @@ remap="$(remap_rustflags "${repo_root}")"
 # A pkg-config file per ABI (packaging/pkgconfig.sh).
 # shellcheck source=packaging/pkgconfig.sh
 source "${repo_root}/packaging/pkgconfig.sh"
+# Debug information in files of its own (packaging/debuginfo.sh).
+# shellcheck source=packaging/debuginfo.sh
+source "${repo_root}/packaging/debuginfo.sh"
+debug_objcopy >/dev/null || exit 1
 version="$(sed -n 's/^version *= *"\(.*\)"/\1/p' "${repo_root}/Cargo.toml" | head -1)"
 # OPT= picks the optimisation level (packaging/opt-level.sh); default -O2.
 # shellcheck source=packaging/opt-level.sh
@@ -169,8 +173,15 @@ for abi in "${abis[@]}"; do
     # The GUI is deliberately excluded: iced needs a windowing system, and
     # Android's is not one winit drives from a plain executable.
     #
-    # Nothing is stripped: the symbols and debug info stay, to debug with and
-    # so that nothing shipped looks as though it hides what it is.
+    # Nothing is stripped of its symbols — nothing shipped looks as though it
+    # hides what it is — but the debug information goes to files of its own
+    # (packaging/debuginfo.sh), to keep the release light.
+    for f in "${staging}/bin/nanochrono" "${staging}/bin/nanochrono-static" \
+             "${staging}/${libdir}/libnanochrono.so"; do
+        split_debug "${f}" || { echo "error: could not split the debug information of ${f}" >&2; exit 1; }
+    done
+    split_debug_archive "${staging}" "${libdir}" libnanochrono.a ||
+        { echo "error: could not split the debug information of libnanochrono.a" >&2; exit 1; }
     echo
 done
 

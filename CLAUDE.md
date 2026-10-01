@@ -16,16 +16,22 @@ in `CLAUDE.local.md`.
   opt-level 1; Rust has no -Og). Every packaging script builds `--profile
   dist` and takes `OPT=-O0|-Og|-O1|-O2|-O3|-Os|-Oz|-Ofast`
   (`packaging/opt-level.sh`); the code must be correct at every level.
-- **Never strip** anything that ships — no `strip`/`objcopy --strip-*`, and
-  `dist` sets `strip = "none"` (a stripped binary or kernel looks like it
-  hides something; symbols are also how it gets debugged). The library
-  crates (core, crypto, ffi, android) build with full debug info in `dist`,
-  the programs (cli, gui, bench) with line tables; macOS ships it as a
-  `.dSYM` per binary. Build-machine paths are remapped instead
+- **Never strip symbols** from anything that ships (a stripped binary or
+  kernel looks like it hides something): `dist` and the bare-metal release
+  set `strip = "none"`. Debug information is built (full for the libraries
+  and the bare-metal crate, line tables for the programs) and moved into
+  files of its own — `<file>.debug` + `.gnu_debuglink` for ELF and PE, the
+  `.dSYM` on macOS, `debug/<libdir>/libnanochrono.a` for static libraries —
+  by `packaging/debuginfo.sh` (`tools/strip-archive-debug.py` for COFF
+  archives). On Windows that `.debug` stands for a `.pdb` (MinGW = DWARF).
+  Build-machine paths are remapped instead of stripped
   (`packaging/remap-paths.sh`: rustc, C, the macOS debug map), and the
   Windows link uses a copy of llvm-mingw whose runtime (mingw-w64 CRT,
-  libunwind) `build-all.sh` rebuilt from `~/llvm-mingw` with the paths mapped,
-  because the toolchain's own embeds them.
+  libunwind) `build-all.sh` rebuilt from `~/llvm-mingw` with the paths mapped.
+- Release assets: `packaging/release/package.sh` → `build/release-<version>/`,
+  one `.zip` per OS and arch plus its `-debug.zip`, the APK and the ISOs,
+  `SHA256SUMS`; each carries `LICENSE`, `NOTICE` and
+  `THIRD-PARTY-LICENSES.txt` (`tools/third-party-licenses.py`).
 - Debug before release, at **both -O0 and -Og** (the latter catches what only
   optimised code shows): `cargo test` and `cargo test --profile debug-og`;
   bare metal `build.sh debug` and `build.sh debug-og`; C SDK `make MODE=debug`

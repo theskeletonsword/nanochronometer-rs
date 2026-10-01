@@ -57,6 +57,12 @@ remap="$(remap_rustflags "${repo_root}")"
 # shellcheck source=packaging/opt-level.sh
 source "${repo_root}/packaging/opt-level.sh"
 set_opt_args dist
+# Debug information in files of its own (packaging/debuginfo.sh): the JNI
+# libraries' goes to build/android/apk-debug/lib/<abi>/, not into the APK.
+# shellcheck source=packaging/debuginfo.sh
+source "${repo_root}/packaging/debuginfo.sh"
+debug_objcopy >/dev/null || exit 1
+apk_debug="${out}/apk-debug"
 declare -A rust_target=(
     [arm64-v8a]=aarch64-linux-android
     [armeabi-v7a]=armv7-linux-androideabi
@@ -73,7 +79,7 @@ declare -A clang_prefix=(
 abis=("$@")
 [[ ${#abis[@]} -eq 0 ]] && abis=(arm64-v8a armeabi-v7a x86_64 x86)
 
-rm -rf "${work}/apk" "${work}/classes" "${work}/res" "${work}/dex"
+rm -rf "${work}/apk" "${work}/classes" "${work}/res" "${work}/dex" "${work}/assets" "${apk_debug}"
 mkdir -p "${work}/apk/lib" "${work}/classes" "${work}/res" "${work}/dex" "${out}"
 
 # --- 1. the JNI library, per ABI -------------------------------------------
@@ -96,16 +102,27 @@ for abi in "${abis[@]}"; do
             --manifest-path "${repo_root}/Cargo.toml" \
             --target-dir "${work}/cargo" \
             -p nanochrono-android
-    # Not stripped, like every library the release ships: the symbols stay.
+    # Not stripped of its symbols, like every library the release ships; its
+    # debug information is split off beside the APK.
     install -Dm644 "${work}/cargo/${target}/dist/libnanochrono_jni.so" \
+        "${apk_debug}/lib/${abi}/libnanochrono_jni.so"
+    split_debug "${apk_debug}/lib/${abi}/libnanochrono_jni.so"
+    install -Dm644 "${apk_debug}/lib/${abi}/libnanochrono_jni.so" \
         "${work}/apk/lib/${abi}/libnanochrono_jni.so"
+    rm -f "${apk_debug}/lib/${abi}/libnanochrono_jni.so"
 done
 
 # --- 2. resources and manifest ---------------------------------------------
 version_name="$(sed -n 's/^version = "\(.*\)"/\1/p' "${repo_root}/Cargo.toml" | head -1)"
 "${build_tools}/aapt2" compile --dir "${app}/res" -o "${work}/res/res.zip"
+# The licence texts travel inside the APK, as with every other release:
+# NanoChronometer's and those of the crates it links in.
+mkdir -p "${work}/assets/licenses"
+command cp -f "${repo_root}/LICENSE" "${repo_root}/NOTICE" "${work}/assets/licenses/"
+python3 "${repo_root}/tools/third-party-licenses.py" > "${work}/assets/licenses/THIRD-PARTY-LICENSES.txt"
 "${build_tools}/aapt2" link \
     -I "${platform_jar}" \
+    -A "${work}/assets" \
     --manifest "${app}/AndroidManifest.xml" \
     --min-sdk-version "${min_api}" --target-sdk-version "${compile_sdk}" \
     --version-code "$(echo "${version_name}" | awk -F. '{print $1*10000+$2*100+$3}')" \

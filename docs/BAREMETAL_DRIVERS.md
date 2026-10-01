@@ -4,7 +4,7 @@ The freestanding build talks to four things: a display, a keyboard, a pointer,
 and the power controller. This is what each one does, and — where the answer
 is "nothing" — why.
 
-FreeBSD's tree under `/home/skels/Documentos/bsd` was the reference for the
+FreeBSD's source tree was the reference for the
 input path. No code was copied; the register names and the initialisation
 order follow `sys/dev/atkbdc/atkbdcreg.h` and `psm.c` so the two can be read
 side by side.

@@ -79,6 +79,11 @@ fi
 # pkg-config files (packaging/pkgconfig.sh).
 # shellcheck source=packaging/pkgconfig.sh
 source "${repo}/packaging/pkgconfig.sh"
+
+# Debug information in files of its own (packaging/debuginfo.sh).
+# shellcheck source=packaging/debuginfo.sh
+source "${repo}/packaging/debuginfo.sh"
+debug_objcopy >/dev/null || exit 1
 version="$(sed -n 's/^version *= *"\(.*\)"/\1/p' "${repo}/Cargo.toml" | head -1)"
 
 # ship_pkgconfig <name> <target> <dest> <libdir>: the pkg-config file, and on
@@ -312,7 +317,7 @@ build_one() {
     # A fresh prefix. Only what this script writes is cleared — the flat
     # layout of older releases included — so anything else kept here (a
     # kernel driver built on its own) stays.
-    command rm -rf "${dest}/bin" "${dest}/lib" "${dest}/lib64" "${dest}/include"
+    command rm -rf "${dest}/bin" "${dest}/lib" "${dest}/lib64" "${dest}/include" "${dest}/debug"
     for f in nanochrono nanochrono-gui nanochrono.exe nanochrono-gui.exe nanochrono.dll \
              libnanochrono.so libnanochrono.dylib libnanochrono.a libnanochrono.dll.a; do
         command rm -f "${dest}/${f}"
@@ -332,6 +337,17 @@ build_one() {
     done
     [[ -e "${rel}/libnanochrono.dylib.dSYM" ]] &&
         command cp -RL "${rel}/libnanochrono.dylib.dSYM" "${dest}/${libdir}/"
+    # The debug information beside what ships rather than in it
+    # (packaging/debuginfo.sh): a .debug per program and shared library —
+    # macOS has its .dSYM already — and the static library as built under
+    # debug/.
+    if [[ "${target}" != *-apple-darwin ]]; then
+        for f in "${dest}"/bin/* "${dest}/${libdir}/libnanochrono.so"; do
+            split_debug "${f}" || { echo "!!! ${name}: could not split the debug information of ${f}"; return 1; }
+        done
+    fi
+    split_debug_archive "${dest}" "${libdir}" libnanochrono.a ||
+        { echo "!!! ${name}: could not split the debug information of libnanochrono.a"; return 1; }
     ship_header "${dest}"
     ship_pkgconfig "${name}" "${target}" "${dest}" "${libdir}"
     dress "${name}"
@@ -390,8 +406,9 @@ universal_macos() {
     local a="${out}/macos-x86_64" b="${out}/macos-aarch64" u="${out}/macos-universal"
     [[ -d "${a}" && -d "${b}" ]] || return 0
     command rm -rf "${u}"
-    mkdir -p "${u}/bin" "${u}/lib"
-    for f in bin/nanochrono bin/nanochrono-gui lib/libnanochrono.dylib lib/libnanochrono.a; do
+    mkdir -p "${u}/bin" "${u}/lib" "${u}/debug/lib"
+    for f in bin/nanochrono bin/nanochrono-gui lib/libnanochrono.dylib lib/libnanochrono.a \
+             debug/lib/libnanochrono.a; do
         [[ -f "${a}/${f}" && -f "${b}/${f}" ]] &&
             "${osxcross}/bin/lipo" -create "${a}/${f}" "${b}/${f}" -output "${u}/${f}"
     done

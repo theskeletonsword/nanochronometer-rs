@@ -129,6 +129,10 @@ fi
 # pkgconfig.sh); freestanding, so nothing else to link.
 # shellcheck source=packaging/pkgconfig.sh
 source "${repo_root}/packaging/pkgconfig.sh"
+
+# A release's debug information in files of its own (packaging/debuginfo.sh).
+# shellcheck source=packaging/debuginfo.sh
+source "${repo_root}/packaging/debuginfo.sh"
 pc_version="$(sed -n 's/^version *= *"\(.*\)"/\1/p' "${crate}/Cargo.toml" | head -1)"
 
 # The C/assembly header, generated from src/abi.rs (tools/gen-header.sh) when
@@ -175,6 +179,7 @@ build_shared() {
         --no-whole-archive \
         -soname libnanochrono.so -z notext --hash-style=both --build-id \
         -o "${so}"
+    split_debug "${so}" || { echo "error: could not split the debug information of ${so}" >&2; exit 1; }
 }
 
 build_one() {
@@ -220,6 +225,14 @@ build_one() {
     # C kernel links it with -lnanochrono and includes nanochrono.h.
     cp "${target_dir}/${target}/${profile_dir}/libnanochrono_baremetal.a" \
         "${out_dir}/${arch}/${libdir}/libnanochrono.a"
+    if [[ "${build_kind}" == "release" ]]; then
+        # The debug information goes to files of its own (packaging/
+        # debuginfo.sh) before anything uses the kernel: the ISOs, the EFI
+        # application and QEMU all get it as light as it ever was.
+        split_debug "${out_dir}/${arch}/nanochrono-kernel.elf" &&
+            split_debug_archive "${out_dir}/${arch}" "${libdir}" libnanochrono.a ||
+            { echo "error: could not split the debug information for ${arch}" >&2; exit 1; }
+    fi
     if [[ -f "${header}" ]]; then
         install -Dm644 "${header}" "${out_dir}/${arch}/include/nanochrono.h"
     fi

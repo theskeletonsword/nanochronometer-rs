@@ -241,6 +241,9 @@ Verified under KVM on an x86_64 host:
 ## The release build
 
 `packaging/baremetal/build.sh [arch...]` builds `--release` (the crate's
-release profile: optimised, `panic = "abort"`, no debug information). Nothing
-is stripped: the kernel that goes into the ISO keeps its symbol table, so a
-crash dump from a release ISO resolves against the same `nanochrono-kernel.elf`.
+release profile: optimised, `panic = "abort"`, full debug information, which
+the script moves into `nanochrono-kernel.elf.debug` beside the kernel). Nothing
+is stripped of its symbols: the kernel that goes into the ISO keeps its symbol
+table, so a crash dump from a release ISO resolves against the same
+`nanochrono-kernel.elf`, and GDB finds the `.debug` beside it through its
+`.gnu_debuglink`.
