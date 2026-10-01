@@ -2116,6 +2116,74 @@ pub extern "C" fn nc_timing_impact_advice() -> *const c_char {
     static_cstr(nanochrono_core::hypervisor::cached().timing_impact.advice())
 }
 
+// -- NC_VM: is this a virtual machine, from user mode -------------------------
+//
+// The quick verdict a program usually wants — "am I in a VM, and how sure are
+// we" — without the full nc_hypervisor_report_t. It runs entirely in user mode:
+// the CPUID hypervisor leaf and its signature where the architecture allows an
+// unprivileged read, and the timing of a trapping instruction against a plain
+// counter read (a hypervisor's trap costs far more), so a hypervisor that
+// cleared the CPUID bit is still caught by how it behaves. No privileged
+// instruction and no kernel module; detection is cached, so repeat calls are
+// free. The same backing detection fills nc_hypervisor_detect for the detail.
+
+/// `nc_vm_t::confidence`: nothing says this is a guest.
+pub const NC_VM_NONE: u32 = 0;
+/// A signal suggests a guest, below proof (e.g. only a timing anomaly).
+pub const NC_VM_SUSPECTED: u32 = 1;
+/// Confirmed: the CPUID signature, or a trap that behaved like a VM exit.
+pub const NC_VM_CONFIRMED: u32 = 2;
+
+/// The user-mode virtual-machine verdict. Fixed-size name, so nothing is
+/// allocated and nothing has to be freed.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct nc_vm_t {
+    /// 1 if running under a hypervisor, 0 if not — the plain yes/no.
+    pub present: i32,
+    /// `NC_VM_NONE`, `NC_VM_SUSPECTED` or `NC_VM_CONFIRMED`: how sure.
+    pub confidence: u32,
+    /// 1 if the platform emulates the timing sources (the counter is not the
+    /// hardware's own), so measurements are the emulator's, not the metal's.
+    pub timing_emulated: u32,
+    pub _reserved: u32,
+    /// The hypervisor's name, NUL-terminated ("KVM", "Microsoft Hv", "QEMU
+    /// TCG", …); empty if none or unknown.
+    pub name: [c_char; 32],
+}
+
+/// Fills `out` with the user-mode VM verdict. Returns 1, or 0 for a null
+/// `out`. A thin front to `nc_hypervisor_detect`, sharing its cached result.
+#[no_mangle]
+pub unsafe extern "C" fn nc_vm_detect(out: *mut nc_vm_t) -> c_int {
+    let Some(out) = (unsafe { out.as_mut() }) else {
+        return 0;
+    };
+    let report = nanochrono_core::hypervisor::cached();
+    let mut v = nc_vm_t {
+        present: report.is_virtualized() as c_int,
+        confidence: match report.confidence {
+            nanochrono_core::hypervisor::Confidence::None => NC_VM_NONE,
+            nanochrono_core::hypervisor::Confidence::Suspected => NC_VM_SUSPECTED,
+            nanochrono_core::hypervisor::Confidence::Confirmed => NC_VM_CONFIRMED,
+        },
+        timing_emulated: (report.timing_impact == nanochrono_core::hypervisor::TimingImpact::Emulated)
+            as u32,
+        _reserved: 0,
+        name: [0; 32],
+    };
+    fill_c_array(&mut v.name, report.hypervisor.name());
+    *out = v;
+    1
+}
+
+/// 1 if running under a hypervisor, 0 if not: the one-call yes/no, for a
+/// caller that wants only the bit. Equivalent to `nc_vm_detect(&v); v.present`.
+#[no_mangle]
+pub extern "C" fn nc_vm_present() -> c_int {
+    nanochrono_core::hypervisor::cached().is_virtualized() as c_int
+}
+
 /// Copies `text` into a fixed C array, truncating on a char boundary and
 /// always leaving room for the terminator.
 fn fill_c_array(dst: &mut [c_char], text: &str) {
@@ -2277,18 +2345,21 @@ fn integrity_to_u32(integrity: nanochrono_core::Integrity) -> u32 {
     }
 }
 
-// -- NC_RNG: the entropy pool ------------------------------------------------
+// -- NC_RNG: the operating system's generator ---------------------------------
 //
-// nanochrono_core::rng, one pool per process: CPU timing jitter (credited),
-// RDSEED/RDRAND, the OS's generator (/dev/urandom, credited only if the
-// timer fails) and any events the caller stirs in, conditioned through a
-// Keccak sponge into XDRBG-256, whose key drives the output stage —
-// AES-256-CTR on VAES/AES-NI/ARMv8 AES, or ChaCha20 — with fast key
-// erasure and a nonce counter that never goes back. The same functions, with
-// the same meaning, exist in the freestanding kernel for `.ncplu` plugins.
+// On a hosted OS, NC_RNG is the operating system's own generator — a CSPRNG
+// the kernel seeds and reseeds from everything it sees — reached through the
+// `getrandom` crate: getrandom(2) on Linux and Android, getentropy(2) on
+// macOS, ProcessPrng on Windows. Nothing is reinvented here. The entropy pool
+// of NanoChronometer's own (nanochrono_core::rng: timing jitter, RDSEED,
+// Keccak, XDRBG, an AES or ChaCha20 output stage) is for bare metal, where
+// there is no OS to ask; the freestanding kernel exposes it under these same
+// names, constants and struct, so C written against one builds against the
+// other.
 
-/// `nc_rng_fill` flag: a fresh credited seed before every 32-byte block
-/// (slow; for long-term keys). Without it the output stage serves the read.
+/// `nc_rng_fill` flag: on bare metal, a fresh credited seed before every
+/// 32-byte block (slow; for long-term keys). A hosted OS generator is fit for
+/// long-term keys as it is, so here it reads the same as `NC_RNG_FAST`.
 pub const NC_RNG_TRUE: u32 = 1;
 /// `nc_rng_fill` flags value for the output stage (the default).
 pub const NC_RNG_FAST: u32 = 0;
@@ -2321,6 +2392,8 @@ pub const NC_RNG_SOURCE_RDRAND: u32 = 1 << 2;
 pub const NC_RNG_SOURCE_PMU: u32 = 1 << 3;
 pub const NC_RNG_SOURCE_EVENTS: u32 = 1 << 4;
 pub const NC_RNG_SOURCE_EXTERNAL: u32 = 1 << 5;
+/// The operating system's generator: the one source of a hosted build.
+pub const NC_RNG_SOURCE_OS: u32 = 1 << 6;
 
 /// `nc_rng_status_t::engine` values: the output stage's path.
 pub const NC_RNG_ENGINE_VAES512: u32 = 1;
@@ -2328,12 +2401,17 @@ pub const NC_RNG_ENGINE_VAES256: u32 = 2;
 pub const NC_RNG_ENGINE_AESNI: u32 = 3;
 pub const NC_RNG_ENGINE_ARM_AES: u32 = 4;
 pub const NC_RNG_ENGINE_CHACHA20: u32 = 5;
+/// The operating system's generator, which a hosted build reads directly.
+pub const NC_RNG_ENGINE_OS: u32 = 6;
 
 /// First event tag that belongs to the caller (`nc_rng_stir`).
 pub const NC_RNG_EVENT_USER: u64 = 0x100;
 
-/// A snapshot of the pool. Set `size` to `sizeof(nc_rng_status_t)` before
-/// calling `nc_rng_status`; it comes back as the number of bytes written.
+/// A snapshot of the generator. Set `size` to `sizeof(nc_rng_status_t)`
+/// before calling `nc_rng_status`; it comes back as the number of bytes
+/// written. A hosted build fills `flags`, `sources`, `available`,
+/// `last_error`, `engine` and `bytes_out`; the other fields describe the
+/// bare-metal pool and stay 0.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct nc_rng_status_t {
@@ -2373,56 +2451,95 @@ const _: () = assert!(
     std::mem::size_of::<nc_rng_status_t>() == std::mem::size_of::<nanochrono_core::rng::Status>()
 );
 
-mod rng_host {
-    use std::sync::atomic::{AtomicU32, Ordering};
-    use std::sync::Mutex;
+/// What NC_RNG is on a hosted OS: the operating system's generator.
+mod rng_os {
+    use std::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, Ordering};
 
-    use nanochrono_core::rng::{jitter::DEFAULT_REGION_LEN, Config, EntropyPool, External};
+    use super::{
+        nc_rng_status_t, NC_RNG_ENGINE_OS, NC_RNG_ENOSOURCE, NC_RNG_ESELFTEST, NC_RNG_FAILED,
+        NC_RNG_READY, NC_RNG_SELFTEST_PASSED, NC_RNG_SOURCE_OS,
+    };
 
-    static POOL: Mutex<Option<EntropyPool<'static>>> = Mutex::new(None);
-    /// The process the pool was last used in. A `fork` copies the pool;
-    /// without this, parent and child would hand out the same bytes.
-    static OWNER: AtomicU32 = AtomicU32::new(0);
+    /// Bytes handed out through `nc_rng_fill`.
+    static BYTES_OUT: AtomicU64 = AtomicU64::new(0);
+    /// The last failure's code, 0 if none.
+    static LAST_ERROR: AtomicI32 = AtomicI32::new(0);
+    /// The self-test: 0 not run yet, 1 passed, 2 failed.
+    static SELFTEST: AtomicU32 = AtomicU32::new(0);
 
-    /// The OS's generator, as the embedder's source: mixed into every seed,
-    /// credited only when the timer cannot run.
-    #[cfg(unix)]
-    fn os_read(buf: &mut [u8]) -> bool {
-        use std::io::Read;
-        std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(buf)).is_ok()
+    /// One read of the OS generator.
+    fn os_read(out: &mut [u8]) -> Result<(), i32> {
+        getrandom::fill(out).map_err(|_| {
+            LAST_ERROR.store(NC_RNG_ENOSOURCE, Ordering::Relaxed);
+            NC_RNG_ENOSOURCE
+        })
     }
 
-    pub(super) fn with_pool<T>(f: impl FnOnce(&mut EntropyPool<'static>) -> T) -> Option<T> {
-        let mut guard = POOL.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        let pid = std::process::id();
-        if OWNER.swap(pid, Ordering::Relaxed) != pid {
-            if let Some(pool) = guard.as_mut() {
-                // A child of a fork: erase the inherited state; the next read
-                // starts over with its own self-tests and seed.
-                pool.wipe();
+    /// Fills `out`, or zeroes it and says why not: never a partial fill.
+    pub(super) fn fill(out: &mut [u8]) -> Result<(), i32> {
+        match os_read(out) {
+            Ok(()) => {
+                BYTES_OUT.fetch_add(out.len() as u64, Ordering::Relaxed);
+                Ok(())
+            }
+            Err(code) => {
+                out.fill(0);
+                Err(code)
             }
         }
-        if guard.is_none() {
-            let region: &'static mut [u8] = Box::leak(vec![0u8; DEFAULT_REGION_LEN].into_boxed_slice());
-            // Only unix wires the OS generator in below; elsewhere the pool
-            // runs on its own sources and is never changed after this.
-            #[cfg_attr(not(unix), allow(unused_mut))]
-            let mut pool = EntropyPool::new(region, Config::DEFAULT).ok()?;
-            #[cfg(unix)]
-            pool.set_external(Some(External { read: os_read, credit_eighths: 8 }));
-            #[cfg(not(unix))]
-            let _: Option<External> = None;
-            *guard = Some(pool);
+    }
+
+    /// Asks the generator twice: both answers must arrive, differ, and not be
+    /// all zeros. The OS tests its own generator; this proves it is there.
+    pub(super) fn selftest() -> i32 {
+        let (mut a, mut b) = ([0u8; 32], [0u8; 32]);
+        let code = match (os_read(&mut a), os_read(&mut b)) {
+            (Ok(()), Ok(())) if a != b && a != [0; 32] && b != [0; 32] => 0,
+            (Ok(()), Ok(())) => NC_RNG_ESELFTEST,
+            (Err(code), _) | (_, Err(code)) => code,
+        };
+        if code == NC_RNG_ESELFTEST {
+            LAST_ERROR.store(code, Ordering::Relaxed);
         }
-        guard.as_mut().map(f)
+        SELFTEST.store(if code == 0 { 1 } else { 2 }, Ordering::Relaxed);
+        code
+    }
+
+    pub(super) fn status() -> nc_rng_status_t {
+        // The first look runs the self-test, as the bare-metal pool's start
+        // does, so a status never reports an untested generator as ready.
+        if SELFTEST.load(Ordering::Relaxed) == 0 {
+            selftest();
+        }
+        let answers = os_read(&mut [0u8; 16]).is_ok();
+        let passed = SELFTEST.load(Ordering::Relaxed) == 1;
+        let mut flags = 0;
+        if answers && passed {
+            flags |= NC_RNG_READY | NC_RNG_SELFTEST_PASSED;
+        } else {
+            flags |= NC_RNG_FAILED;
+        }
+        nc_rng_status_t {
+            size: std::mem::size_of::<nc_rng_status_t>() as u32,
+            flags,
+            sources: NC_RNG_SOURCE_OS,
+            available: NC_RNG_SOURCE_OS,
+            last_error: LAST_ERROR.load(Ordering::Relaxed),
+            engine: NC_RNG_ENGINE_OS,
+            bytes_out: BYTES_OUT.load(Ordering::Relaxed),
+            ..Default::default()
+        }
     }
 }
 
-/// Fills `len` bytes at `buf` from the pool. `flags` is `NC_RNG_FAST` or
-/// `NC_RNG_TRUE`. Returns `len`, or a negative `NC_RNG_E*` code with the
-/// buffer zeroed — never a partial fill. Thread-safe.
+/// Fills `len` bytes at `buf` from the operating system's generator. `flags`
+/// is `NC_RNG_FAST` or `NC_RNG_TRUE`, which read the same here. Returns
+/// `len`, or a negative `NC_RNG_E*` code with the buffer zeroed — never a
+/// partial fill. Thread-safe, and fork-safe: the OS generator is the
+/// kernel's, not the process's.
 #[no_mangle]
 pub unsafe extern "C" fn nc_rng_fill(buf: *mut c_void, len: usize, flags: u32) -> i64 {
+    let _ = flags;
     if len == 0 {
         return 0;
     }
@@ -2431,16 +2548,15 @@ pub unsafe extern "C" fn nc_rng_fill(buf: *mut c_void, len: usize, flags: u32) -
     }
     // SAFETY: the caller passes `len` writable bytes at `buf`.
     let out = unsafe { std::slice::from_raw_parts_mut(buf.cast::<u8>(), len) };
-    let mode = nanochrono_core::rng::Mode::from_flags(flags);
-    match rng_host::with_pool(|pool| pool.fill(out, mode)) {
-        Some(Ok(n)) => n as i64,
-        Some(Err(error)) => error.code() as i64,
-        None => NC_RNG_EMISUSE as i64,
+    match rng_os::fill(out) {
+        Ok(()) => len as i64,
+        Err(code) => code as i64,
     }
 }
 
 /// Fills `*out`, which the caller has prepared with `out->size =
-/// sizeof(nc_rng_status_t)`. Returns 0 or a negative code.
+/// sizeof(nc_rng_status_t)`: the operating system's generator, as
+/// `NC_RNG_SOURCE_OS` and `NC_RNG_ENGINE_OS`. Returns 0 or a negative code.
 #[no_mangle]
 pub unsafe extern "C" fn nc_rng_status(out: *mut nc_rng_status_t) -> i32 {
     if out.is_null() {
@@ -2451,10 +2567,10 @@ pub unsafe extern "C" fn nc_rng_status(out: *mut nc_rng_status_t) -> i32 {
     if capacity < 8 {
         return NC_RNG_EMISUSE;
     }
-    let status = rng_host::with_pool(|pool| pool.status()).unwrap_or_default();
+    let status = rng_os::status();
     let n = capacity.min(std::mem::size_of::<nc_rng_status_t>());
-    // SAFETY: `n` bytes fit in the caller's struct by its own declaration;
-    // both layouts are `repr(C)` and identical (asserted above).
+    // SAFETY: `n` bytes fit in the caller's struct by its own declaration,
+    // and `status` is a plain `repr(C)` value.
     unsafe {
         std::ptr::copy_nonoverlapping((&raw const status).cast::<u8>(), out.cast::<u8>(), n);
         std::ptr::write_unaligned(out.cast::<u32>(), n as u32);
@@ -2462,22 +2578,20 @@ pub unsafe extern "C" fn nc_rng_status(out: *mut nc_rng_status_t) -> i32 {
     0
 }
 
-/// Mixes an event into the pool: `tag` (from `NC_RNG_EVENT_USER` up), a
-/// value, and the counter at the moment of the call. Never credited.
+/// Accepted for the bare-metal kernel's sake, where events feed the pool. A
+/// hosted OS generator gathers its own and takes nothing from outside, so
+/// here this does nothing.
 #[no_mangle]
 pub extern "C" fn nc_rng_stir(tag: u64, value: u64) {
-    rng_host::with_pool(|pool| pool.stir(tag, value));
+    let _ = (tag, value);
 }
 
-/// Re-runs the known-answer tests. 0, or `NC_RNG_ESELFTEST` with the pool out
-/// of service.
+/// Checks that the operating system's generator answers, with two reads that
+/// must differ. 0, `NC_RNG_ENOSOURCE` if it does not answer, or
+/// `NC_RNG_ESELFTEST` if it answers the same twice.
 #[no_mangle]
 pub extern "C" fn nc_rng_selftest() -> i32 {
-    match rng_host::with_pool(|pool| pool.selftest()) {
-        Some(Ok(())) => 0,
-        Some(Err(error)) => error.code(),
-        None => NC_RNG_EMISUSE,
-    }
+    rng_os::selftest()
 }
 
 #[cfg(test)]
@@ -2546,26 +2660,62 @@ mod integrity_tests {
 mod rng_tests {
     use super::*;
 
+    fn status() -> nc_rng_status_t {
+        let mut s = nc_rng_status_t { size: std::mem::size_of::<nc_rng_status_t>() as u32, ..Default::default() };
+        assert_eq!(unsafe { nc_rng_status(&mut s) }, 0);
+        s
+    }
+
     #[test]
-    fn fill_status_and_errors_through_the_abi() {
+    fn fill_reads_the_os_generator_through_the_abi() {
         let mut a = [0u8; 48];
         let mut b = [0u8; 48];
         unsafe {
             assert_eq!(nc_rng_fill(a.as_mut_ptr().cast(), a.len(), NC_RNG_FAST), 48);
             assert_eq!(nc_rng_fill(b.as_mut_ptr().cast(), b.len(), NC_RNG_TRUE), 48);
             assert_eq!(nc_rng_fill(std::ptr::null_mut(), 4, 0), NC_RNG_EMISUSE as i64);
+            assert_eq!(nc_rng_fill(a.as_mut_ptr().cast(), 0, 0), 0);
         }
         assert_ne!(a, b);
-        nc_rng_stir(NC_RNG_EVENT_USER, 42);
+        assert_ne!(a, [0u8; 48]);
+    }
 
-        let mut s = nc_rng_status_t { size: std::mem::size_of::<nc_rng_status_t>() as u32, ..Default::default() };
-        assert_eq!(unsafe { nc_rng_status(&mut s) }, 0);
+    #[test]
+    fn a_large_fill_is_whole() {
+        let mut big = vec![0u8; 1 << 20];
+        assert_eq!(unsafe { nc_rng_fill(big.as_mut_ptr().cast(), big.len(), NC_RNG_FAST) }, 1 << 20);
+        // A megabyte from a working generator has no 4 KiB run of zeros.
+        assert!(big.chunks(4096).all(|page| page.iter().any(|&b| b != 0)));
+    }
+
+    #[test]
+    fn status_names_the_os_generator() {
+        assert_eq!(nc_rng_selftest(), 0);
+        let s = status();
         assert_ne!(s.flags & NC_RNG_READY, 0);
         assert_ne!(s.flags & NC_RNG_SELFTEST_PASSED, 0);
-        assert_ne!(s.sources & NC_RNG_SOURCE_JITTER, 0);
-        assert!((NC_RNG_ENGINE_VAES512..=NC_RNG_ENGINE_CHACHA20).contains(&s.engine));
-        assert!(s.nonces >= 1);
-        assert_eq!(nc_rng_selftest(), 0);
+        assert_eq!(s.flags & NC_RNG_FAILED, 0);
+        assert_eq!(s.sources, NC_RNG_SOURCE_OS);
+        assert_eq!(s.available, NC_RNG_SOURCE_OS);
+        assert_eq!(s.engine, NC_RNG_ENGINE_OS);
+        assert_eq!(s.last_error, 0);
+        // The bare-metal pool's own counters stay at zero.
+        assert_eq!((s.osr, s.reseeds, s.jitter_samples, s.hw_words, s.nonces), (0, 0, 0, 0, 0));
+    }
+
+    #[test]
+    fn bytes_out_counts_what_was_served() {
+        let before = status().bytes_out;
+        let mut buf = [0u8; 100];
+        assert_eq!(unsafe { nc_rng_fill(buf.as_mut_ptr().cast(), 100, NC_RNG_FAST) }, 100);
+        // Other tests read concurrently, so at least what this one asked for.
+        assert!(status().bytes_out >= before + 100);
+    }
+
+    #[test]
+    fn stir_is_accepted_and_does_nothing() {
+        nc_rng_stir(NC_RNG_EVENT_USER, 42);
+        assert_eq!(status().events, 0);
     }
 
     #[test]
@@ -2574,5 +2724,48 @@ mod rng_tests {
         assert_eq!(unsafe { nc_rng_status(&mut s) }, 0);
         assert_eq!(s.size, 12);
         assert_eq!(s.available, 0, "past the caller's size, nothing is written");
+    }
+
+    #[test]
+    fn a_status_too_small_for_its_own_size_is_refused() {
+        let mut s = nc_rng_status_t { size: 4, ..Default::default() };
+        assert_eq!(unsafe { nc_rng_status(&mut s) }, NC_RNG_EMISUSE);
+        assert_eq!(unsafe { nc_rng_status(std::ptr::null_mut()) }, NC_RNG_EMISUSE);
+    }
+}
+
+#[cfg(test)]
+mod vm_tests {
+    use super::*;
+
+    #[test]
+    fn vm_detect_agrees_with_the_full_report_and_present() {
+        let mut v = nc_vm_t::default();
+        assert_eq!(unsafe { nc_vm_detect(&mut v) }, 1);
+        assert_eq!(unsafe { nc_vm_detect(std::ptr::null_mut()) }, 0);
+
+        let mut hv = nc_hypervisor_report_t::default();
+        assert_eq!(unsafe { nc_hypervisor_detect(&mut hv) }, 1);
+
+        // The quick verdict and the full report are the same detection.
+        assert_eq!(v.present, hv.present);
+        assert_eq!(v.present, nc_vm_present());
+        assert!(v.present == 0 || v.present == 1);
+        assert!((NC_VM_NONE..=NC_VM_CONFIRMED).contains(&v.confidence));
+        assert_eq!(v.present == 0, v.confidence == NC_VM_NONE);
+        // The name is always NUL-terminated.
+        assert!(v.name.iter().any(|&c| c == 0));
+    }
+
+    #[test]
+    fn under_qemu_the_verdict_is_a_confirmed_emulated_guest() {
+        // The test suite runs under this project's CI and on developer
+        // machines; when that is QEMU (TCG or KVM), detection should see it.
+        // Skip the assertion on bare metal, where present is legitimately 0.
+        let mut v = nc_vm_t::default();
+        unsafe { nc_vm_detect(&mut v) };
+        if v.present == 1 {
+            assert!(v.confidence >= NC_VM_SUSPECTED);
+        }
     }
 }

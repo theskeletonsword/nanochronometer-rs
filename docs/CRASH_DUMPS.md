@@ -58,11 +58,11 @@ UART only (a text-mode screen would scroll the reason away).
 
 ```console
 $ tools/nanodump.py extract serial.log -o CRASH.DMP
-$ tools/nanodump.py show CRASH.DMP --elf build/baremetal/x86_64/nanochrono-kernel.sym.elf
+$ tools/nanodump.py show CRASH.DMP --elf build/baremetal/x86_64/nanochrono-kernel.elf
 ```
 
-The release ISO boots a stripped kernel. `build.sh` keeps the symbols in
-`nanochrono-kernel.sym.elf` beside it, and that is the file to give `--elf`.
+The kernel is never stripped, in a release either: the `nanochrono-kernel.elf`
+that the ISO boots carries its symbol table, and it is the file to give `--elf`.
 
 ### Where it is stored
 
@@ -116,7 +116,7 @@ its own:
 
 ```console
 $ tools/nanodump.py show /run/media/$USER/NANOCRASH/CRASH.DMP \
-      --elf build/baremetal/x86_64/nanochrono-kernel.sym.elf
+      --elf build/baremetal/x86_64/nanochrono-kernel.elf
 ```
 
 A `CRASH.DMP` that is all zeros means nothing has crashed since the stick was
@@ -241,6 +241,6 @@ Verified under KVM on an x86_64 host:
 ## The release build
 
 `packaging/baremetal/build.sh [arch...]` builds `--release` (the crate's
-release profile: optimised, `panic = "abort"`, no debug information). It
-strips the kernel that goes into the ISO and keeps the symbol table in
-`nanochrono-kernel.sym.elf`.
+release profile: optimised, `panic = "abort"`, no debug information). Nothing
+is stripped: the kernel that goes into the ISO keeps its symbol table, so a
+crash dump from a release ISO resolves against the same `nanochrono-kernel.elf`.

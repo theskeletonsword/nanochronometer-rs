@@ -17,7 +17,9 @@ set confirm off
 # sends the 64-bit register file; GDB has to expect it before it connects, or
 # it rejects the reply as too long.
 set architecture i386:x86-64
-file build/baremetal-debug/x86_64/nanochrono-kernel.elf
+# The -O0 kernel by default; NC_GDB_ELF names another (the -Og one, from
+# `build.sh debug-og` or DEBUG_OPT=Og, is build/baremetal-debug-og/...).
+python import os; gdb.execute("file " + os.environ.get("NC_GDB_ELF", "build/baremetal-debug/x86_64/nanochrono-kernel.elf"))
 target remote localhost:1234
 
 # A hardware breakpoint: at the reset vector the kernel is not in memory yet.

@@ -13,10 +13,18 @@
 #   packaging/baremetal/build.sh run x86_64      # build and boot under QEMU
 #   packaging/baremetal/build.sh test            # the host-side unit tests
 #   packaging/baremetal/build.sh debug [arch]    # -O0 -g + frame pointers
+#   packaging/baremetal/build.sh debug-og [arch] # the same at -Og (Rust's opt-level 1):
+#                                                # bugs that only optimised code shows,
+#                                                # still steppable. DEBUG_OPT=Og does the
+#                                                # same for gdb and boot
 #   packaging/baremetal/build.sh gdb x86_64 [crashtest=<de|pf|gp|ud|so|df|panic>] [plugin=<name>]
 #                                                # debug build, QEMU stopped for GDB
 #   packaging/baremetal/build.sh boot x86_64 [crashtest=...] [plugin=<name>]
 #                                                # the same, running at once (no GDB wait)
+#
+# OPT=-O0|-Og|-O1|-O2|-O3|-Os|-Oz|-Ofast builds at that level instead of the
+# mode's default (release -O2, debug -O0, debug-og -Og); see
+# packaging/opt-level.sh. The code must be correct at every one.
 #
 # NCPLU_EXTRA="a.NCPLU b.NCPLU" adds plugins built elsewhere (the C SDK's, in
 # sdk/) to the ISO's FAT partition beside the in-tree ones.
@@ -29,13 +37,13 @@
 #                                                tree tier; runs in the kernel)
 #   NCPLU_ROOT_PUBKEYS                           the old name for the creator's
 #   NCPLU_SIGN_KEYS=KEYDIR                       sign every plugin on the ISO
-#   PLUGIN_PROFILE=debug|release                 plugins at -O0 or -O3; by
+#   PLUGIN_PROFILE=debug|debug-og|release        plugins at -O0, -Og or -O2; by
 #                                                default they follow the kernel
 #
-# Output, build/baremetal/ (build/baremetal-debug/ for debug, gdb and boot):
-#   <arch>/nanochrono-kernel.elf        the kernel (stripped in a release)
-#   <arch>/nanochrono-kernel.sym.elf    release: its symbols, for
-#                                       tools/nanodump.py and GDB
+# Output, build/baremetal/ (build/baremetal-debug/ for debug, gdb and boot;
+# build/baremetal-debug-og/ at -Og):
+#   <arch>/nanochrono-kernel.elf        the kernel, with its symbols (for
+#                                       tools/nanodump.py and GDB)
 #   <arch>/lib64/ (lib/ when 32-bit)    libnanochrono.a, and in a release
 #                                       libnanochrono.so: the same library,
 #                                       position independent, which needs a
@@ -102,6 +110,27 @@ rust_lld() {
     echo "${sysroot}/lib/rustlib/${host}/bin/rust-lld"
 }
 
+# No build-machine path in a release (packaging/remap-paths.sh), through
+# `--config`, which adds to the rustflags .cargo/config.toml sets rather than
+# replacing them as RUSTFLAGS would. A debug build keeps the real paths, for
+# GDB to find the sources.
+# shellcheck source=packaging/remap-paths.sh
+source "${repo_root}/packaging/remap-paths.sh"
+remap_toml="$(remap_toml_array "${repo_root}")"
+
+# OPT= (packaging/opt-level.sh), applied to whichever profile each build uses.
+# shellcheck source=packaging/opt-level.sh
+source "${repo_root}/packaging/opt-level.sh"
+if [[ -n "${OPT:-}" ]]; then
+    rust_opt_level "${OPT}" >/dev/null || exit 1
+fi
+
+# A pkg-config file beside each architecture's libraries (packaging/
+# pkgconfig.sh); freestanding, so nothing else to link.
+# shellcheck source=packaging/pkgconfig.sh
+source "${repo_root}/packaging/pkgconfig.sh"
+pc_version="$(sed -n 's/^version *= *"\(.*\)"/\1/p' "${crate}/Cargo.toml" | head -1)"
+
 # The C/assembly header, generated from src/abi.rs (tools/gen-header.sh) when
 # cbindgen is here; otherwise the copy a previous run generated is used.
 header="${repo_root}/include/baremetal/nanochrono.h"
@@ -110,12 +139,6 @@ if command -v cbindgen >/dev/null 2>&1; then
 elif [[ ! -f "${header}" ]]; then
     echo "note: no cbindgen and no include/baremetal/nanochrono.h; the libraries ship without it"
 fi
-
-# An objcopy that understands every target here. LLVM's does; the host's GNU
-# one may only know the host's formats.
-objcopy_tool() {
-    command -v llvm-objcopy || command -v rust-objcopy || command -v objcopy
-}
 
 # The shared object: the same library as the static archive, not a trimmed
 # one. A `cdylib` would keep only the `#[no_mangle]` entry points and what
@@ -142,8 +165,10 @@ build_shared() {
     libdir="$(lib_dir "${arch}")"
     so="${out_dir}/${arch}/${libdir}/libnanochrono.so"
     echo "=== ${arch} shared object (${spec})"
+    set_opt_args release
     # shellcheck disable=SC2086
-    (cd "${crate}" && cargo ${toolchain} build --release --lib \
+    (cd "${crate}" && cargo ${toolchain} build --release --lib "${OPT_ARGS[@]}" \
+        --config "target.${spec}.rustflags=${remap_toml}" \
         --target "${spec}" ${arch_features[${arch}]})
     "$(rust_lld)" -flavor gnu -shared -Bsymbolic --defsym=__bss_end=_end \
         --whole-archive "${target_dir}/${spec}/release/libnanochrono_baremetal.a" \
@@ -158,7 +183,8 @@ build_one() {
     echo "=== ${arch} (${target}, ${build_kind})"
     rustup target add "${target}" >/dev/null 2>&1 || true
 
-    local profile_args=(--release) profile_dir="release"
+    local profile_args=(--release --config "target.${target}.rustflags=${remap_toml}")
+    local profile_dir="release"
     if [[ "${build_kind}" == "debug" ]]; then
         # Cargo's dev profile — `-O0` with full debug information — plus
         # frame pointers, so GDB unwinds without CFI and the crash dump's
@@ -168,15 +194,27 @@ build_one() {
         # where `--config` appends to them.
         profile_args=(--config "target.${target}.rustflags=[\"-C\",\"force-frame-pointers=yes\"]")
         profile_dir="debug"
+        if [[ "${debug_opt}" == "Og" ]]; then
+            profile_args+=(--profile debug-og)
+            profile_dir="debug-og"
+        fi
     fi
+    local cargo_profile="release"
+    [[ "${build_kind}" == "debug" ]] && cargo_profile="dev"
+    [[ "${profile_dir}" == "debug-og" ]] && cargo_profile="debug-og"
+    set_opt_args "${cargo_profile}"
     # shellcheck disable=SC2086
-    (cd "${crate}" && cargo ${toolchain} build "${profile_args[@]}" --target "${target}" \
-        ${arch_features[${arch}]})
+    (cd "${crate}" && cargo ${toolchain} build "${profile_args[@]}" "${OPT_ARGS[@]}" \
+        --target "${target}" ${arch_features[${arch}]})
 
     local libdir
     libdir="$(lib_dir "${arch}")"
     mkdir -p "${out_dir}/${arch}/${libdir}"
     local elf="${target_dir}/${target}/${profile_dir}/nanochrono-kernel"
+    # The kernel keeps its symbol table, in a release too: it is what
+    # tools/nanodump.py resolves a crash dump's addresses against, and a boot
+    # image stripped of its names looks as though it hides what it is. It costs
+    # under 200 KiB on any architecture.
     cp "${elf}" "${out_dir}/${arch}/nanochrono-kernel.elf"
     # Shipped as libnanochrono, the name every platform's release uses, so a
     # C kernel links it with -lnanochrono and includes nanochrono.h.
@@ -185,19 +223,7 @@ build_one() {
     if [[ -f "${header}" ]]; then
         install -Dm644 "${header}" "${out_dir}/${arch}/include/nanochrono.h"
     fi
-
-    if [[ "${build_kind}" == "release" ]]; then
-        # The image that boots carries no symbol table; the copy beside it
-        # keeps one, which is what tools/nanodump.py resolves a crash dump's
-        # addresses against. Stripped after the copy, so both describe the
-        # same code.
-        local objcopy
-        objcopy="$(objcopy_tool || true)"
-        if [[ -n "${objcopy}" ]]; then
-            cp "${out_dir}/${arch}/nanochrono-kernel.elf" "${out_dir}/${arch}/nanochrono-kernel.sym.elf"
-            "${objcopy}" --strip-all "${out_dir}/${arch}/nanochrono-kernel.elf"
-        fi
-    fi
+    write_pc "${out_dir}/${arch}" "${libdir}" "" "${pc_version}"
 
     if [[ "${build_kind}" == "release" ]]; then
         build_shared "${arch}"
@@ -423,11 +449,15 @@ run_gdb() {
     local stop=(-s -S)
     if [[ "${mode}" == "boot" ]]; then
         stop=()
-        echo "=== booting the -O0 build under QEMU (not waiting for GDB)"
+        echo "=== booting the -${debug_opt} build under QEMU (not waiting for GDB)"
     else
         echo "=== QEMU is stopped at the reset vector, GDB stub on localhost:1234"
         echo "    in another terminal, from ${repo_root}:"
-        echo "        gdb -x packaging/baremetal/gdb/x86_64.gdb"
+        if [[ "${debug_opt}" == "Og" ]]; then
+            echo "        NC_GDB_ELF=${out_dir#"${repo_root}/"}/x86_64/nanochrono-kernel.elf gdb -x packaging/baremetal/gdb/x86_64.gdb"
+        else
+            echo "        gdb -x packaging/baremetal/gdb/x86_64.gdb"
+        fi
     fi
     echo "    booting ${iso##*/} as a USB stick (copy: ${stick##*/})"
     echo "    exceptions and resets: ${log}"
@@ -464,18 +494,28 @@ run_gdb() {
 }
 
 mode="build"
-if [[ "${1:-}" == "run" || "${1:-}" == "test" || "${1:-}" == "debug" || "${1:-}" == "gdb" || "${1:-}" == "boot" ]]; then
+if [[ "${1:-}" == "run" || "${1:-}" == "test" || "${1:-}" == "debug" || "${1:-}" == "debug-og" ||
+      "${1:-}" == "gdb" || "${1:-}" == "boot" ]]; then
     mode="$1"
     shift
 fi
 
 crashtest=""
 kernel_extra=""
-if [[ "${mode}" == "debug" || "${mode}" == "gdb" || "${mode}" == "boot" ]]; then
+# Debug builds come at two levels: -O0 (`debug`; `gdb` and `boot` by default)
+# and -Og (`debug-og`, or DEBUG_OPT=Og) — Rust has no -Og, so the debug-og
+# profile: opt-level 1 with the same symbols and checks. Bugs that only show
+# once code is optimised turn up there while they can still be stepped.
+debug_opt="O0"
+if [[ "${mode}" == "debug-og" || "${DEBUG_OPT:-O0}" == "Og" ]]; then
+    debug_opt="Og"
+fi
+if [[ "${mode}" == "debug" || "${mode}" == "debug-og" || "${mode}" == "gdb" || "${mode}" == "boot" ]]; then
     build_kind="debug"
     # Beside the release output, not over it: a debug kernel is 8 MiB of
     # DWARF and never ships.
     out_dir="${repo_root}/build/baremetal-debug"
+    [[ "${debug_opt}" == "Og" ]] && out_dir+="-og"
     if [[ "${mode}" == "gdb" || "${mode}" == "boot" ]]; then
         args=()
         for a in "$@"; do
@@ -557,17 +597,26 @@ build_plugins() {
     [[ -d "${plugins_dir}" ]] || return 0
     mkdir -p "${out_dir}/plugins"
 
-    # Debug plugins are -O0 with debug info, to step through under GDB;
-    # release plugins are -O3 (their Cargo.toml's [profile.release]) — the
-    # build a user runs, and the one that gets signed. They follow the
-    # kernel's build unless PLUGIN_PROFILE=debug|release says otherwise, so a
-    # release plugin can be tried on the -O0 kernel.
+    # Debug plugins are -O0 (or -Og, with an -Og kernel) with debug info, to
+    # step through under GDB; release plugins are -O2 (their Cargo.toml's
+    # [profile.release]) — the build a user runs, and the one that gets
+    # signed. They follow the kernel's build unless
+    # PLUGIN_PROFILE=debug|debug-og|release says otherwise, so a release
+    # plugin can be tried on a debug kernel.
     local profile="${PLUGIN_PROFILE:-${build_kind}}"
-    local profile_args=() opt="-O0"
-    if [[ "${profile}" == "release" ]]; then
-        profile_args=(--release)
-        opt="-O3"
-    fi
+    [[ "${profile}" == "debug" && "${debug_opt}" == "Og" ]] && profile="debug-og"
+    local profile_args=() opt="-O0" profile_dir="debug" cargo_profile="dev"
+    case "${profile}" in
+        release)
+            profile_args=(--release --config "target.x86_64-nanochrono-none-dylib.rustflags=${remap_toml}")
+            opt="-O2" profile_dir="release" cargo_profile="release" ;;
+        debug-og)
+            profile_args=(--profile debug-og)
+            opt="-Og" profile_dir="debug-og" cargo_profile="debug-og" ;;
+    esac
+    set_opt_args "${cargo_profile}"
+    profile_args+=("${OPT_ARGS[@]}")
+    opt="${OPT:-${opt}}"
 
     local crate name target so out
     for crate in "${plugins_dir}"/*/; do
@@ -584,7 +633,7 @@ build_plugins() {
             echo "note: plugin ${name} failed to build; skipping"
             continue
         fi
-        so="$(ls "${target}/x86_64-nanochrono-none-dylib/${profile}/"*.so 2>/dev/null | head -1)"
+        so="$(ls "${target}/x86_64-nanochrono-none-dylib/${profile_dir}/"*.so 2>/dev/null | head -1)"
         if [[ -z "${so}" ]]; then
             echo "note: no shared object for plugin ${name}; skipping"
             continue
@@ -662,7 +711,7 @@ the blocks this file already occupies, nothing else on this volume is touched.
 Do not delete, move or shrink it - the kernel finds it by name at boot and
 never allocates space for it. All zeros means nothing has crashed since.
 
-Read it with:  tools/nanodump.py show CRASH.DMP --elf nanochrono-kernel.sym.elf
+Read it with:  tools/nanodump.py show CRASH.DMP --elf nanochrono-kernel.elf
 TXT
     MTOOLS_SKIP_CHECK=1 mcopy -i "${img}" "${files}/CRASH.DMP" "${files}/README.TXT" ::/
     # Every packed plugin, if any were built. mtools writes a proper VFAT long
@@ -925,7 +974,7 @@ if [[ "${mode}" == "gdb" || "${mode}" == "boot" ]]; then
     exit 0
 fi
 
-if [[ "${mode}" == "debug" ]]; then
+if [[ "${mode}" == "debug" || "${mode}" == "debug-og" ]]; then
     echo
     echo "=== ${out_dir}"
     find "${out_dir}" -type f -printf '%p  %s bytes\n' | sort

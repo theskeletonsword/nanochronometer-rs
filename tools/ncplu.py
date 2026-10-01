@@ -111,6 +111,10 @@ R_X86_64_GLOB_DAT = 6
 R_X86_64_JUMP_SLOT = 7
 R_X86_64_RELATIVE = 8
 
+# Function imports a plugin may carry because the compiler, not its author,
+# calls them: -fstack-protector's failure handler (the kernel provides it).
+COMPILER_FUNCTION_IMPORTS = {"__stack_chk_fail"}
+
 
 class Section:
     __slots__ = ("name", "type", "flags", "addr", "offset", "size", "link", "info", "entsize", "_name_off", "addralign")
@@ -242,10 +246,16 @@ def pack(elf: Elf, entry: str, caps: int = CAP_ALL) -> bytes:
             sym = syms[r_sym]
             if sym.shndx == 0:
                 # Undefined: a kernel import, resolved by nc_resolve_symbol.
-                if r_type == R_X86_64_JUMP_SLOT:
+                # Kernel services are called through the NcApi table, where
+                # capabilities apply and which works at ring 3, so a function
+                # import is refused — except what the compiler itself calls:
+                # the stack canary's failure handler, which the kernel
+                # provides at both tiers. The loader binds every slot at load
+                # time, so the PLT stub's indirect jump needs no lazy binding.
+                if r_type == R_X86_64_JUMP_SLOT and sym.name not in COMPILER_FUNCTION_IMPORTS:
                     raise ValueError(
                         f"function import '{sym.name}': call kernel services through the "
-                        "NcApi table, not by linker import (no PLT in the loader)"
+                        "NcApi table, not by linker import"
                     )
                 relocs.append((RELOC_IMPORT64, r_offset, import_of(sym.name), r_addend))
             else:

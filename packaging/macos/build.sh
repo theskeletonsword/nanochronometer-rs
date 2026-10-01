@@ -89,6 +89,24 @@ declare -A arch_out=(
 requested=("$@")
 [[ ${#requested[@]} -eq 0 ]] && requested=(arm64 x86_64)
 
+# No build-machine path in what ships (packaging/remap-paths.sh).
+# shellcheck source=packaging/remap-paths.sh
+source "${repo_root}/packaging/remap-paths.sh"
+remap="$(remap_rustflags "${repo_root}")"
+# OPT= picks the optimisation level (packaging/opt-level.sh); default -O2.
+# shellcheck source=packaging/opt-level.sh
+source "${repo_root}/packaging/opt-level.sh"
+set_opt_args dist
+# A .dSYM per binary, shipped beside it (packaging/remap-paths.sh): the debug
+# map written relative to $HOME, and a dsymutil that knows where that is.
+dsym_tools="${target_dir}/macos-tools"
+if remap_dsymutil "${dsym_tools}" "${osxcross:+${osxcross}/bin}"; then
+    export PATH="${dsym_tools}:${PATH}"
+    export CARGO_PROFILE_DIST_SPLIT_DEBUGINFO=packed
+else
+    echo "note: no dsymutil; the binaries ship without a .dSYM"
+fi
+
 # Only the directories this run rebuilds are cleared: build/ holds every other
 # platform's release too.
 produced=()
@@ -112,12 +130,15 @@ for arch in "${requested[@]}"; do
         upper="$(echo "${target}" | tr 'a-z-' 'A-Z_')"
         export "CARGO_TARGET_${upper}_LINKER=${arch_clang[${arch}]}"
         export "CC_${target//-/_}=${arch_clang[${arch}]}"
+        export "CFLAGS_${target//-/_}=$(remap_cflags "${repo_root}")"
         export "AR_${target//-/_}=${arch}-apple-${darwin_ver}-ar"
     fi
 
+    export "CARGO_TARGET_$(echo "${target}" | tr 'a-z-' 'A-Z_')_RUSTFLAGS=${remap} $(remap_macos_rustflags)"
+
     echo "=== ${arch} (${target})"
     rustup target add "${target}" >/dev/null 2>&1 || true
-    cargo build --profile dist --target "${target}" \
+    cargo build --profile dist "${OPT_ARGS[@]}" --target "${target}" \
         --target-dir "${target_dir}" \
         -p nanochrono-cli -p nanochrono-ffi -p nanochrono-gui
 
@@ -129,6 +150,11 @@ for arch in "${requested[@]}"; do
     cp "${src}/nanochrono-gui" "${dst}/bin/"
     cp "${src}/libnanochrono.dylib" "${dst}/lib/"
     cp "${src}/libnanochrono.a" "${dst}/lib/"
+    # Each .dSYM beside its binary (Cargo links them into the profile
+    # directory; -L copies the bundle, not the link).
+    for f in bin/nanochrono bin/nanochrono-gui lib/libnanochrono.dylib; do
+        [[ -e "${src}/$(basename "${f}").dSYM" ]] && cp -RL "${src}/$(basename "${f}").dSYM" "${dst}/${f}.dSYM"
+    done
     built+=("${arch}")
     produced+=("${dst}")
 done
@@ -144,6 +170,16 @@ if [[ ${#built[@]} -eq 2 ]]; then
             "${out_root}/macos-aarch64/${artifact}" \
             "${out_root}/macos-x86_64/${artifact}" \
             -output "${universal}/${artifact}"
+    done
+    # A .dSYM holds one DWARF file per binary, which joins the same way.
+    for artifact in bin/nanochrono bin/nanochrono-gui lib/libnanochrono.dylib; do
+        a="${out_root}/macos-x86_64/${artifact}.dSYM" b="${out_root}/macos-aarch64/${artifact}.dSYM"
+        [[ -d "${a}" && -d "${b}" ]] || continue
+        dwa="$(ls "${a}"/Contents/Resources/DWARF/* | head -1)"
+        dwb="$(ls "${b}"/Contents/Resources/DWARF/* | head -1)"
+        cp -R "${b}" "${universal}/${artifact}.dSYM"
+        "${lipo_bin}" -create "${dwa}" "${dwb}" \
+            -output "${universal}/${artifact}.dSYM/Contents/Resources/DWARF/$(basename "${dwb}")"
     done
     produced+=("${universal}")
 fi

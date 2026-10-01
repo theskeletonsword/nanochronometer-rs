@@ -16,6 +16,11 @@
 #   packaging/release/build-all.sh               # everything
 #   packaging/release/build-all.sh linux-aarch64 macos-aarch64   # some
 #   packaging/release/build-all.sh android baremetal             # by name
+#   OPT=-Os packaging/release/build-all.sh                       # another level
+#
+# OPT picks the optimisation level: -O0 -Og -O1 -O2 -O3 -Os -Oz, or -Ofast
+# (not recommended; see packaging/opt-level.sh). The default is -O2, which
+# is what the published releases are.
 #
 # The bare-metal kernels trust the plugin signing roots named by
 # NCPLU_ROOT_CREATOR / NCPLU_ROOT_TREE and sign the bundled plugins with
@@ -51,6 +56,17 @@ mkdir -p "${logs}" "${out}"
 
 toolchain_bin() { echo "${rustup_home}/toolchains/$1-${host}/bin"; }
 
+# No build-machine path in what ships (packaging/remap-paths.sh).
+# shellcheck source=packaging/remap-paths.sh
+source "${repo}/packaging/remap-paths.sh"
+remap="$(remap_rustflags "${repo}")" || exit 1
+cflags_remap="$(remap_cflags "${repo}")"
+
+# OPT= (packaging/opt-level.sh), checked once here and passed on.
+# shellcheck source=packaging/opt-level.sh
+source "${repo}/packaging/opt-level.sh"
+set_opt_args dist || exit 1
+
 # The C header ships next to every library. It is generated from the Rust
 # source when cbindgen is available; otherwise the checked-out copy is used.
 header="${repo}/include/nanochrono.h"
@@ -59,6 +75,39 @@ if command -v cbindgen >/dev/null 2>&1; then
 elif [[ ! -f "${header}" ]]; then
     echo "note: no cbindgen and no include/nanochrono.h; the libraries ship without it"
 fi
+
+# pkg-config files (packaging/pkgconfig.sh).
+# shellcheck source=packaging/pkgconfig.sh
+source "${repo}/packaging/pkgconfig.sh"
+version="$(sed -n 's/^version *= *"\(.*\)"/\1/p' "${repo}/Cargo.toml" | head -1)"
+
+# ship_pkgconfig <name> <target> <dest> <libdir>: the pkg-config file, and on
+# Windows what its static link needs that MinGW does not have — the
+# windows-targets import library — with libunwind named as the archive, so a
+# C program does not end up importing libunwind.dll either.
+ship_pkgconfig() {
+    local name="$1" target="$2" dest="$3" libdir="$4" private
+    private="$(native_libs "${logs}/${name}.log")"
+    if [[ -z "${private}" ]]; then
+        echo "note: no native-static-libs for ${name}; nanochrono.pc lists none"
+    fi
+    if [[ "${target}" == *-windows-gnullvm ]]; then
+        local arch="${target%%-*}" lib file
+        for lib in ${private}; do
+            [[ "${lib}" == -lwindows.* ]] || continue
+            # -lwindows.0.52.0 comes from windows_<arch>_gnullvm 0.52.x.
+            local ver="${lib#-lwindows.}"
+            file="$(ls -d "${CARGO_HOME:-${HOME}/.cargo}"/registry/src/*/windows_"${arch}"_gnullvm-"${ver%.*}".*/lib/libwindows."${ver}".a 2>/dev/null | sort -V | tail -1)"
+            if [[ -n "${file}" ]]; then
+                command cp -f "${file}" "${dest}/${libdir}/"
+            else
+                echo "note: no libwindows.${ver}.a found for ${name}"
+            fi
+        done
+        private="$(sed 's/\(^\| \)-lunwind\( \|$\)/\1-l:libunwind.a\2/g' <<<"${private}")"
+    fi
+    write_pc "${dest}" "${libdir}" "${private}" "${version}"
+}
 
 # Where a platform keeps its libraries: lib64/ for 64-bit Linux, as the
 # distributions do; lib/ for 32-bit Linux, and for macOS and Windows, which
@@ -76,6 +125,81 @@ ship_header() {
     [[ -f "${header}" ]] && install -Dm644 "${header}" "${dest}/include/nanochrono.h"
     command cp -f "${repo}/LICENSE" "${repo}/NOTICE" "${dest}/"
 }
+
+# Every Windows binary links llvm-mingw's runtime into itself — the mingw-w64
+# CRT, and libunwind (statically: no libunwind.dll to ship) — and as
+# llvm-mingw builds that runtime, it names the machine that built the
+# toolchain: the CRT's debug information and libunwind's __FILE__ strings.
+# mingw_runtime <arch> prints a toolchain whose runtime does not: a copy of
+# the toolchain (a reflink copy, which costs no space on btrfs or XFS) with the
+# CRT and libunwind rebuilt from its own sources ([MINGW_SRC], default
+# ~/llvm-mingw), configured as llvm-mingw's build-mingw-w64.sh and
+# build-libcxx.sh configure them, the paths remapped. Without those sources,
+# or if a rebuild fails, it prints the toolchain itself.
+mingw_src="${MINGW_SRC:-${HOME}/llvm-mingw}"
+mingw_runtime() {
+    local arch="$1" rev root crt_flags flags extra=""
+    if [[ ! -d "${mingw_src}/mingw-w64/mingw-w64-crt" || ! -d "${mingw_src}/llvm-project/libunwind" ]]; then
+        echo "${mingw_tc}"
+        return 0
+    fi
+    rev="$(git -C "${mingw_src}/mingw-w64" rev-parse --short=12 HEAD 2>/dev/null || echo src)"
+    rev+="-$(git -C "${mingw_src}/llvm-project" rev-parse --short=12 HEAD 2>/dev/null || echo src)"
+    root="${cache}/mingw-runtime/${rev}"
+    if [[ ! -d "${root}/toolchain" ]]; then
+        mkdir -p "${root}"
+        command rm -rf "${root}/toolchain.tmp"
+        command cp -a --reflink=auto "${mingw_tc}" "${root}/toolchain.tmp" &&
+            mv "${root}/toolchain.tmp" "${root}/toolchain" || { echo "${mingw_tc}"; return 0; }
+    fi
+    if [[ ! -f "${root}/done-${arch}" ]]; then
+        flags="-g -O2 ${cflags_remap} -ffile-prefix-map=${mingw_src}=/llvm-mingw"
+        case "${arch}" in
+            i686) crt_flags="--enable-lib32 --disable-lib64"; extra="-D__USE_MINGW_ANSI_STDIO=1" ;;
+            x86_64) crt_flags="--disable-lib32 --enable-lib64"; extra="-D__USE_MINGW_ANSI_STDIO=1" ;;
+            aarch64) crt_flags="--disable-lib32 --disable-lib64 --enable-libarm64" ;;
+        esac
+        local log="${logs}/mingw-runtime-${arch}.log" tc="${root}/toolchain"
+        command rm -rf "${root}/crt-${arch}" "${root}/unwind-${arch}"
+        mkdir -p "${root}/crt-${arch}"
+        # shellcheck disable=SC2086
+        if ! (cd "${root}/crt-${arch}" && env -u CC PATH="${tc}/bin:${PATH}" \
+                    CFLAGS="${flags}" CCASFLAGS="${flags}" \
+                    "${mingw_src}/mingw-w64/mingw-w64-crt/configure" --host="${arch}-w64-mingw32" \
+                    --prefix="${tc}/${arch}-w64-mingw32" ${crt_flags} --with-default-msvcrt=ucrt \
+                    --enable-silent-rules --enable-cfguard &&
+                env -u CC PATH="${tc}/bin:${PATH}" make -j"$(nproc)" &&
+                env -u CC PATH="${tc}/bin:${PATH}" make install) > "${log}" 2>&1 ||
+           ! PATH="${tc}/bin:${PATH}" cmake -G Ninja -S "${mingw_src}/llvm-project/runtimes" \
+                -B "${root}/unwind-${arch}" \
+                -DCMAKE_BUILD_TYPE=Release \
+                -DCMAKE_C_COMPILER="${arch}-w64-mingw32-clang" \
+                -DCMAKE_CXX_COMPILER="${arch}-w64-mingw32-clang++" \
+                -DCMAKE_CXX_COMPILER_TARGET="${arch}-w64-windows-gnu" \
+                -DCMAKE_SYSTEM_NAME=Windows \
+                -DCMAKE_C_COMPILER_WORKS=TRUE -DCMAKE_CXX_COMPILER_WORKS=TRUE \
+                -DCMAKE_AR="${tc}/bin/llvm-ar" -DCMAKE_RANLIB="${tc}/bin/llvm-ranlib" \
+                -DLLVM_ENABLE_RUNTIMES=libunwind \
+                -DLIBUNWIND_USE_COMPILER_RT=TRUE \
+                -DLIBUNWIND_ENABLE_SHARED=ON -DLIBUNWIND_ENABLE_STATIC=ON \
+                -DCMAKE_C_FLAGS_INIT="-mguard=cf ${extra} ${flags#-g -O2 }" \
+                -DCMAKE_CXX_FLAGS_INIT="-mguard=cf ${extra} ${flags#-g -O2 }" \
+                -DCMAKE_ASM_FLAGS_INIT="${extra} ${flags#-g -O2 }" \
+                >> "${log}" 2>&1 ||
+           ! PATH="${tc}/bin:${PATH}" cmake --build "${root}/unwind-${arch}" --target unwind_static \
+                >> "${log}" 2>&1; then
+            echo "note: the ${arch} MinGW runtime did not rebuild (${log}); linking the toolchain's" >&2
+            echo "${mingw_tc}"
+            return 0
+        fi
+        command cp -f "${root}/unwind-${arch}/lib/libunwind.a" "${tc}/${arch}-w64-mingw32/lib/libunwind.a"
+        touch "${root}/done-${arch}"
+    fi
+    echo "${root}/toolchain"
+}
+
+# macOS: a .dSYM per binary, through the dsymutil remap_dsymutil writes here.
+macos_tools="${cache}/macos-tools"
 
 # name | rust target | rust toolchain
 targets=(
@@ -110,7 +234,7 @@ build_one() {
     local t_=${target//-/_}
     local T; T="$(echo "${target}" | tr 'a-z-' 'A-Z_')"
     local env_=(PATH="${bin}:${PATH}" RUSTUP_TOOLCHAIN="${chain}-${host}")
-    local extra=()
+    local extra=() rustflags="" cflags="${cflags_remap}"
 
     if [[ ! -d "$("${bin}/rustc" --print sysroot)/lib/rustlib/${target}" ]]; then
         extra=(-Zbuild-std=std,panic_abort)
@@ -129,33 +253,53 @@ build_one() {
                 sysroot="${root}/${triple}/sysroot"
                 local cc; cc="$(ls "${root}/bin/${triple}"-gcc-*.br_real 2>/dev/null | head -1)"
                 [[ -n "${cc}" ]] || cc="${root}/bin/${triple}-gcc"
+                rustflags="-C link-arg=--sysroot=${sysroot}${nolld}"
+                cflags="--sysroot=${sysroot} ${cflags_remap}"
                 env_+=("CARGO_TARGET_${T}_LINKER=${cc}"
-                       "CARGO_TARGET_${T}_RUSTFLAGS=-C link-arg=--sysroot=${sysroot}${nolld}"
-                       "CC_${t_}=${cc}" "CFLAGS_${t_}=--sysroot=${sysroot}"
+                       "CC_${t_}=${cc}"
                        "AR_${t_}=${root}/bin/${triple}-ar")
             fi
             ;;
         *-windows-gnullvm)
-            local arch="${target%%-*}"
-            env_+=("CARGO_TARGET_${T}_LINKER=${mingw_tc}/bin/${arch}-w64-mingw32-clang"
-                   "CC_${t_}=${mingw_tc}/bin/${arch}-w64-mingw32-clang"
-                   "AR_${t_}=${mingw_tc}/bin/llvm-ar" "AR=${mingw_tc}/bin/llvm-ar"
-                   "WINDRES=${mingw_tc}/bin/${arch}-w64-mingw32-windres")
+            local arch="${target%%-*}" tc
+            # The toolchain with its runtime rebuilt (mingw_runtime, above).
+            tc="$(mingw_runtime "${arch}")"
+            # libunwind linked in rather than imported: llvm-mingw's
+            # libunwind.dll is no part of Windows, and a release that needs
+            # it does not start on a machine without that toolchain.
+            rustflags="-C target-feature=+crt-static"
+            env_+=("CARGO_TARGET_${T}_LINKER=${tc}/bin/${arch}-w64-mingw32-clang"
+                   "CC_${t_}=${tc}/bin/${arch}-w64-mingw32-clang"
+                   "AR_${t_}=${tc}/bin/llvm-ar" "AR=${tc}/bin/llvm-ar"
+                   "WINDRES=${tc}/bin/${arch}-w64-mingw32-windres")
             ;;
         *-apple-darwin)
             local arch="${target%%-*}"
             local cc; cc="$(ls "${osxcross}/bin/${arch}-apple-darwin"*-clang | head -1)"
+            # The debug map relative to $HOME, and a .dSYM per binary
+            # (packaging/remap-paths.sh).
+            remap_dsymutil "${macos_tools}" "${osxcross}/bin" ||
+                echo "note: no dsymutil; the macOS binaries ship without a .dSYM"
+            rustflags="$(remap_macos_rustflags)"
             # osxcross's ld links against its own libxar, which is not on the
             # system library path.
-            env_+=("PATH=${osxcross}/bin:${bin}:${PATH}"
+            env_+=("PATH=${macos_tools}:${osxcross}/bin:${bin}:${PATH}"
+                   "CARGO_PROFILE_DIST_SPLIT_DEBUGINFO=packed"
                    "LD_LIBRARY_PATH=${osxcross}/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
                    "CARGO_TARGET_${T}_LINKER=${cc}" "CC_${t_}=${cc}"
                    "AR_${t_}=${cc%-clang}-ar" "MACOSX_DEPLOYMENT_TARGET=11.0")
             ;;
     esac
+    # Every target's rustflags carry the path remapping, after its own, and
+    # ask rustc for the system libraries the static library needs (for the
+    # pkg-config file, below). CFLAGS does the same for the C that cc-crate
+    # dependencies build, so the archived C objects name no build path either.
+    env_+=("CARGO_TARGET_${T}_RUSTFLAGS=${rustflags:+${rustflags} }${remap} --print native-static-libs"
+           "CFLAGS_${t_}=${cflags}")
 
     echo "=== ${name} (${target}, ${chain}${extra:+, std from source})"
-    if ! env "${env_[@]}" "${bin}/cargo" build --profile dist --target "${target}" "${extra[@]}" \
+    if ! env "${env_[@]}" "${bin}/cargo" build --profile dist "${OPT_ARGS[@]}" \
+            --target "${target}" "${extra[@]}" \
             --manifest-path "${repo}/Cargo.toml" --target-dir "${tdir}" "${packages[@]}" \
             > "${logs}/${name}.log" 2>&1; then
         echo "!!! ${name} FAILED — see ${logs}/${name}.log"
@@ -181,7 +325,15 @@ build_one() {
     for f in libnanochrono.so libnanochrono.dylib libnanochrono.a libnanochrono.dll.a; do
         [[ -f "${rel}/${f}" ]] && command cp -f "${rel}/${f}" "${dest}/${libdir}/"
     done
+    # macOS: each binary's .dSYM beside it (Cargo links them into the profile
+    # directory; -L copies the bundle, not the link).
+    for f in nanochrono nanochrono-gui; do
+        [[ -e "${rel}/${f}.dSYM" ]] && command cp -RL "${rel}/${f}.dSYM" "${dest}/bin/"
+    done
+    [[ -e "${rel}/libnanochrono.dylib.dSYM" ]] &&
+        command cp -RL "${rel}/libnanochrono.dylib.dSYM" "${dest}/${libdir}/"
     ship_header "${dest}"
+    ship_pkgconfig "${name}" "${target}" "${dest}" "${libdir}"
     dress "${name}"
     echo "    -> ${dest}"
 }
@@ -243,7 +395,19 @@ universal_macos() {
         [[ -f "${a}/${f}" && -f "${b}/${f}" ]] &&
             "${osxcross}/bin/lipo" -create "${a}/${f}" "${b}/${f}" -output "${u}/${f}"
     done
+    # A .dSYM holds one DWARF file per binary, which joins the same way.
+    local d dwa dwb
+    for f in bin/nanochrono bin/nanochrono-gui lib/libnanochrono.dylib; do
+        d="${f}.dSYM"
+        [[ -d "${a}/${d}" && -d "${b}/${d}" ]] || continue
+        dwa="$(ls "${a}/${d}"/Contents/Resources/DWARF/* | head -1)"
+        dwb="$(ls "${b}/${d}"/Contents/Resources/DWARF/* | head -1)"
+        command cp -R "${b}/${d}" "${u}/${d}"
+        "${osxcross}/bin/lipo" -create "${dwa}" "${dwb}" \
+            -output "${u}/${d}/Contents/Resources/DWARF/$(basename "${dwb}")"
+    done
     ship_header "${u}"
+    write_pc "${u}" lib "$(native_libs "${logs}/macos-aarch64.log")" "${version}"
     dress macos-universal
     echo "=== macos-universal -> ${u}"
 }

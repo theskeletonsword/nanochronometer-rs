@@ -33,3 +33,8 @@ tokio = { version = "1.53.1", features = ["rt"] }
 # build.rs asks for the target instead.
 [build-dependencies]
 winresource = "0.1"
+
+# acosf and asinf of its own on Linux (src/main.rs, glibc_compat): glibc 2.43
+# gave both new symbol versions, which would make the GUI require it.
+[target.'cfg(all(target_os = "linux", target_env = "gnu"))'.dependencies]
+libm = "0.2"

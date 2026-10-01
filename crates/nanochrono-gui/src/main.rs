@@ -19,7 +19,14 @@
 //! * Benchmarks and NTP queries run off the UI thread, so a three-pass run no
 //!   longer freezes the window.
 
+// A release is a windowed program on Windows: the console subsystem would
+// open a console window beside it. Debug builds keep the console, for the
+// diagnostics below.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 mod clockface;
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+mod glibc_compat;
 mod style;
 
 use std::sync::Arc;

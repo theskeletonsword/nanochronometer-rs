@@ -68,6 +68,19 @@ if [[ ${#abis[@]} -eq 0 ]]; then
     abis=(arm64-v8a armeabi-v7a x86_64 x86)
 fi
 
+# No build-machine path in what ships (packaging/remap-paths.sh).
+# shellcheck source=packaging/remap-paths.sh
+source "${repo_root}/packaging/remap-paths.sh"
+remap="$(remap_rustflags "${repo_root}")"
+# A pkg-config file per ABI (packaging/pkgconfig.sh).
+# shellcheck source=packaging/pkgconfig.sh
+source "${repo_root}/packaging/pkgconfig.sh"
+version="$(sed -n 's/^version *= *"\(.*\)"/\1/p' "${repo_root}/Cargo.toml" | head -1)"
+# OPT= picks the optimisation level (packaging/opt-level.sh); default -O2.
+# shellcheck source=packaging/opt-level.sh
+source "${repo_root}/packaging/opt-level.sh"
+set_opt_args dist
+
 # A target with no prebuilt standard library (x86_64-linux-android on some
 # nightlies) gets one built from rust-src, which needs a nightly `cargo`.
 sysroot="$(rustc --print sysroot)"
@@ -100,6 +113,8 @@ for abi in "${abis[@]}"; do
         "CC_${target}=${cc}"
         "AR_${target}=${AR}"
         "RANLIB_${target}=${RANLIB}"
+        "CARGO_TARGET_$(echo "${target}" | tr 'a-z-' 'A-Z_')_RUSTFLAGS=${remap} --print native-static-libs"
+        "CFLAGS_${target}=$(remap_cflags "${repo_root}")"
     )
 
     extra=()
@@ -111,10 +126,10 @@ for abi in "${abis[@]}"; do
     # Dynamically linked against bionic: the shared library an app loads, and
     # the static archive an NDK build links.
     env "${build_env[@]}" \
-        cargo build --profile dist --target "${target}" "${extra[@]}" \
+        cargo build --profile dist "${OPT_ARGS[@]}" --target "${target}" "${extra[@]}" \
             --manifest-path "${repo_root}/Cargo.toml" \
             --target-dir "${target_dir}" \
-            -p nanochrono-ffi -p nanochrono-cli
+            -p nanochrono-ffi -p nanochrono-cli 2>&1 | tee "${target_dir}/${target}.native.log"
 
     # Each ABI is an install prefix of its own: bin/, lib64/ (lib/ for the
     # 32-bit ABIs) and include/nanochrono.h beside it.
@@ -126,6 +141,7 @@ for abi in "${abis[@]}"; do
     install -m644 "${target_dir}/${target}/dist/libnanochrono.so" "${staging}/${libdir}/"
     install -m644 "${target_dir}/${target}/dist/libnanochrono.a"  "${staging}/${libdir}/"
     install -m755 "${target_dir}/${target}/dist/nanochrono"       "${staging}/bin/"
+    write_pc "${staging}" "${libdir}" "$(native_libs "${target_dir}/${target}.native.log")" "${version}"
 
     # A second, statically linked CLI. `adb push` plus `chmod +x` is enough to
     # run this on any device of the right ABI — no library path to arrange, and
@@ -142,8 +158,8 @@ for abi in "${abis[@]}"; do
     #    the builtins archive for this ABI.
     builtins="$("${cc}" -rtlib=compiler-rt --print-libgcc-file-name)"
     env "${build_env[@]}" \
-        RUSTFLAGS="-C target-feature=+crt-static -C link-arg=-Wl,--allow-multiple-definition -C link-arg=${builtins}" \
-        cargo build --profile dist --target "${target}" "${extra[@]}" \
+        RUSTFLAGS="-C target-feature=+crt-static -C link-arg=-Wl,--allow-multiple-definition -C link-arg=${builtins} ${remap}" \
+        cargo build --profile dist "${OPT_ARGS[@]}" --target "${target}" "${extra[@]}" \
             --manifest-path "${repo_root}/Cargo.toml" \
             --target-dir "${target_dir}/static-android" \
             -p nanochrono-cli
@@ -153,12 +169,8 @@ for abi in "${abis[@]}"; do
     # The GUI is deliberately excluded: iced needs a windowing system, and
     # Android's is not one winit drives from a plain executable.
     #
-    # Stripping is what makes these shippable: debug info dominates the size of
-    # a Rust cdylib and an Android package has no use for it.
-    "${bin}/llvm-strip" --strip-unneeded \
-        "${staging}/${libdir}/libnanochrono.so" \
-        "${staging}/bin/nanochrono" \
-        "${staging}/bin/nanochrono-static"
+    # Nothing is stripped: the symbols and debug info stay, to debug with and
+    # so that nothing shipped looks as though it hides what it is.
     echo
 done
 

@@ -47,11 +47,54 @@ codegen-units = 16
 
 [profile.dist]
 inherits = "release"
+# What ships, and what the published releases are built at: -O2. Every other
+# level builds too (OPT=, packaging/opt-level.sh).
+opt-level = 2
 lto = "fat"
 codegen-units = 1
+# Nothing that ships is stripped — not even the debug information Cargo would
+# otherwise strip from a profile without its own: the symbols stay, to debug
+# with, and so that no binary looks as though it hides what it is.
+strip = "none"
+
+# The libraries' own code carries full debug information (-O2 -g), so
+# libnanochrono can be stepped through in a debugger as shipped. Only these
+# crates: the same for every dependency (iced, wgpu…) would make the GUI
+# nearly ten times its size.
+[profile.dist.package.nanochrono-core]
+debug = true
+
+[profile.dist.package.nanochrono-crypto]
+debug = true
+
+[profile.dist.package.nanochrono-ffi]
+debug = true
+
+[profile.dist.package.nanochrono-android]
+debug = true
+
+# The programs' own code carries line tables: a backtrace names the file and
+# line, and macOS gets a .dSYM for each program too (rustc runs dsymutil only
+# for a crate with debug information of its own).
+[profile.dist.package.nanochrono-cli]
+debug = "line-tables-only"
+
+[profile.dist.package.nanochrono-gui]
+debug = "line-tables-only"
+
+[profile.dist.package.nanochrono-bench]
+debug = "line-tables-only"
 
 # Measurement code must not be folded away by the optimiser in ways a debug
 # build would hide, and the numbers a benchmark reports should be the numbers
 # the shipped binary would produce — so the bench profile mirrors `dist`.
 [profile.bench]
 inherits = "dist"
+
+# The -Og build: the dev profile's symbols and checks (debug info, debug
+# assertions, overflow checks) with basic optimisation, so a bug that only
+# shows once code is optimised turns up while it can still be stepped through.
+# Rust has no -Og; opt-level 1 is its counterpart. Debugging uses both levels.
+[profile.debug-og]
+inherits = "dev"
+opt-level = 1

@@ -274,12 +274,6 @@ pub fn refused(fb: &Framebuffer, input: &mut Input, name: &str, error: LoadError
 
 /// Says a plugin was stopped by a fault the kernel contained.
 pub fn stopped(fb: &Framebuffer, input: &mut Input, name: &str, fault: &Fault, hz: u64) {
-    let p = &Palette::APP;
-    let (x, y, w, h) = background(fb, p);
-    mark_refused(fb, x + 28, y + 28);
-    let tx = x + 28 + ICON + 20;
-    draw::text(fb, &TITLE, tx, y + 26, name, p.title);
-    draw::text(fb, &HEADING, tx, y + 26 + TITLE.line_height as u32, "Plugin stopped", p.danger);
     let mut t = Text::<96>::new();
     if fault.stack {
         t.str("It ran out of stack (guard page at 0x");
@@ -290,7 +284,25 @@ pub fn stopped(fb: &Framebuffer, input: &mut Input, name: &str, fault: &Fault, h
         hex(&mut t, &(fault.rip as u32).to_be_bytes());
         t.str(".");
     }
-    draw::text(fb, &BODY, x + 28, y + 120, t.as_str(), p.text);
+    stopped_because(fb, input, name, t.as_str(), hz);
+}
+
+/// The card for a plugin its own stack canary stopped: a buffer on its stack
+/// overflowed into the canary, caught before the corrupted return address
+/// was used.
+pub fn smashed(fb: &Framebuffer, input: &mut Input, name: &str, hz: u64) {
+    stopped_because(fb, input, name, "Stack smashing: a buffer overflowed into its stack canary.", hz);
+}
+
+/// A stopped plugin's card, with the reason on its first line.
+fn stopped_because(fb: &Framebuffer, input: &mut Input, name: &str, why: &str, hz: u64) {
+    let p = &Palette::APP;
+    let (x, y, w, h) = background(fb, p);
+    mark_refused(fb, x + 28, y + 28);
+    let tx = x + 28 + ICON + 20;
+    draw::text(fb, &TITLE, tx, y + 26, name, p.title);
+    draw::text(fb, &HEADING, tx, y + 26 + TITLE.line_height as u32, "Plugin stopped", p.danger);
+    draw::text(fb, &BODY, x + 28, y + 120, why, p.text);
     draw::text(
         fb,
         &BODY,

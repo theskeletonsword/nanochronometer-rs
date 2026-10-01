@@ -16,6 +16,11 @@ pub mod x86;
 #[cfg(target_arch = "aarch64")]
 pub mod arm;
 
+/// The ARM run-time ABI's unaligned-access helpers, which `-Oz` code calls on
+/// 32-bit ARM.
+#[cfg(target_arch = "arm")]
+mod aeabi;
+
 #[cfg(any(target_arch = "powerpc", target_arch = "powerpc64"))]
 pub use nanochrono_core::arch::powerpc;
 

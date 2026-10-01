@@ -161,6 +161,10 @@ pub fn nc_resolve_symbol(name: &[u8]) -> Option<(usize, u8)> {
         b"nc_rng_stir" => (crate::rng::nc_rng_stir as *const () as usize, TIER_ANY),
         b"nc_rng_selftest" => (crate::rng::nc_rng_selftest as *const () as usize, TIER_ANY),
         b"nc_abi_version" => (&raw const NC_ABI_VERSION as usize, TIER_ANY),
+        // What -fstack-protector code calls on: the canary, and the handler
+        // for a canary that changed.
+        b"__stack_chk_guard" => (&raw const NC_STACK_CHK_GUARD as usize, TIER_ANY),
+        b"__stack_chk_fail" => (nc_stack_chk_fail as *const () as usize, TIER_ANY),
         _ => return None,
     };
     Some(entry)
@@ -190,6 +194,8 @@ pub static EXPORT_NAMES: &[&str] = &[
     "nc_rng_stir",
     "nc_rng_selftest",
     "nc_abi_version",
+    "__stack_chk_guard",
+    "__stack_chk_fail",
 ];
 
 /// A data symbol, exported so the `IMPORT64` relocation path has something to
@@ -197,7 +203,55 @@ pub static EXPORT_NAMES: &[&str] = &[
 #[no_mangle]
 static NC_ABI_VERSION: u32 = ABI_VERSION;
 
-/// C-ABI form of [`nc_resolve_symbol`]/// C-ABI form of [`nc_resolve_symbol`], for a plugin that wants to resolve a
+/// The stack canary a plugin's `-fstack-protector` code compares against: its
+/// `__stack_chk_guard` import. A fresh random value for every run, set before
+/// any of the plugin's code runs; the low byte is zero, so a string copy that
+/// runs over a buffer cannot write the value back.
+static NC_STACK_CHK_GUARD: AtomicU64 = AtomicU64::new(0);
+
+/// Set when the running plugin's canary check failed, for `run` to report.
+static STACK_SMASHED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// The code a plugin stopped by its canary returns with.
+const ABORT_STACK_SMASHED: i64 = -0x200;
+
+/// A canary for the next run, from NC_RNG; from the counter if the pool cannot
+/// serve (then guessable, but never the same twice).
+fn new_stack_guard() -> u64 {
+    let mut bytes = [0u8; 8];
+    let value = match crate::rng::fill(&mut bytes, nanochrono_core::rng::Mode::Fast) {
+        Ok(_) => u64::from_le_bytes(bytes),
+        Err(_) => crate::arch::counter_ordered().rotate_left(29) ^ 0x9E37_79B9_7F4A_7C15,
+    };
+    value & !0xFF
+}
+
+/// The current run's canary, which the ring-3 runtime copies to user memory.
+pub(crate) fn stack_guard() -> u64 {
+    NC_STACK_CHK_GUARD.load(Ordering::Relaxed)
+}
+
+/// `__stack_chk_fail` for a kernel-tier plugin. Its canary changed, so its
+/// stack is corrupt and its return address is not to be trusted: it is
+/// abandoned the way a contained fault abandons it, on the kernel's own saved
+/// stack, and `run` reports why. (A ring-3 plugin reaches the same end through
+/// `nccall`; see `crate::ring3`.)
+extern "C" fn nc_stack_chk_fail() -> ! {
+    if RUNNING_ARENA.load(Ordering::Relaxed) == 0 {
+        panic!("stack smashing detected outside a plugin");
+    }
+    STACK_SMASHED.store(true, Ordering::Relaxed);
+    // SAFETY: a kernel-tier plugin is running, so nc_plugin_call saved the
+    // kernel's stack and registers, which nc_plugin_abort returns to; single
+    // core, and nothing else touches the abort code.
+    unsafe {
+        *core::ptr::addr_of_mut!(NC_PLUGIN_ABORT_CODE) = ABORT_STACK_SMASHED;
+        nc_plugin_abort();
+    }
+    unreachable!("nc_plugin_abort returns to nc_plugin_call's caller")
+}
+
+/// C-ABI form of [`nc_resolve_symbol`], for a plugin that wants to resolve a
 /// name itself at run time rather than through a load-time relocation.
 ///
 /// # Safety
@@ -839,10 +893,11 @@ pub fn arena_ptr() -> usize {
 }
 
 /// Copies the inspected plugin into the arena and applies its relocations.
-/// `abi_user` is `Some(addr)` for a ring-3 plugin — the user-memory address a
-/// `nc_abi_version` import resolves to; a ring-3 plugin may import no other
-/// symbol (kernel functions are reached through the `NcApi`, kernel data is
-/// not user-readable). `None` is a kernel-tier plugin, resolved as before.
+/// `abi_user` is `Some(addr)` for a ring-3 plugin — the user-memory address its
+/// `nc_abi_version` import resolves to, with the stack canary's two symbols
+/// beside it (`crate::ring3::user_symbol`); a ring-3 plugin may import nothing
+/// else (kernel functions are reached through the `NcApi`, kernel data is not
+/// user-readable). `None` is a kernel-tier plugin, resolved as before.
 ///
 /// # Safety
 /// Writes the executable arena; ring 0; no plugin running.
@@ -870,9 +925,9 @@ pub unsafe fn place(insp: &Inspected<'_>, abi_user: Option<usize>) -> Result<Loa
             Reloc::Import { offset, import } => {
                 let name = image.import_name(import).map_err(LoadError::Format)?;
                 let addr = match abi_user {
-                    // Ring 3: only data symbols exposed in user memory.
+                    // Ring 3: only what is laid out in user memory.
                     Some(abi) => {
-                        crate::ring3::user_data_symbol(name, abi).ok_or(LoadError::UnresolvedImport)?
+                        crate::ring3::user_symbol(name, abi).ok_or(LoadError::UnresolvedImport)?
                     }
                     // Kernel tier: the kernel's own symbols, tier-gated.
                     None => {
@@ -1285,6 +1340,8 @@ pub unsafe fn run(
     #[cfg(x86_any)]
     let _crumb = crate::crashdump::Driver::Interface.enter();
     let hz = ticks_per_sec.max(1);
+    NC_STACK_CHK_GUARD.store(new_stack_guard(), Ordering::Relaxed);
+    STACK_SMASHED.store(false, Ordering::Relaxed);
 
     // Parse, verify and gate. Nothing is copied into the arena yet.
     // SAFETY: forwarded from this function's own contract; no plugin runs.
@@ -1355,6 +1412,12 @@ pub unsafe fn run(
         PLUGIN_CTX.store(0, Ordering::Relaxed);
         match outcome {
             crate::ring3::Outcome::Exited(code) => {
+                if crate::ring3::stack_smashed() {
+                    crate::println!(
+                        "plugin: {name}: stopped \u{2014} stack smashing detected (a stack canary was overwritten)"
+                    );
+                    crate::plugin_card::smashed(fb, input, name, hz);
+                }
                 if let Some(num) = crate::ring3::denied_call() {
                     crate::println!(
                         "plugin: {name}: stopped \u{2014} nccall {num} needs a capability it was not granted"
@@ -1414,6 +1477,12 @@ pub unsafe fn run(
         let code = unsafe { nc_plugin_call(loaded.entry, &api, stack_range().end) };
         RUNNING_ARENA.store(0, Ordering::Relaxed);
         PLUGIN_CTX.store(0, Ordering::Relaxed);
+        if STACK_SMASHED.swap(false, Ordering::Relaxed) {
+            crate::println!(
+                "plugin: {name}: stopped \u{2014} stack smashing detected (a stack canary was overwritten)"
+            );
+            crate::plugin_card::smashed(fb, input, name, hz);
+        }
         // SAFETY: as above.
         if let Some(fault) = unsafe { (*core::ptr::addr_of_mut!(LAST_FAULT)).take() } {
             crate::println!(

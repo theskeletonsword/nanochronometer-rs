@@ -65,6 +65,20 @@ bench = false
 # A freestanding binary has no unwinder and no runtime to unwind into.
 [profile.release]
 panic = "abort"
+# The published kernels and libraries are -O2; OPT= builds any other level.
+opt-level = 2
+# Never stripped, as nothing the project ships is: the kernel that boots keeps
+# its symbol table (crash dumps resolve against it). Said outright because
+# Cargo would otherwise strip debug information from a profile without any.
+strip = "none"
+
+# The -Og build: the dev profile's symbols and checks (debug info, debug
+# assertions, overflow checks) with basic optimisation, so a bug that only
+# shows once code is optimised turns up while it can still be stepped through.
+# Rust has no -Og; opt-level 1 is its counterpart. Debugging uses both levels.
+[profile.debug-og]
+inherits = "dev"
+opt-level = 1
 
 # RustCrypto picks its hardware paths (AES-NI, SHA-NI, PCLMUL, ARMv8 crypto)
 # through `cpufeatures`, which upstream refuses to run on `target_os = "none"`

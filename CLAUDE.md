@@ -11,8 +11,25 @@ in `CLAUDE.local.md`.
 
 - Host workspace: `cargo build --workspace`, `cargo test --workspace`.
 - Profiles: `release` is for development (thin LTO, 16 codegen units, fast);
-  `dist` is what ships (fat LTO, 1 codegen unit). `bench` inherits `dist`.
-  Every packaging script builds `--profile dist`.
+  `dist` is what ships (fat LTO, 1 codegen unit, **-O2** — the published
+  level). `bench` inherits `dist`. `debug-og` is the -Og build (dev plus
+  opt-level 1; Rust has no -Og). Every packaging script builds `--profile
+  dist` and takes `OPT=-O0|-Og|-O1|-O2|-O3|-Os|-Oz|-Ofast`
+  (`packaging/opt-level.sh`); the code must be correct at every level.
+- **Never strip** anything that ships — no `strip`/`objcopy --strip-*`, and
+  `dist` sets `strip = "none"` (a stripped binary or kernel looks like it
+  hides something; symbols are also how it gets debugged). The library
+  crates (core, crypto, ffi, android) build with full debug info in `dist`,
+  the programs (cli, gui, bench) with line tables; macOS ships it as a
+  `.dSYM` per binary. Build-machine paths are remapped instead
+  (`packaging/remap-paths.sh`: rustc, C, the macOS debug map), and the
+  Windows link uses a copy of llvm-mingw whose runtime (mingw-w64 CRT,
+  libunwind) `build-all.sh` rebuilt from `~/llvm-mingw` with the paths mapped,
+  because the toolchain's own embeds them.
+- Debug before release, at **both -O0 and -Og** (the latter catches what only
+  optimised code shows): `cargo test` and `cargo test --profile debug-og`;
+  bare metal `build.sh debug` and `build.sh debug-og`; C SDK `make MODE=debug`
+  and `MODE=debug-og`. Then build the release and test that too.
 - Every release — desktop, Android (libraries, CLI, APK) and bare metal:
   `packaging/release/build-all.sh [name...]` → `build/` (nothing goes to
   `dist/` any more). Each platform is an install prefix: `bin/`, `lib64/` or
@@ -49,8 +66,10 @@ Faults (x86_64): `crashtest=<de|pf|gp|ud|so|df|panic>` on the kernel command
 line raises one on purpose; passing means a crash dump on COM1 and the stop
 screen, with QEMU still running — QEMU exiting under `-no-reboot` is a triple
 fault. `build.sh debug` builds `-O0 -g` with frame pointers into
-`build/baremetal-debug/`; `build.sh gdb x86_64 [crashtest=…]` boots it stopped
-for `gdb -x packaging/baremetal/gdb/x86_64.gdb`. `tools/nanodump.py` reads the
+`build/baremetal-debug/` (`debug-og`: -Og into `build/baremetal-debug-og/`);
+`build.sh gdb x86_64 [crashtest=…]` boots it stopped for
+`gdb -x packaging/baremetal/gdb/x86_64.gdb` (`DEBUG_OPT=Og` for the -Og
+kernel, which GDB then loads via `NC_GDB_ELF`, as the script prints). `tools/nanodump.py` reads the
 dumps. See `docs/CRASH_DUMPS.md`. A PC with no 8042 is `-machine q35,i8042=off`.
 
 ## Logo and icons

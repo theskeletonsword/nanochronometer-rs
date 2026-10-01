@@ -12,8 +12,8 @@ install prefix:
                               runtime loader of yours (read below)
   include/
     nanochrono.h              the C ABI, for C and for assembly
-  nanochrono-kernel.elf       the NanoChronometer kernel (stripped)
-  nanochrono-kernel.sym.elf   its symbols, for GDB and tools/nanodump.py
+  nanochrono-kernel.elf       the NanoChronometer kernel, with its symbols
+                              (for GDB and tools/nanodump.py)
   nanochrono-kernel.mb.elf    x86_64: the same kernel as ELF32, for QEMU -kernel
 
 nanochronometer_x86_64.iso    bootable (BIOS and UEFI) from a USB stick or CD

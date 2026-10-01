@@ -9,7 +9,7 @@ ELF when one is given.
 
     tools/nanodump.py extract serial.log -o CRASH.DMP   # the last dump in the log
     tools/nanodump.py extract-image stick.img -o CRASH.DMP  # CRASH.DMP off a stick
-    tools/nanodump.py show CRASH.DMP --elf nanochrono-kernel.sym.elf
+    tools/nanodump.py show CRASH.DMP --elf nanochrono-kernel.elf
     tools/nanodump.py show serial.log --elf ...          # both at once
 
 `extract-image` reads a whole-disk image or the device itself (/dev/sdX, as

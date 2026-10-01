@@ -18,8 +18,17 @@ debug = true
 panic = "abort"
 
 [profile.release]
-opt-level = 3
+# Released plugins are -O2, as the kernel is.
+opt-level = 2
 debug = false
 lto = true
 codegen-units = 1
 panic = "abort"
+
+# The -Og build: the dev profile's symbols and checks (debug info, debug
+# assertions, overflow checks) with basic optimisation, so a bug that only
+# shows once code is optimised turns up while it can still be stepped through.
+# Rust has no -Og; opt-level 1 is its counterpart. Debugging uses both levels.
+[profile.debug-og]
+inherits = "dev"
+opt-level = 1

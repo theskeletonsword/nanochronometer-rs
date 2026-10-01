@@ -2,16 +2,22 @@
 # NanoChronometer SDK: C plugins (.ncplu), the kernel, a bootable ISO, QEMU.
 #
 #   make                           C plugins in examples/ -> build/<MODE>/<NAME>.NCPLU
+#   make MODE=debug-og             the same at -Og: optimised enough to show what -O0 hides
 #   make MODE=release [OPT=-O3]    the same optimised: -O2 by default, no debug info
+#   make OPT=-Os                   any level in any mode: -O0 -O1 -O2 -O3 -Os -Oz -Og,
+#                                  or -Ofast (not recommended: gives up IEEE 754)
 #   make sign KEYS=<keydir>        sign them (ML-DSA-87 + P-521; keys from ncplu-sign keygen)
-#   make kernel                    the x86-64 kernel, -O0 -g, custom Rust target
+#   make kernel                    the x86-64 kernel, -O0 -g (-Og with MODE=debug-og)
 #   make iso                       kernel + hybrid ISO; the C plugins go on its FAT partition
 #   make run [PLUGIN=rng_demo]     boot the ISO as a USB stick (KVM on an x86-64 host, else TCG)
 #   make gdb [PLUGIN=rng_demo]     the same, stopped for: gdb -x packaging/baremetal/gdb/x86_64.gdb
 #   make clean
 #
-# Plugins: MODE=debug is -O0 -g3 (step through under GDB), MODE=release is
-# -O2 (OPT=-O3 for more). The kernel stays -O0 -g. KEYS=<keydir> on iso/run/gdb
+# Plugins: MODE=debug is -O0 -g3 (step through under GDB), MODE=debug-og is
+# -Og -g3 — debug with both, since -Og shows bugs that -O0 hides and release
+# would hit — and MODE=release is -O2 (OPT=-O3 for more). The kernel follows:
+# -O0 -g, or -Og with MODE=debug-og (it never builds release here; packaging/
+# baremetal/build.sh does). Stack canaries are on in every mode. KEYS=<keydir> on iso/run/gdb
 # signs every plugin and builds the kernel to trust that key's root, which is
 # how a developer gets Official plugins on their own machine. Key directories
 # live outside the repository.
@@ -21,14 +27,34 @@ SDK     := $(REPO)/sdk
 KERNEL  := $(REPO)/crates/nanochrono-baremetal
 MODE    ?= debug
 ifeq ($(MODE),debug)
-OPTFLAGS := -O0 -g3                           # debug: step it in GDB
+OPT_DEFAULT := -O0                            # debug: step it in GDB
+MODEFLAGS   := -g3
+else ifeq ($(MODE),debug-og)
+OPT_DEFAULT := -Og                            # debug at -Og: what only optimised code shows, still steppable
+MODEFLAGS   := -g3
 else ifeq ($(MODE),release)
-OPT     ?= -O2
-OPTFLAGS := $(OPT) -DNDEBUG                   # release: what users run, and what gets signed
+OPT_DEFAULT := -O2                            # release: what users run, and what gets signed
+MODEFLAGS   := -DNDEBUG
 else
-$(error MODE must be debug or release)
+$(error MODE must be debug, debug-og or release)
 endif
-BUILD   := $(SDK)/build/$(MODE)
+# OPT picks the level in any mode; every one is supported and must work.
+# -Ofast is not recommended: -ffast-math reassociates floating-point
+# arithmetic and gives up IEEE 754. Clang has deprecated the -Ofast spelling,
+# so it is passed as what it means.
+OPT     ?= $(OPT_DEFAULT)
+OPT_OK  := -O0 -O1 -O2 -O3 -Os -Oz -Og -Ofast
+ifeq ($(filter $(OPT),$(OPT_OK)),)
+$(error OPT must be one of $(OPT_OK))
+endif
+ifeq ($(OPT),-Ofast)
+$(warning OPT=-Ofast: -ffast-math reassociates floating point and gives up IEEE 754 (not recommended))
+OPTFLAGS := -O3 -ffast-math $(MODEFLAGS)
+else
+OPTFLAGS := $(OPT) $(MODEFLAGS)
+endif
+# A level other than the mode's own builds beside it, not over its objects.
+BUILD   := $(SDK)/build/$(MODE)$(if $(filter-out $(OPT_DEFAULT),$(OPT)),$(OPT))
 # Off the repository's exFAT volume: no hard links there, and rustc's
 # incremental cache corrupts on it.
 export CARGO_TARGET_DIR ?= $(HOME)/.cache/nanochrono/kernel-target
@@ -50,7 +76,13 @@ CFLAGS  += -nostdinc -isystem $(shell $(CC) -print-resource-dir)/include  # comp
 CFLAGS  += -fPIC                              # position independent: the loader picks the address
 CFLAGS  += -fvisibility=hidden                # only ncplu_main is exported (NCPLU_EXPORT)
 CFLAGS  += -mno-red-zone                      # ring 0: an exception pushes onto this same stack
-CFLAGS  += -fno-stack-protector -fno-stack-check  # no __stack_chk_* in the kernel
+# Stack canaries: every function with a local array gets one between its
+# locals and its return address, checked on the way out. The canary is the
+# global __stack_chk_guard (a plugin has no %fs-based TLS), and the kernel
+# supplies both symbols: a fresh random canary for every run, and a
+# __stack_chk_fail that stops the plugin and says so (sdk/examples/smash.c).
+CFLAGS  += -fstack-protector-strong -mstack-protector-guard=global
+CFLAGS  += -fno-stack-check
 CFLAGS  += -fno-exceptions -fno-unwind-tables -fno-asynchronous-unwind-tables  # no .eh_frame
 CFLAGS  += -ffunction-sections -fdata-sections
 CFLAGS  += $(OPTFLAGS)
@@ -106,6 +138,7 @@ sign: $(PLUGINS)
 # What iso/run/gdb hand build.sh: these plugins, the Rust plugins' profile,
 # and with KEYS the signing keys plus the root the kernel will trust.
 BUILD_ENV = NCPLU_EXTRA="$(PLUGINS)" PLUGIN_PROFILE=$(MODE) \
+            DEBUG_OPT=$(if $(filter debug-og,$(MODE)),Og,O0) \
             $(if $(KEYS),NCPLU_SIGN_KEYS=$(KEYS) NCPLU_ROOT_PUBKEYS=$(KEYS)/root_pubkeys.bin)
 
 # The kernel for the custom target. crates/nanochrono-baremetal/.cargo/

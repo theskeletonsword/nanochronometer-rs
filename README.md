@@ -82,6 +82,50 @@ declare their own bindings and do not need them. The kernel module is Rust too.
 | Static library | `target/release/libnanochrono.a` |
 | C header | `include/nanochrono.h` (generated — see below) |
 
+### Optimisation levels
+
+The code is built and tested at every level a user may pick: `-O0`, `-Og`,
+`-O1`, `-O2`, `-O3`, `-Os` and `-Oz`. Each packaging script takes `OPT=`
+([`packaging/opt-level.sh`](packaging/opt-level.sh) maps it onto Rust's
+`opt-level`; Rust has no `-Og`, so it is opt-level 1 with full debug info):
+
+| Level | Used for |
+|---|---|
+| `-O0` | debugging: every `debug` build |
+| `-Og` | debugging what only optimised code shows (`debug-og` builds) — debug with both |
+| `-O2` | **releases** — what is published |
+| `-O1`, `-O3`, `-Os`, `-Oz` | supported for anyone building from source |
+| `-Ofast` | not recommended. In C it is `-ffast-math`, which reassociates floating-point arithmetic and gives up IEEE 754 (NaN, infinities, signed zeros, exact rounding); Rust has no fast-math, so Rust code builds at `-O3` and stays IEEE |
+
+```sh
+OPT=-Os packaging/release/build-all.sh          # every platform at -Os
+OPT=-O3 packaging/baremetal/build.sh x86_64     # one kernel at -O3
+packaging/baremetal/build.sh debug-og           # the -Og debug build
+```
+
+Nothing that ships is stripped. Every binary and library keeps its symbol
+table; the libraries' own code (`nanochrono-core`, `-crypto`, `-ffi` and the
+Android JNI library) carries full debug information, and the programs' own
+code line tables, so a release can be debugged as it is shipped and a
+backtrace names file and line — on macOS through the `.dSYM` beside each
+binary.
+The bare-metal kernels keep their symbols as well; their debug information is
+in the `-O0` and `-Og` debug builds.
+
+Nor does a release carry a path of the machine that built it: the packaging
+scripts remap the repository, the Cargo registry, the toolchains and the
+build trees to fixed names ([`packaging/remap-paths.sh`](packaging/remap-paths.sh)),
+write the macOS debug map relative to the home directory, and link the
+Windows binaries against a MinGW runtime (the mingw-w64 CRT and libunwind)
+rebuilt the same way from llvm-mingw's sources. The repository is
+`/nanochronometer` in the debug information, so point the debugger at a
+checkout of the same version to see the sources:
+
+```
+(gdb) set substitute-path /nanochronometer /path/to/nanochronometer
+(lldb) settings set target.source-map /nanochronometer /path/to/nanochronometer
+```
+
 ### Release builds
 
 ```sh
@@ -99,9 +143,26 @@ them — so C or assembly links with `-I include -L lib64 -lnanochrono` (or
 | `build/linux-{x86_64,aarch64,riscv64}/` | `bin/` (CLI, GUI), `lib64/` (`.so`, `.a`), `include/`, `share/` (desktop entry, icons) |
 | `build/linux-{i686,armv7}/` | the same, with `lib/` |
 | `build/windows-{x86_64,aarch64,i686}/` | `bin/` (the `.exe`s and `nanochrono.dll`, which Windows finds beside them), `lib/` (`libnanochrono.a`, the `.dll.a` import library), `include/` |
-| `build/macos-{aarch64,x86_64,universal}/` | `bin/`, `lib/` (`.dylib`, `.a`), `include/`, `NanoChronometer.app` |
+| `build/macos-{aarch64,x86_64,universal}/` | `bin/`, `lib/` (`.dylib`, `.a`), each binary's `.dSYM` beside it, `include/`, `NanoChronometer.app` |
 | `build/android/<abi>/` | `bin/` (the CLI, dynamic and static), `lib64/` or `lib/` (`.so`, `.a`), `include/`; the universal APK in `build/android/` |
 | `build/baremetal/<arch>/` | the kernel, `lib64/` or `lib/` (`libnanochrono.a` and the complete `libnanochrono.so`), `include/` with the bare-metal ABI; the ISOs and a README in `build/baremetal/` |
+
+Each library directory has a `pkgconfig/nanochrono.pc` that finds the header
+and the library wherever the directory is unpacked:
+
+```sh
+export PKG_CONFIG_PATH=$PWD/linux-x86_64/lib64/pkgconfig
+cc app.c $(pkg-config --cflags --libs nanochrono)              # the shared library
+cc app.c $(pkg-config --cflags nanochrono) linux-x86_64/lib64/libnanochrono.a \
+   $(pkg-config --static --libs-only-l nanochrono | sed 's/-lnanochrono//')  # static
+```
+
+A Rust static library needs the system libraries its standard library uses;
+`Libs.private` lists exactly those, as rustc reported them for that build. On
+Windows that names libunwind as the archive, so a C program does not come to
+depend on `libunwind.dll` either; on Windows on Arm it also includes
+`libwindows.0.52.0.a`, which ships beside it in `lib/` (MinGW has no such
+import library).
 
 The shared libraries carry a portable name, not the path they were built at:
 `SONAME` `libnanochrono.so` on Linux and Android, and the install name
@@ -211,6 +272,7 @@ certificate and a Mac — this project cannot do it for you.
 ./packaging/baremetal/build.sh run ppc-g4   # the ppc build, via Open Firmware
 ./packaging/baremetal/build.sh test         # the host-side decoding tests
 ./packaging/baremetal/build.sh debug        # x86_64 at -O0 -g, frame pointers
+./packaging/baremetal/build.sh debug-og     # the same at -Og (DEBUG_OPT=Og for gdb/boot)
 ./packaging/baremetal/build.sh gdb x86_64 [crashtest=df]  # the same, stopped for GDB
 ```
 
@@ -452,7 +514,7 @@ trace, then writes a `.DMP` crash dump:
 
 ```sh
 tools/nanodump.py show /run/media/$USER/NANOCRASH/CRASH.DMP \
-    --elf build/baremetal/x86_64/nanochrono-kernel.sym.elf
+    --elf build/baremetal/x86_64/nanochrono-kernel.elf
 ```
 
 `crashtest=<de|pf|gp|ud|so|df|panic>` on the kernel command line raises a
@@ -528,6 +590,13 @@ unsigned. The loader treats every byte as hostile:
 * A fault in a plugin — bad opcode, null write, stack overflow — is **caught
   and the plugin abandoned**; the kernel returns to the interface instead of
   triple-faulting. A fault in kernel code still crashes honestly.
+* **Stack canaries** guard C plugins against overflowing a buffer on their own
+  stack. The SDK builds with `-fstack-protector-strong`, and the kernel
+  provides what that code imports: `__stack_chk_guard`, a canary drawn from
+  NC_RNG for every run (low byte zero, so a string copy cannot write it back),
+  and `__stack_chk_fail`, which stops the plugin before the smashed return
+  address is used — in the kernel, or at ring 3 through its own `nccall`.
+  `sdk/examples/smash.c` overflows a stack buffer on purpose to show it.
 
 ##### A community plugin runs at ring 3
 
@@ -571,13 +640,17 @@ from the user's own stick, never built into this tree.
 
 Plugins can be written in C. [`sdk/`](sdk) has the ABI header
 (`include/ncplu.h`, layout pinned by static asserts on both sides), the
-freestanding runtime the compiler expects (`memcpy` & co.), an example that
-uses NC_RNG and NC_TIMER, and a Makefile with the exact clang/lld flags —
-`--target=x86_64-unknown-none-elf -ffreestanding -fPIC -fvisibility=hidden
--mno-red-zone`, linked `-shared` for the packer:
+freestanding runtime the compiler expects (`memcpy` & co.), examples (NC_RNG
+and NC_TIMER, faults, a stack smash), and a Makefile with the exact clang/lld
+flags — `--target=x86_64-unknown-none-elf -ffreestanding -fPIC
+-fvisibility=hidden -mno-red-zone -fstack-protector-strong
+-mstack-protector-guard=global`, linked `-shared` for the packer:
 
 ```sh
-make -C sdk run PLUGIN=rng_demo   # C plugin + -O0 kernel + ISO, booted under QEMU
+make -C sdk run PLUGIN=rng_demo        # C plugin + -O0 kernel + ISO, booted under QEMU
+make -C sdk run MODE=debug-og          # plugins and kernel at -Og
+make -C sdk MODE=release               # -O2, what gets signed and shipped
+make -C sdk MODE=release OPT=-Os       # any level: -O0 -O1 -O2 -O3 -Os -Oz -Og -Ofast
 ```
 
 ### Linux on other architectures
@@ -883,6 +956,26 @@ emulator, not the workload. Use these numbers for correctness checks only,
 never for performance claims.
 ```
 
+### NC_VM — the user-mode verdict in one call
+
+The same detection is a C API, for a program that just wants to know whether it
+is in a VM — no privileges, no kernel module, the result cached:
+
+```c
+#include "nanochrono.h"
+
+nc_vm_t vm;
+nc_vm_detect(&vm);              /* present, confidence, timing_emulated, name */
+if (vm.present && vm.timing_emulated) {
+    /* the counter is synthesised: correctness, not performance */
+}
+int in_vm = nc_vm_present();    /* or just the yes/no */
+```
+
+`nc_vm_detect` is a thin front to `nc_hypervisor_detect`, which returns the full
+`nc_hypervisor_report_t` (CPUID signature, trap-cost cycles and ratio, declared
+TSC kHz, the AArch64 ID registers). Both share one cached detection.
+
 ### Ring 3 / EL0 — always available, no privileges
 
 * `CPUID.1:ECX[31]`, the architectural hypervisor bit
@@ -1016,6 +1109,19 @@ The other one is `#UD` under most hypervisors, and an unhandled `#UD` in
 ring 0 is a crash. The table is `nanochrono_core::hypercall_hal`; the module
 and driver, built without the crate, carry the same one. Reports name the
 choice (`hypercall_insn=`).
+
+#### NC_HYPERCALL — the bare-metal ring 0 API
+
+On bare metal the freestanding library exposes the hypervisor negotiation as a
+C ABI (`include/baremetal/nanochrono.h`), so a kernel linking `libnanochrono`
+does not write its own: `nc_hypercall_detect` fills an `nc_hv_report_t` (the
+CPUID signature, whether a hypercall was *accepted* — proof, not inference —
+and the host/guest clock pair), and `nc_hypercall_count` is the running total
+that stays at 1. It is a **ring 0 / EL1** interface: the hypercall instruction
+(`VMCALL`/`VMMCALL`, `HVC`) faults at ring 3 / EL0, and a hypercall is visible
+to the host, which cloud platforms rate-limit — so a sandboxed community plugin
+does not reach it, while a signed kernel-tier plugin, which runs in the kernel,
+does.
 
 ### Ring 0 — the optional kernel module
 
@@ -1185,14 +1291,33 @@ total=85.724 ms (TLS is 12.0% of it)
 
 ---
 
-## NC_RNG — the entropy pool
+## NC_RNG — random bytes
 
-[`nanochrono_core::rng`](crates/nanochrono-core/src/rng) is one pool for
-everything that needs unpredictable bytes: the freestanding kernel, its
-`.ncplu` plugins, and — through `libnanochrono` — any program, including an
-operating system built on these libraries. `no_std`, allocation-free (the
-caller lends the memory it walks), the same code on all nine kernel
-architectures and the hosted builds.
+One C API for unpredictable bytes — `nc_rng_fill`, `nc_rng_status`,
+`nc_rng_stir`, `nc_rng_selftest` — with two implementations behind it:
+
+- **On a hosted OS** (Linux, Android, macOS, Windows) `libnanochrono` reads the
+  **operating system's own generator**, through the
+  [`getrandom`](https://docs.rs/getrandom) crate: `getrandom(2)` on Linux and
+  Android, `getentropy(2)` on macOS, `ProcessPrng` on Windows. The kernel's
+  CSPRNG is already seeded from everything the OS sees and is fit for
+  long-term keys, so nothing is reinvented there: `NC_RNG_FAST` and
+  `NC_RNG_TRUE` read it alike, `nc_rng_status` reports `NC_RNG_SOURCE_OS` and
+  `NC_RNG_ENGINE_OS`, and `nc_rng_stir` does nothing (the OS gathers its own
+  events). It is thread-safe and fork-safe because the generator is the
+  kernel's, not the process's.
+- **On bare metal**, where there is no OS to ask, it is NanoChronometer's own
+  entropy pool, below — for the freestanding kernel, its `.ncplu` plugins, and
+  any kernel linking the bare-metal library.
+
+The names, constants and `nc_rng_status_t` are the same in both headers, so
+the same C builds against either.
+
+### The bare-metal entropy pool
+
+[`nanochrono_core::rng`](crates/nanochrono-core/src/rng) is `no_std`,
+allocation-free (the caller lends the memory it walks), and the same code on
+all nine kernel architectures.
 
 No single generator is trusted. Every source is absorbed into one Keccak
 sponge; a broken or hostile source cannot cancel the others without knowing
@@ -1202,7 +1327,7 @@ them, and never sees them:
 |---|---|
 | CPU timing jitter | 1/OSR bit per healthy sample — the primary source |
 | `RDSEED` | ½ bit per bit, only if the timer fails its start-up test |
-| OS generator (`/dev/urandom`, hosted) | only if the timer fails |
+| An embedder's own source (`External`) | only if the timer fails |
 | `RDRAND`, PMU cycle counts, events (keys, mouse, USB and storage transfers, frames) | never — additional input |
 
 The jitter source follows the entropy manual the project uses as its
@@ -1243,11 +1368,11 @@ before the caller sees the output. `NC_RNG_TRUE` bypasses the stage and
 reseeds before every 32 bytes, for long-term keys.
 
 ```c
-#include "nanochrono.h"            /* the same calls exist in the kernel for plugins */
+#include "nanochrono.h"            /* hosted or bare metal: the same calls */
 
 uint8_t key[32];
 if (nc_rng_fill(key, sizeof key, NC_RNG_TRUE) != sizeof key) { /* NC_RNG_E* */ }
-nc_rng_stir(NC_RNG_EVENT_USER, my_event);    /* mix in your own timings */
+nc_rng_stir(NC_RNG_EVENT_USER, my_event);    /* bare metal: mix in your timings */
 
 nc_rng_status_t st = { .size = sizeof st };
 nc_rng_status(&st);                           /* sources, engine, health, nonces */

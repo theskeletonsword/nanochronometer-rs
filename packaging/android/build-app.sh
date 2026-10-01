@@ -48,6 +48,15 @@ if [[ -n "${RUST_BIN:-}" ]]; then
 fi
 
 bin="${ndk}/toolchains/llvm/prebuilt/linux-x86_64/bin"
+
+# No build-machine path in what ships (packaging/remap-paths.sh).
+# shellcheck source=packaging/remap-paths.sh
+source "${repo_root}/packaging/remap-paths.sh"
+remap="$(remap_rustflags "${repo_root}")"
+# OPT= picks the optimisation level (packaging/opt-level.sh); default -O2.
+# shellcheck source=packaging/opt-level.sh
+source "${repo_root}/packaging/opt-level.sh"
+set_opt_args dist
 declare -A rust_target=(
     [arm64-v8a]=aarch64-linux-android
     [armeabi-v7a]=armv7-linux-androideabi
@@ -82,14 +91,14 @@ for abi in "${abis[@]}"; do
     echo "=== ${abi} (${target})"
     env "${linker_var}=${cc}" "CC_${target}=${cc}" \
         "AR_${target}=${bin}/llvm-ar" "RANLIB_${target}=${bin}/llvm-ranlib" \
-        cargo build --profile dist --target "${target}" "${extra[@]}" \
+        "${linker_var%_LINKER}_RUSTFLAGS=${remap}" "CFLAGS_${target}=$(remap_cflags "${repo_root}")" \
+        cargo build --profile dist "${OPT_ARGS[@]}" --target "${target}" "${extra[@]}" \
             --manifest-path "${repo_root}/Cargo.toml" \
             --target-dir "${work}/cargo" \
             -p nanochrono-android
-    mkdir -p "${work}/apk/lib/${abi}"
-    "${bin}/llvm-strip" --strip-unneeded \
-        -o "${work}/apk/lib/${abi}/libnanochrono_jni.so" \
-        "${work}/cargo/${target}/dist/libnanochrono_jni.so"
+    # Not stripped, like every library the release ships: the symbols stay.
+    install -Dm644 "${work}/cargo/${target}/dist/libnanochrono_jni.so" \
+        "${work}/apk/lib/${abi}/libnanochrono_jni.so"
 done
 
 # --- 2. resources and manifest ---------------------------------------------

@@ -629,6 +629,26 @@ unsafe fn report_hypervisor() {
         }
         None => println!("  bare metal: the counter is physical"),
     }
+
+    // The NC_HYPERCALL ring-0 C ABI over the same detection: the functions
+    // include/baremetal/nanochrono.h declares, which a C kernel linking
+    // libnanochrono calls. Reads the cache this function just filled.
+    let mut c = crate::abi::nc_hv_report_t::default();
+    // SAFETY: a struct of ours, at ring 0 / EL1.
+    let rc = unsafe { crate::abi::nc_hypercall_detect(&mut c) };
+    let csig = {
+        let bytes: &[u8] =
+            unsafe { core::slice::from_raw_parts(c.signature.as_ptr().cast(), c.signature.len()) };
+        let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+        core::str::from_utf8(&bytes[..end]).unwrap_or("")
+    };
+    println!(
+        "  C ABI          : nc_hypercall_detect {} (flags {}, count {}), signature {}",
+        rc,
+        Hex(c.flags as u64),
+        crate::abi::nc_hypercall_count(),
+        if csig.is_empty() { "none" } else { csig }
+    );
     println!();
 }
 

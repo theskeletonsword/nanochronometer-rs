@@ -13,6 +13,13 @@
  *
  * and reaches the kernel only through `api`: there is no libc, no PLT and no
  * dynamic linker. Kernel *data* may be imported by name (see nc_abi_version).
+ *
+ * Stack canaries: the SDK builds with -fstack-protector-strong and
+ * -mstack-protector-guard=global, and the kernel provides the two symbols
+ * that code imports — `__stack_chk_guard`, a canary drawn from NC_RNG for
+ * every run (its low byte zero), and `__stack_chk_fail`, which stops the
+ * plugin, in the kernel or at ring 3, before a smashed return address is
+ * used. A plugin needs to declare neither.
  */
 #ifndef NCPLU_H
 #define NCPLU_H

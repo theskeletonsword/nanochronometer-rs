@@ -187,9 +187,10 @@ fn route_code(route: crate::pmu::CounterRoute) -> u32 {
 // ===========================================================================
 // NC_RNG: the entropy pool.
 //
-// The same names, values, struct and meaning as libnanochrono's hosted
-// functions (crates/nanochrono-ffi), so C written against one builds against
-// the other. These are the ring-0 entry points: the caller vouches for its
+// The same names, values and struct as libnanochrono's hosted functions
+// (crates/nanochrono-ffi), so C written against one builds against the other.
+// Here they are NanoChronometer's own entropy pool, for bare metal has no OS
+// to ask; a hosted build reads the operating system's generator instead. These are the ring-0 entry points: the caller vouches for its
 // own pointers, as with any C function. A plugin reaches the pool through its
 // NcApi instead, where its pointers and capabilities are checked
 // (`crate::rng::nc_rng_fill` and friends).
@@ -231,6 +232,9 @@ pub const NC_RNG_SOURCE_RDRAND: u32 = 1 << 2;
 pub const NC_RNG_SOURCE_PMU: u32 = 1 << 3;
 pub const NC_RNG_SOURCE_EVENTS: u32 = 1 << 4;
 pub const NC_RNG_SOURCE_EXTERNAL: u32 = 1 << 5;
+/// The operating system's generator: what the hosted libnanochrono reads.
+/// Never reported here; kept so the same C builds against either library.
+pub const NC_RNG_SOURCE_OS: u32 = 1 << 6;
 
 /// `nc_rng_status_t::engine` values: the output stage's path.
 pub const NC_RNG_ENGINE_VAES512: u32 = 1;
@@ -238,6 +242,8 @@ pub const NC_RNG_ENGINE_VAES256: u32 = 2;
 pub const NC_RNG_ENGINE_AESNI: u32 = 3;
 pub const NC_RNG_ENGINE_ARM_AES: u32 = 4;
 pub const NC_RNG_ENGINE_CHACHA20: u32 = 5;
+/// The operating system's generator (the hosted library); never reported here.
+pub const NC_RNG_ENGINE_OS: u32 = 6;
 
 /// First event tag that belongs to the caller (`nc_rng_stir`).
 pub const NC_RNG_EVENT_USER: u64 = 0x100;
@@ -328,4 +334,105 @@ pub extern "C" fn nc_rng_stir(tag: u64, value: u64) {
 #[no_mangle]
 pub extern "C" fn nc_rng_selftest() -> i32 {
     crate::rng::selftest_c()
+}
+
+// ===========================================================================
+// NC_HYPERCALL: the hypervisor, from ring 0.
+//
+// A ready-made front to `crate::hypervisor`, so a kernel that links this
+// library does not reinvent the detection: the CPUID hypervisor leaf and its
+// 12-byte signature, the proof-by-acceptance that a real hypercall returned,
+// and the host/guest clock pair the host offered at boot. The negotiation —
+// the actual VMCALL/VMMCALL on x86, HVC on AArch64 — runs once and is cached,
+// and `nc_hypercall_count` is the running total that a correct chronometer
+// keeps at 1: a hypercall belongs at boot, never in the measurement loop.
+//
+// This is a ring 0 / EL1 interface, because the hypercall instruction faults
+// anywhere else, and because a hypercall is visible to the host (cloud hosts
+// rate-limit a guest that keeps trapping). A sandboxed ring-3 plugin does not
+// reach it; a signed kernel-tier plugin, which runs here, does.
+// ===========================================================================
+
+/// `nc_hypercall_detect` flags: what the report establishes.
+pub const NC_HV_PRESENT: u32 = 1 << 0; // a hypervisor is present at all
+pub const NC_HV_CPUID_BIT: u32 = 1 << 1; // CPUID's hypervisor-present bit was set
+pub const NC_HV_HYPERCALL_OK: u32 = 1 << 2; // a hypercall returned — proof, not inference
+pub const NC_HV_HAS_PAIRING: u32 = 1 << 3; // the host offered a clock pairing
+
+/// What ring 0 learned about the hypervisor underneath, flattened for C.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct nc_hv_report_t {
+    /// `NC_HV_*` bits.
+    pub flags: u32,
+    /// Highest hypervisor CPUID leaf the platform answers (x86), else 0.
+    pub max_leaf: u32,
+    /// Hypercalls issued since power-on — the counter that should stay 1.
+    pub hypercalls: u32,
+    /// How many times detection has run (1 = the boot negotiation).
+    pub probes: u32,
+    /// The host's clock, ns, at the paired instant (0 if no pairing).
+    pub host_ns: u64,
+    /// This machine's counter at that instant (0 if no pairing).
+    pub counter: u64,
+    /// The 12-byte CPUID hypervisor signature, NUL-terminated ("KVMKVMKVM",
+    /// "Microsoft Hv", …); empty if none.
+    pub signature: [core::ffi::c_char; 16],
+}
+
+/// Fills `out` with the cached hypervisor detection. Returns 1, or 0 for a
+/// null `out`. The first call ever (normally the boot self-test) runs the
+/// negotiation; this reads the cached result.
+///
+/// # Safety
+/// `out` must be valid for writing an `nc_hv_report_t`. Ring 0 / EL1.
+#[no_mangle]
+pub unsafe extern "C" fn nc_hypercall_detect(out: *mut nc_hv_report_t) -> i32 {
+    let Some(out) = (unsafe { out.as_mut() }) else {
+        return 0;
+    };
+    // SAFETY: ring 0 by this function's contract; the first call negotiates,
+    // later calls read the cache.
+    let report = unsafe { crate::hypervisor::detect() };
+    let mut flags = 0;
+    if report.is_virtualized() {
+        flags |= NC_HV_PRESENT;
+    }
+    if report.cpuid_bit {
+        flags |= NC_HV_CPUID_BIT;
+    }
+    if report.hypercall_ok {
+        flags |= NC_HV_HYPERCALL_OK;
+    }
+    let (host_ns, counter) = match report.pairing {
+        Some(p) => {
+            flags |= NC_HV_HAS_PAIRING;
+            (p.host_ns, p.counter)
+        }
+        None => (0, 0),
+    };
+    let mut r = nc_hv_report_t {
+        flags,
+        max_leaf: report.max_leaf,
+        hypercalls: report.hypercalls,
+        probes: report.probes,
+        host_ns,
+        counter,
+        signature: [0; 16],
+    };
+    let sig = report.signature_str().as_bytes();
+    let n = sig.len().min(r.signature.len() - 1);
+    for (dst, &b) in r.signature.iter_mut().zip(&sig[..n]) {
+        *dst = b as core::ffi::c_char;
+    }
+    *out = r;
+    1
+}
+
+/// Hypercalls issued since power-on. A correct chronometer negotiates once at
+/// boot and reads the counter afterwards, so this stays at 1; a climbing value
+/// means a hypercall landed in a hot path.
+#[no_mangle]
+pub extern "C" fn nc_hypercall_count() -> u32 {
+    crate::hypervisor::hypercalls()
 }

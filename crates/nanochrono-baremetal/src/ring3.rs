@@ -32,7 +32,7 @@
 //! Every pointer a `nccall` carries is checked to lie in the plugin's own
 //! user memory before the kernel follows it.
 
-use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use crate::crashdump::TrapFrame;
 
@@ -70,6 +70,8 @@ pub mod sys {
     pub const RNG_STATUS: u64 = 17;
     pub const RNG_STIR: u64 = 18;
     pub const RNG_SELFTEST: u64 = 19;
+    /// The plugin's stack canary changed (`__stack_chk_fail`): end it.
+    pub const STACK_CHK_FAIL: u64 = 20;
 }
 
 // ---------------------------------------------------------------------------
@@ -369,6 +371,14 @@ fn cap_of(num: u64) -> u32 {
 /// (the number plus one; 0 means none).
 static R3_DENIED_CALL: AtomicU64 = AtomicU64::new(0);
 
+/// Set when a ring-3 plugin's stack canary changed (`sys::STACK_CHK_FAIL`).
+static R3_STACK_SMASHED: AtomicBool = AtomicBool::new(false);
+
+/// Whether the last ring-3 run was stopped by its stack canary.
+pub fn stack_smashed() -> bool {
+    R3_STACK_SMASHED.load(Ordering::Relaxed)
+}
+
 /// The service a ring-3 plugin was stopped for calling without the capability.
 pub fn denied_call() -> Option<u64> {
     let v = R3_DENIED_CALL.load(Ordering::Relaxed);
@@ -380,6 +390,13 @@ extern "C" fn dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) ->
     // A call to a service the plugin did not declare ends it: an unsigned
     // plugin reaching past what it asked for is misbehaving, and this is the
     // capability wall the plugin cannot talk its way around.
+    // Its canary changed: the plugin's stack is corrupt, so it is ended here,
+    // before its return address is ever used. No capability: always allowed.
+    if num == sys::STACK_CHK_FAIL {
+        R3_STACK_SMASHED.store(true, Ordering::Relaxed);
+        NC_R3_UNWIND.store(1, Ordering::Relaxed);
+        return u64::MAX;
+    }
     let cap = cap_of(num);
     if cap != 0 && !ncplu::cap_granted(cap) {
         R3_DENIED_CALL.store(num + 1, Ordering::Relaxed);
@@ -460,9 +477,9 @@ fn write_stub(buf: &mut [u8], num: u32) -> usize {
 }
 
 /// Builds the `NcApi` and its stubs in the user shared page, and returns the
-/// user address of the `NcApi`. Also copies the one data symbol a plugin may
-/// import, `nc_abi_version`, into user memory and hands its address back for
-/// the loader to relocate against.
+/// user address of the `NcApi`. Also lays out what a plugin may import, for
+/// the loader to relocate against (see [`user_symbol`]): `nc_abi_version`,
+/// this run's stack canary `__stack_chk_guard`, and a `__stack_chk_fail` stub.
 ///
 /// # Safety
 /// Ring 0; `USER_SHARED` is mapped and not in use.
@@ -473,14 +490,19 @@ unsafe fn build_user_api(screen_w: u32, screen_h: u32, ticks_per_sec: u64) -> (u
     let page = unsafe { &mut (*core::ptr::addr_of_mut!(USER_SHARED)).bytes };
     page.fill(0);
 
-    // Layout: [NcApi][nc_abi_version u32][stubs...]. The NcApi comes first so
-    // its address is `base`; the stubs follow, 16-byte spaced for clarity.
+    // Layout: [NcApi][nc_abi_version u32 | pad][__stack_chk_guard u64]
+    // [__stack_chk_fail stub][NcApi stubs...]. The NcApi comes first so its
+    // address is `base`; the rest is 16-byte spaced, at the fixed offsets from
+    // `abi_user` that `user_symbol` resolves.
     let api_len = core::mem::size_of::<NcApi>();
     let abi_off = (api_len + 15) & !15;
     page[abi_off..abi_off + 4].copy_from_slice(&crate::ncplu::ABI_VERSION.to_le_bytes());
+    page[abi_off + GUARD_OFF..abi_off + GUARD_OFF + 8]
+        .copy_from_slice(&crate::ncplu::stack_guard().to_le_bytes());
+    write_stub(&mut page[abi_off + CHK_FAIL_OFF..], sys::STACK_CHK_FAIL as u32);
     let abi_user = base + abi_off;
 
-    let mut off = abi_off + 16;
+    let mut off = abi_off + CHK_FAIL_OFF + 16;
     let mut stub_addr = [0usize; 19];
     for (i, s) in stub_addr.iter_mut().enumerate() {
         *s = base + off;
@@ -525,11 +547,23 @@ unsafe fn build_user_api(screen_w: u32, screen_h: u32, ticks_per_sec: u64) -> (u
     (base, abi_user)
 }
 
-/// The address a ring-3 plugin's data import resolves to: a user-readable copy
-/// in the shared page, not the kernel's own symbol (which ring 3 cannot read).
-/// Only `nc_abi_version` is exported; any other data import is refused.
-pub fn user_data_symbol(name: &[u8], abi_user: usize) -> Option<usize> {
-    (name == b"nc_abi_version").then_some(abi_user)
+/// Where `__stack_chk_guard` and the `__stack_chk_fail` stub sit, from
+/// `nc_abi_version` in the user page.
+const GUARD_OFF: usize = 8;
+const CHK_FAIL_OFF: usize = 16;
+
+/// The address a ring-3 plugin's import resolves to: a user-readable copy or a
+/// user stub in the shared page, never the kernel's own symbol (which ring 3
+/// cannot reach). `nc_abi_version`, the run's stack canary, and the canary's
+/// failure handler, which traps in with `nccall`; any other import is refused
+/// — kernel functions are reached through the `NcApi`.
+pub fn user_symbol(name: &[u8], abi_user: usize) -> Option<usize> {
+    match name {
+        b"nc_abi_version" => Some(abi_user),
+        b"__stack_chk_guard" => Some(abi_user + GUARD_OFF),
+        b"__stack_chk_fail" => Some(abi_user + CHK_FAIL_OFF),
+        _ => None,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -634,6 +668,7 @@ pub unsafe fn run(entry: usize, api_user: usize) -> Outcome {
     NC_R3_UNWIND.store(0, Ordering::Relaxed);
     NC_R3_RESULT.store(0, Ordering::Relaxed);
     R3_DENIED_CALL.store(0, Ordering::Relaxed);
+    R3_STACK_SMASHED.store(false, Ordering::Relaxed);
 
     // The plugin runs `ncplu_main(api) -> i32`. It is entered by iretq (not a
     // call), so a return address is placed on the user stack by hand: an exit
