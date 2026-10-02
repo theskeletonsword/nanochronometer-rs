@@ -44,7 +44,7 @@ cbindgen \
 # cbindgen writes a header for C. For assembly, split its body at the blank
 # lines between items: an item that is only a numeric #define (with its doc
 # comment) stays visible, and everything else goes under __ASSEMBLER__.
-python3 - "${hosted}" "${baremetal}" <<'PY'
+python3 - "${hosted}" "${baremetal}" "${repo_root}/crates/nanochrono-baremetal/src/abi_symbols.h" <<'PY'
 import re
 import sys
 
@@ -73,7 +73,13 @@ def asm_safe(item):
     return bool(code) and all(NUMERIC.match(line) for line in code)
 
 
-for path in sys.argv[1:]:
+# The bare-metal library's symbols that cbindgen cannot see (assembly, trap
+# entry points, the kernel's imports): abi_symbols.h, without its file comment,
+# spliced in before the extern "C" block closes.
+symbols = open(sys.argv[3]).read()
+symbols = symbols[symbols.index("*/") + 2:].strip("\n").split("\n")
+
+for path in sys.argv[1:3]:
     lines = open(path).read().split("\n")
     guard = next(i for i, l in enumerate(lines) if re.match(r"#define NANOCHRONO_H\b", l))
     end = max(i for i, l in enumerate(lines) if l.startswith("#endif") and "NANOCHRONO_H" in l)
@@ -93,6 +99,8 @@ for path in sys.argv[1:]:
         out += item + [""]
     out += ["#ifndef __ASSEMBLER__", ""]
     for item in c_only:
+        if path == sys.argv[2] and any(l.startswith("}  // extern") for l in item):
+            out += symbols + [""]
         out += item + [""]
     out += ["#endif  /* __ASSEMBLER__ */", ""] + lines[end:]
     open(path, "w").write("\n".join(out))

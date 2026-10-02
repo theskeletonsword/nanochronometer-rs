@@ -726,6 +726,17 @@ fn report_cpu() {
     {
         println!("  neon={} sve={} sve2={}", f.neon, f.sve, f.sve2);
         println!("  aes={} sha2={} sme={}", f.arm_aes, f.arm_sha2, f.sme);
+        // The lengths the boot stub's ZCR_ELx/SMCR_ELx settings produced:
+        // the core's maximum, unless a level above this one capped it.
+        let (vl, svl) = crate::arch::arm::vector_lengths();
+        match vl {
+            Some(bytes) => println!("  sve vector length  : {} bits", bytes * 8),
+            None => println!("  sve vector length  : n/a"),
+        }
+        match svl {
+            Some(bytes) => println!("  sme streaming vl   : {} bits", bytes * 8),
+            None => println!("  sme streaming vl   : n/a"),
+        }
         println!("  el={}", crate::arch::arm::current_el());
         println!(
             "  mmu            : {}",

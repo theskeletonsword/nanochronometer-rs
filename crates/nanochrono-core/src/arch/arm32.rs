@@ -34,6 +34,24 @@ use std::sync::OnceLock;
 /// has the same value).
 pub const HWCAP_NEON: u64 = 1 << 12;
 
+/// Whether `MVFR1` reports Advanced SIMD: its SIMDLS, SIMDInt and SIMDSP
+/// fields (bits 19:8) are non-zero on a core with NEON. The freestanding
+/// kernel's way to learn what `AT_HWCAP` tells a hosted process.
+///
+/// Reading `MVFR1` needs PL1 and the FP unit enabled (`CPACR` cp10/cp11 and
+/// `FPEXC.EN`), which the bare-metal boot stub sets before any Rust runs; a
+/// hosted build never calls this.
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+pub fn mvfr1_reports_neon() -> bool {
+    let mvfr1: u32;
+    // SAFETY: see above — PL1 with the FP unit on; a read with no side
+    // effects.
+    unsafe {
+        core::arch::asm!("vmrs {}, mvfr1", out(reg) mvfr1, options(nomem, nostack, preserves_flags));
+    }
+    (mvfr1 >> 8) & 0xFFF != 0
+}
+
 /// Whether `CNTVCT`/`CNTFRQ` are readable from this process, and `CNTFRQ`.
 #[cfg(feature = "std")]
 fn generic_timer() -> Option<u32> {

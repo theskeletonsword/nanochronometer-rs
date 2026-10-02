@@ -91,10 +91,13 @@ opt-level = 1
 # for this kernel because its boot stub enables the state those paths need.
 # Each crypto crate then uses hardware where the CPU has it and its portable
 # code where it does not: no #UD on older parts. See vendor/cpufeatures.
-# Decodes the logo PNG at build time (build.rs), so the kernel embeds pixels
-# and carries no decoder.
+# Decodes the logo PNG and the wallpapers (PNG or JPEG) at build time
+# (build.rs), so the kernel embeds pixels and carries no PNG or JPEG decoder;
+# nanochrono-core's QOI encoder stores the wallpapers the kernel streams.
 [build-dependencies]
 png = "0.17"
+jpeg-decoder = { version = "0.3", default-features = false }
+nanochrono-core = { path = "../nanochrono-core" }
 
 [patch.crates-io]
 cpufeatures = { path = "vendor/cpufeatures" }

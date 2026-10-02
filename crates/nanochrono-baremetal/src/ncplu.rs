@@ -60,7 +60,7 @@ use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 // ===========================================================================
 
 pub use nanochrono_core::ncplu::{
-    fnv1a, FormatError, Image, Reloc, ABI_VERSION, CAP_ALL, CAP_INPUT, CAP_LOG, CAP_PMU, CAP_RNG,
+    fnv1a, Arch, FormatError, Image, Kind, Reloc, ABI_VERSION, CAP_ALL, CAP_INPUT, CAP_LOG, CAP_PMU, CAP_RNG,
     CAP_SCREEN, CAP_TIMER, FLAG_HAS_CAPS, FLAG_WANTS_PRIVILEGED, FORMAT_VERSION, HEADER_SIZE, MAGIC,
     ROOT_MLDSA_LEN, ROOT_P521_LEN, SIGNATURE_LEN,
 };
@@ -552,7 +552,7 @@ pub const ARENA_LEN: usize = nanochrono_core::ncplu::MAX_ARENA;
 /// a community plugin runs at ring 3, and the arena is mapped user by setting
 /// the user bit on exactly its one 2 MiB page (see `crate::ring3`), so nothing
 /// kernel may share it. Only the first [`ARENA_LEN`] bytes are ever used.
-const ARENA_SPAN: usize = 0x20_0000;
+pub(crate) const ARENA_SPAN: usize = 0x20_0000;
 #[repr(C, align(0x200000))]
 struct Arena {
     bytes: [u8; ARENA_SPAN],
@@ -574,6 +574,15 @@ pub enum LoadError {
     /// A relocation names a kernel symbol that does not exist, or that its
     /// tier may not use.
     UnresolvedImport,
+    /// Built for another architecture: a package's entry for a machine this
+    /// kernel is not, installed by mistake. Never loaded, never executed.
+    WrongArch,
+    /// A driver or a shared library: installed, not run. Drivers load at
+    /// boot from `/boot/drivers`, libraries from `/usr/lib`; neither is a
+    /// program to launch from here.
+    NotRunnable,
+    /// The file breaks the `.ncplu` package format. Nothing from it was loaded.
+    BadPackage(nanochrono_core::ncpkg::FormatError),
 }
 
 impl LoadError {
@@ -583,7 +592,51 @@ impl LoadError {
             LoadError::Corrupt => "digest mismatch: the file is damaged or was edited",
             LoadError::Privileged => "asks for privileged services but is not officially signed",
             LoadError::UnresolvedImport => "a needed kernel symbol is missing or privileged",
+            LoadError::WrongArch => "built for another architecture",
+            LoadError::NotRunnable => "a driver or a library: installed, not run",
+            LoadError::BadPackage(e) => e.message(),
         }
+    }
+}
+
+/// The architecture this kernel was built for: what [`Arch`] a module must
+/// name to load here.
+pub const fn this_arch() -> Arch {
+    #[cfg(target_arch = "x86_64")]
+    {
+        Arch::X86_64
+    }
+    #[cfg(target_arch = "x86")]
+    {
+        Arch::I386
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        Arch::Aarch64
+    }
+    #[cfg(target_arch = "arm")]
+    {
+        Arch::Arm32
+    }
+    #[cfg(target_arch = "riscv64")]
+    {
+        Arch::Riscv64
+    }
+    #[cfg(target_arch = "riscv32")]
+    {
+        Arch::Riscv32
+    }
+    #[cfg(all(target_arch = "powerpc64", target_endian = "big"))]
+    {
+        Arch::Ppc64
+    }
+    #[cfg(all(target_arch = "powerpc64", target_endian = "little"))]
+    {
+        Arch::Ppc64Le
+    }
+    #[cfg(target_arch = "powerpc")]
+    {
+        Arch::Ppc
     }
 }
 
@@ -651,13 +704,28 @@ pub struct Loaded {
 /// P-521 must verify over it against a trusted root for a kernel tier.
 #[cfg(feature = "plugin-verify")]
 fn check(image: &Image<'_>) -> Result<(Signature, [u8; 8]), LoadError> {
-    let digest = verify_impl::digest(image.signed());
+    let digest = verify_impl::digest(image.signed(), nanochrono_core::ncplu::H_DIGEST);
     if image.header_digest() != &digest[..] {
         return Err(LoadError::Corrupt);
     }
     let mut prefix = [0u8; 8];
     prefix.copy_from_slice(&digest[..8]);
     Ok((verify_on_scratch(&digest, image.signature_block()), prefix))
+}
+
+/// The package container's own integrity and signature: the same hybrid
+/// check as [`check`], over the package's signed region. A damaged download
+/// fails here, before anything is picked out of it; the entry the loader
+/// then maps is checked again by [`inspect`], with its own digest.
+#[cfg(feature = "plugin-verify")]
+fn check_package(pkg: &nanochrono_core::ncpkg::Package<'_>) -> Result<(Signature, [u8; 8]), LoadError> {
+    let digest = verify_impl::digest(pkg.signed(), nanochrono_core::ncpkg::H_DIGEST);
+    if pkg.header_digest() != &digest[..] {
+        return Err(LoadError::Corrupt);
+    }
+    let mut prefix = [0u8; 8];
+    prefix.copy_from_slice(&digest[..8]);
+    Ok((verify_on_scratch(&digest, pkg.signature_block()), prefix))
 }
 
 /// The signature check, on the verification stack: ML-DSA-87 verify alone
@@ -701,6 +769,13 @@ fn check(_image: &Image<'_>) -> Result<(Signature, [u8; 8]), LoadError> {
     Ok((Signature::NoRoot, [0; 8]))
 }
 
+/// Without the `plugin-verify` feature there is no SHA-512 to check with:
+/// nothing is Official, and integrity rests on the format checks alone.
+#[cfg(not(feature = "plugin-verify"))]
+fn check_package(_pkg: &nanochrono_core::ncpkg::Package<'_>) -> Result<(Signature, [u8; 8]), LoadError> {
+    Ok((Signature::NoRoot, [0; 8]))
+}
+
 /// A trusted root's fingerprint, as `ncplu-sign` prints it: the first 8
 /// bytes of SHA-512 over its two public keys. `Creator` (✅) or `TreeRoot`
 /// (🌳); `None` when that root is not embedded.
@@ -722,7 +797,7 @@ pub fn root_fingerprint(which: Tier) -> Option<[u8; 8]> {
 mod verify_impl {
     use super::{Signature, Tier, ROOT_MLDSA_LEN, ROOT_P521_LEN};
     use nanochrono_core::ncplu::{
-        DIGEST_LEN, H_DIGEST, SIG_MAGIC, SIG_MLDSA_LEN, SIG_MLDSA_OFF, SIG_P521_LEN, SIG_P521_OFF,
+        DIGEST_LEN, SIG_MAGIC, SIG_MLDSA_LEN, SIG_MLDSA_OFF, SIG_P521_LEN, SIG_P521_OFF,
     };
     use sha512::{Digest, Sha512};
 
@@ -747,12 +822,14 @@ mod verify_impl {
     }
 
     /// SHA-512 of the signed region with the header's digest field zeroed,
-    /// hashed in three pieces so nothing is copied.
-    pub fn digest(signed: &[u8]) -> [u8; 64] {
+    /// hashed in three pieces so nothing is copied. `digest_at` is the
+    /// field's offset: [`H_DIGEST`](crate::ncplu::H_DIGEST) for a module,
+    /// [`H_DIGEST`](nanochrono_core::ncpkg::H_DIGEST) for a package.
+    pub fn digest(signed: &[u8], digest_at: usize) -> [u8; 64] {
         let mut h = Sha512::new();
-        h.update(signed.get(..H_DIGEST).unwrap_or(&[]));
+        h.update(signed.get(..digest_at).unwrap_or(&[]));
         h.update([0u8; DIGEST_LEN]);
-        h.update(signed.get(H_DIGEST + DIGEST_LEN..).unwrap_or(&[]));
+        h.update(signed.get(digest_at + DIGEST_LEN..).unwrap_or(&[]));
         finish(h)
     }
 
@@ -852,6 +929,9 @@ mod verify_impl {
 /// No plugin may be running.
 pub unsafe fn inspect(file: &[u8]) -> Result<Inspected<'_>, LoadError> {
     let image = Image::parse(file).map_err(LoadError::Format)?;
+    if image.arch() != this_arch() {
+        return Err(LoadError::WrongArch);
+    }
     let t0 = crate::arch::counter_ordered();
     let (signature, digest) = check(&image)?;
     let check_ticks = crate::arch::counter_ordered().wrapping_sub(t0);
@@ -1093,8 +1173,9 @@ unsafe fn unmap_page(addr: usize, spare: &mut usize) -> bool {
             (e2 & PTE_ADDR) as *mut u64
         };
         *pt.add((addr >> 12) & 511) = 0;
-        // A whole-TLB flush: a 2 MiB entry may just have become a table.
-        core::arch::asm!("mov {t}, cr3", "mov cr3, {t}", t = out(reg) _, options(nostack, preserves_flags));
+        // A whole-TLB flush, global entries included: a 2 MiB entry may just
+        // have become a table, and the boot map's first gigabyte is global.
+        crate::arch::x86::flush_tlb_all();
     }
     true
 }
@@ -1322,6 +1403,14 @@ pub const fn vector_name(vector: u64) -> &'static str {
 
 /// Loads and runs a plugin, handing it the screen until it returns.
 ///
+/// `image` is whatever a path held: a `.ncplu` package, a single `.ncapp`,
+/// or — refused with the reason on a card — a driver, a library, or a module
+/// for another machine. A package selects the app entry for this architecture
+/// and runs it as if it had arrived alone: the container's own digest and
+/// signature are checked first, so a damaged download fails before anything
+/// is picked out of it, and the entry is then checked again below, with its
+/// own digest and signature. A driver or a library is installed, not run.
+///
 /// Returns the plugin's exit code; -1 if it was refused, -2 if the user
 /// cancelled it at the launch card, and -(0x100 + vector) if a fault stopped
 /// it.
@@ -1337,6 +1426,66 @@ pub unsafe fn run(
     pmu: &crate::pmu::CorePmu,
     ticks_per_sec: u64,
 ) -> i32 {
+    use nanochrono_core::ncpkg;
+    // A package: check the container, pick this architecture's app, and run
+    // those bytes as the single module below.
+    if image.get(..8) == Some(&ncpkg::MAGIC[..]) {
+        let hz = ticks_per_sec.max(1);
+        let pkg = match ncpkg::Package::parse(image) {
+            Ok(p) => p,
+            Err(e) => {
+                let e = LoadError::BadPackage(e);
+                crate::println!("plugin: {name}: refused: {}", e.message());
+                crate::plugin_card::refused(fb, input, name, e, hz);
+                return -1;
+            }
+        };
+        if let Err(e) = check_package(&pkg) {
+            crate::println!("plugin: {name}: refused: {}", e.message());
+            crate::plugin_card::refused(fb, input, name, e, hz);
+            return -1;
+        }
+        let entry = match pkg.select(this_arch(), Kind::App) {
+            Ok(e) => e,
+            Err(ncpkg::FormatError::NoEntry) => {
+                let e = LoadError::WrongArch;
+                crate::println!("plugin: {name}: refused: {}", e.message());
+                crate::plugin_card::refused(fb, input, name, e, hz);
+                return -1;
+            }
+            Err(e) => {
+                let e = LoadError::BadPackage(e);
+                crate::println!("plugin: {name}: refused: {}", e.message());
+                crate::plugin_card::refused(fb, input, name, e, hz);
+                return -1;
+            }
+        };
+        let inner = match pkg.entry_bytes(&entry) {
+            Ok(b) => b,
+            Err(e) => {
+                let e = LoadError::BadPackage(e);
+                crate::println!("plugin: {name}: refused: {}", e.message());
+                crate::plugin_card::refused(fb, input, name, e, hz);
+                return -1;
+            }
+        };
+        // SAFETY: forwarded from this function's own contract; no plugin
+        // runs. The entry's own digest, signature and architecture are
+        // checked again below before anything is copied.
+        return unsafe { run(name, inner, fb, input, pmu, ticks_per_sec) };
+    }
+    // A driver or a library is installed, not run: say so now, with the
+    // reason, rather than faulting later on a missing entry point.
+    if image.get(..8) == Some(&MAGIC[..]) {
+        if let Ok(single) = Image::parse(image) {
+            if single.kind() != Kind::App {
+                let e = LoadError::NotRunnable;
+                crate::println!("plugin: {name}: refused: {}", e.message());
+                crate::plugin_card::refused(fb, input, name, e, ticks_per_sec.max(1));
+                return -1;
+            }
+        }
+    }
     #[cfg(x86_any)]
     let _crumb = crate::crashdump::Driver::Interface.enter();
     let hz = ticks_per_sec.max(1);
@@ -1576,7 +1725,7 @@ pub fn write_caps<const N: usize>(t: &mut crate::text::Text<N>, caps: u32) {
 
 /// The raw `.ncplu` bytes are read into this before loading. 512 KiB is far
 /// larger than any phase-1 plugin (`-O0` Snake is ~90 KiB) and still static.
-const IMAGE_BUF_LEN: usize = nanochrono_core::ncplu::MAX_IMAGE;
+pub(crate) const IMAGE_BUF_LEN: usize = nanochrono_core::ncplu::MAX_IMAGE;
 static mut IMAGE_BUF: [u8; IMAGE_BUF_LEN] = [0; IMAGE_BUF_LEN];
 
 /// The scratch buffer a plugin's file is read into. One plugin loads at a

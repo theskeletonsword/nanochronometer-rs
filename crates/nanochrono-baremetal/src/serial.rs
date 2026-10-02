@@ -184,9 +184,85 @@ macro_rules! println {
 #[doc(hidden)]
 pub fn _print(args: fmt::Arguments<'_>) {
     use fmt::Write as _;
+    /// Everything printed goes three ways: the UART (and whatever console
+    /// stands in for it), the kernel log `dmesg` reads back, and the console
+    /// sink when one is set — the shell's terminal, in the CLI mode, so the
+    /// self-test and every driver's messages are on the screen as well.
+    struct Tee;
+    impl fmt::Write for Tee {
+        fn write_str(&mut self, s: &str) -> fmt::Result {
+            let _ = Serial.write_str(s);
+            klog::append(s.as_bytes());
+            let sink = SINK.load(Ordering::Relaxed);
+            if sink != 0 {
+                // SAFETY: only `set_console_sink` stores here, and only a
+                // `fn(&str)`.
+                let sink: fn(&str) = unsafe { core::mem::transmute::<usize, fn(&str)>(sink) };
+                sink(s);
+            }
+            Ok(())
+        }
+    }
     // The error can only come from the formatter, and there is nothing to
     // report it to.
-    let _ = Serial.write_fmt(args);
+    let _ = Tee.write_fmt(args);
+}
+
+/// Writes text to the console (the UART, or what stands in for it) and
+/// nowhere else: not the kernel log, not the sink. For a shell mirroring its
+/// own terminal, whose output is not a kernel message.
+pub fn console_write(s: &str) {
+    use fmt::Write as _;
+    let _ = Serial.write_str(s);
+}
+
+/// Where printed text also goes, besides the UART and the log.
+static SINK: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// Sends everything printed from now on to `sink` as well (`None` stops).
+/// The sink must not print: it would recurse.
+pub fn set_console_sink(sink: Option<fn(&str)>) {
+    SINK.store(sink.map_or(0, |f| f as usize), Ordering::Relaxed);
+}
+
+/// The kernel log: the last [`klog::CAPACITY`] bytes of everything printed
+/// since boot, for `dmesg`.
+pub mod klog {
+    use core::sync::atomic::{AtomicUsize, Ordering};
+
+    pub const CAPACITY: usize = 64 * 1024;
+    static mut RING: [u8; CAPACITY] = [0; CAPACITY];
+    /// Bytes ever appended; the ring holds the last `CAPACITY` of them.
+    static TOTAL: AtomicUsize = AtomicUsize::new(0);
+
+    pub(super) fn append(bytes: &[u8]) {
+        let mut at = TOTAL.load(Ordering::Relaxed);
+        for &b in bytes {
+            // SAFETY: one core, interrupts masked: the only writer.
+            unsafe { (*core::ptr::addr_of_mut!(RING))[at % CAPACITY] = b };
+            at = at.wrapping_add(1);
+        }
+        TOTAL.store(at, Ordering::Relaxed);
+    }
+
+    /// The log, oldest first, as two slices (the ring's two halves).
+    pub fn contents() -> (&'static [u8], &'static [u8]) {
+        let total = TOTAL.load(Ordering::Relaxed);
+        // SAFETY: read-only views; the appender runs on the same core and
+        // never while a caller holds these (callers print them in one go).
+        let ring = unsafe { &*core::ptr::addr_of!(RING) };
+        if total <= CAPACITY {
+            (&ring[..total], &[])
+        } else {
+            let head = total % CAPACITY;
+            (&ring[head..], &ring[..head])
+        }
+    }
+
+    /// Bytes ever logged.
+    pub fn total() -> usize {
+        TOTAL.load(Ordering::Relaxed)
+    }
 }
 
 #[cfg(x86_any)]

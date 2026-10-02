@@ -13,8 +13,11 @@ header = """/* SPDX-License-Identifier: Apache-2.0 */
  * GENERATED FILE. Do not edit.
  *
  * Regenerate with tools/gen-header.sh. The declarations are derived from
- * crates/nanochrono-baremetal/src/abi.rs, which is the single source of
- * truth: the implementation is Rust and there is no hand-written C here.
+ * crates/nanochrono-baremetal/src/abi.rs, the single source of truth for the
+ * C ABI (the implementation is Rust), followed by src/abi_symbols.h: the rest
+ * of libnanochrono.so's symbol table — what is defined in assembly, the trap
+ * entry points, and the symbols the library imports from the kernel that
+ * loads it — under #if per architecture.
  *
  * Link against libnanochrono.a in lib64/ (lib/ on a 32-bit target), which
  * needs nothing more, or libnanochrono.so beside it, which needs a loader of

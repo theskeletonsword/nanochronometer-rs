@@ -14,15 +14,23 @@ use nanochrono_baremetal::acpi;
 #[allow(unused_imports)]
 use nanochrono_baremetal::println;
 // `arch` only where an entry point still names it directly (the AArch64 MMU,
-// the e500 TLB, RISC-V's vector check); elsewhere the console took it over.
-#[cfg(any(target_arch = "aarch64", target_arch = "powerpc", target_arch = "riscv32", target_arch = "riscv64"))]
+// the e500 TLB, OPAL from the device tree, RISC-V's vector check); elsewhere
+// the console took it over.
+#[cfg(any(
+    target_arch = "aarch64",
+    target_arch = "arm",
+    target_arch = "powerpc",
+    target_arch = "powerpc64",
+    target_arch = "riscv32",
+    target_arch = "riscv64"
+))]
 use nanochrono_baremetal::arch;
 use nanochrono_baremetal::{selftest, serial::Serial};
 // Only the text-mode banner names it, and that path is x86 firmware.
 #[cfg(x86_any)]
 use nanochrono_baremetal::VERSION;
 #[cfg(x86_any)]
-use nanochrono_baremetal::{gui, multiboot, panic, progress};
+use nanochrono_baremetal::{multiboot, panic, progress};
 
 /// What a multiboot2 loader leaves in `EAX`. GRUB2 uses this one.
 ///
@@ -49,6 +57,10 @@ pub unsafe extern "C" fn kmain(magic: usize, multiboot_info: usize) -> ! {
     let (magic, multiboot_info) = (magic as u64, multiboot_info as u64);
     // SAFETY: at CPL 0, and nothing else is driving COM1.
     unsafe { Serial::init() };
+    // The processor controls, from what CPUID says (cpu_control): before
+    // anything that relies on them — the PMU, the counter, the hypervisor.
+    // SAFETY: CPL 0, once, before any plugin.
+    unsafe { nanochrono_baremetal::cpu_control::configure() };
 
     let loader = match magic {
         MULTIBOOT2_BOOTLOADER_MAGIC => "multiboot2",
@@ -126,15 +138,16 @@ pub unsafe extern "C" fn kmain(magic: usize, multiboot_info: usize) -> ! {
     progress::attach(fb);
     progress::leave(progress::Phase::Entered);
 
-    // `crashtest=<de|pf|gp|ud|so|df|panic>` on the command line raises that
-    // fault on purpose: the way to prove, on the machine in question, that a
-    // fault ends in a crash dump and a stop screen rather than a reset. It is
-    // *armed* here and fired later — after the interface has brought up USB
-    // and handed the dumper the stick — so the dump exercises the USB path
-    // too, not only serial. The no-framebuffer console path, which brings up
-    // no USB, fires it immediately before it starts. GRUB: press `e` on the
-    // entry and append it to the `multiboot2` line. QEMU: `-append`.
-    #[cfg(target_arch = "x86_64")]
+    // `crashtest=<de|pf|gp|ud|so|df|xm|mf|nm|panic>` on the command line
+    // raises that fault on purpose (i386: all but so, which needs a guard
+    // page its 4 MiB pages cannot hold): the way to prove, on the machine in question, that a fault —
+    // the floating-point and SIMD ones too — ends in a crash dump and a stop
+    // screen rather than a reset. It is *armed* here and fired later — after
+    // the interface has brought up USB and handed the dumper the stick — so
+    // the dump exercises the USB path too, not only serial. The
+    // no-framebuffer console path, which brings up no USB, fires it
+    // immediately before it starts. GRUB: press `e` on the entry and append
+    // it to the `multiboot2` line. QEMU: `-append`.
     {
         // SAFETY: the magic says which structure `multiboot_info` is.
         let line = unsafe {
@@ -146,11 +159,13 @@ pub unsafe extern "C" fn kmain(magic: usize, multiboot_info: usize) -> ! {
         };
         if let Some(line) = line {
             println!("command line: {line}");
+            nanochrono_baremetal::boot::record_command_line(line);
             if let Some(test) = nanochrono_baremetal::crashdump::CrashTest::from_command_line(line) {
                 nanochrono_baremetal::crashdump::arm_crashtest(test);
             }
             // `plugin=<name>` loads and runs <NAME>.ncplu from the boot
             // medium's FAT partition once the interface is up.
+            #[cfg(target_arch = "x86_64")]
             if let Some(name) = line
                 .split_ascii_whitespace()
                 .find_map(|w| w.strip_prefix("plugin="))
@@ -158,6 +173,20 @@ pub unsafe extern "C" fn kmain(magic: usize, multiboot_info: usize) -> ! {
                 nanochrono_baremetal::ncplu::arm_plugin(name);
             }
         }
+    }
+
+    // The modules the loader placed in memory: packages, libraries, drivers,
+    // an initrd — filed under their paths for the session (`boot`, `vfs`).
+    // SAFETY: the magic says which structure `multiboot_info` is.
+    unsafe {
+        multiboot::modules(
+            multiboot_info,
+            magic == MULTIBOOT2_BOOTLOADER_MAGIC,
+            nanochrono_baremetal::boot::record_module,
+        )
+    };
+    for m in nanochrono_baremetal::boot::modules() {
+        println!("module: {} ({} bytes at {:#x})", m.name, m.end - m.start, m.start);
     }
 
     match fb {
@@ -170,7 +199,7 @@ pub unsafe extern "C" fn kmain(magic: usize, multiboot_info: usize) -> ! {
             // SAFETY: at CPL 0, which the selftest's PMU programming needs.
             unsafe { selftest::run() };
             // SAFETY: at CPL 0, with a framebuffer the loader described.
-            unsafe { gui::run(fb, memory) }
+            unsafe { nanochrono_baremetal::session::start(Some(fb), memory) }
         }
         None => {
             // No linear framebuffer. On a BIOS machine the loader left a VGA
@@ -194,13 +223,13 @@ pub unsafe extern "C" fn kmain(magic: usize, multiboot_info: usize) -> ! {
             println!("Boot with gfxpayload=keep for the interface.");
             // The console brings up no USB, so an armed crashtest fires here,
             // with only the serial dump available.
-            #[cfg(target_arch = "x86_64")]
             // SAFETY: CPL 0, the IDT is installed; faulting is the point.
             unsafe {
                 nanochrono_baremetal::crashdump::fire_pending_crashtest()
             };
-            // SAFETY: at CPL 0; the serial console needs no framebuffer.
-            unsafe { nanochrono_baremetal::console::run() }
+            // SAFETY: at CPL 0; the serial console (or the CLI, over serial
+            // and the text screen) needs no framebuffer.
+            unsafe { nanochrono_baremetal::session::start(None, memory) }
         }
     }
 }
@@ -315,6 +344,54 @@ _start:
 42: msr cpacr_el1, x0
     isb
 
+    // The vector lengths. Enabling SVE and SME above only stops them
+    // trapping; how wide they run is ZCR_ELx.LEN and SMCR_ELx.LEN, which
+    // reset to UNKNOWN values, and each level's field caps every level below
+    // it. Left alone, SVE and streaming SVE run at whatever width reset left
+    // — the 128-bit floor, or anything up to the hardware's maximum — and the
+    // probes measure that instead of the core. Each reachable level's LEN is
+    // set to all ones, which reads as "the longest this core supports" (an
+    // unimplemented length rounds down to one that is). Written after the
+    // trap controls, which also gate these registers, at this level and EL1:
+    //   ZCR_EL1  S3_0_C1_C2_0   ZCR_EL2  S3_4_C1_C2_0   ZCR_EL3  S3_6_C1_C2_0
+    //   SMCR_EL1 S3_0_C1_C2_6   SMCR_EL2 S3_4_C1_C2_6   SMCR_EL3 S3_6_C1_C2_6
+    // (generic names: the assembler needs no +sve/+sme to write them). SMCR
+    // also holds FA64 (bit 31: the full A64 instruction set in streaming
+    // mode) and EZT0 (bit 30: SME2's ZT0 register), set where
+    // ID_AA64SMFR0_EL1.FA64 and ID_AA64PFR1_EL1.SME >= 2 say they exist; set
+    // where they do not, they would be writes to RES0 bits.
+    mrs x0, CurrentEL
+    lsr x0, x0, #2
+    cbz x9, 60f
+    mov x1, #0xF
+    cmp x0, #3
+    b.ne 61f
+    msr S3_6_C1_C2_0, x1
+    b 62f
+61: cmp x0, #2
+    b.ne 62f
+    msr S3_4_C1_C2_0, x1
+62: msr S3_0_C1_C2_0, x1
+    isb
+60: cbz x10, 65f
+    mov x1, #0xF
+    mrs x2, S3_0_C0_C4_5
+    tbz x2, #63, 63f
+    orr x1, x1, #(1 << 31)
+63: cmp x10, #2
+    b.lo 64f
+    orr x1, x1, #(1 << 30)
+64: cmp x0, #3
+    b.ne 66f
+    msr S3_6_C1_C2_6, x1
+    b 67f
+66: cmp x0, #2
+    b.ne 67f
+    msr S3_4_C1_C2_6, x1
+67: msr S3_0_C1_C2_6, x1
+    isb
+65:
+
     // The loader's stack, if any, is not ours. Point sp at the reserved
     // region below. `__boot_stack_top` is 16-byte aligned, which AAPCS64
     // requires of sp at every public interface.
@@ -350,7 +427,7 @@ _start:
 .section .bss
 .balign 16
 __boot_stack_bottom:
-    .skip 65536
+    .skip 262144
 __boot_stack_top:
 "#
 );
@@ -370,6 +447,8 @@ pub unsafe extern "C" fn kmain() -> ! {
     if let Err(why) = unsafe { arch::arm::enable_mmu() } {
         println!("warning: MMU left off ({why}); memory is Device, loads are uncached");
     }
+    // SAFETY: EL1+, once.
+    unsafe { nanochrono_baremetal::cpu_control::configure() };
     // SAFETY: at EL1+, which the PMU programming requires.
     unsafe { selftest::run() };
 
@@ -391,6 +470,22 @@ pub unsafe extern "C" fn kmain() -> ! {
 /// Supervisor mode, with RAM and the devices the tree names mapped.
 #[cfg(any(target_arch = "aarch64", target_arch = "arm", target_arch = "riscv64", target_arch = "riscv32"))]
 unsafe fn devicetree_interface(tree: Option<nanochrono_baremetal::fdt::Fdt<'static>>) -> ! {
+    // The command line and the initrd, as the tree's /chosen carries them
+    // (QEMU's -append and -initrd, or a loader's).
+    if let Some(t) = tree.as_ref() {
+        if let Some(args) = t.bootargs() {
+            println!("command line: {args}");
+            nanochrono_baremetal::boot::record_command_line(args);
+        }
+        if let Some((start, end)) = t.initrd() {
+            println!("initrd: {} bytes at {start:#x}", end - start);
+            nanochrono_baremetal::boot::record_module(nanochrono_baremetal::multiboot::Module {
+                start,
+                end,
+                name: "initrd",
+            });
+        }
+    }
     // SAFETY: devices come from the tree; forwarded from the contract.
     let fb = tree.as_ref().and_then(|t| unsafe {
         nanochrono_baremetal::ramfb::simple_framebuffer(t).or_else(|| nanochrono_baremetal::ramfb::ramfb(t))
@@ -401,37 +496,59 @@ unsafe fn devicetree_interface(tree: Option<nanochrono_baremetal::fdt::Fdt<'stat
             // SAFETY: once, before any drawing.
             unsafe { fb.attach_back_buffer() };
             // SAFETY: forwarded; a framebuffer the tree described.
-            unsafe { nanochrono_baremetal::gui::run(&fb, nanochrono_baremetal::multiboot::Memory::default()) }
+            unsafe { nanochrono_baremetal::session::start(Some(&fb), nanochrono_baremetal::multiboot::Memory::default()) }
         }
         None => {
             println!(
                 "no framebuffer (devicetree {}; add -device ramfb under QEMU)",
                 if tree.is_some() { "found" } else { "not found" }
             );
-            // SAFETY: forwarded; the console owns the machine from here on.
-            unsafe { nanochrono_baremetal::console::run() }
+            // SAFETY: forwarded; the console (or the CLI) owns the machine.
+            unsafe { nanochrono_baremetal::session::start(None, nanochrono_baremetal::multiboot::Memory::default()) }
         }
     }
 }
 
+/// What skiboot puts in r6: it enters a kernel ePAPR style.
+#[cfg(target_arch = "powerpc64")]
+const EPAPR_MAGIC: u64 = 0x6550_4150;
+
 /// OpenPOWER entry point, called from the stub in `arch::ppc` with the
-/// device tree, OPAL base and OPAL entry skiboot handed over.
+/// device tree, OPAL base and OPAL entry the loader handed over (r3, r8,
+/// r9), and r6 — [`EPAPR_MAGIC`] when that loader is skiboot rather than a
+/// kexec from petitboot.
 ///
 /// # Safety
 /// Called once, by the boot stub, in hypervisor real mode with a valid stack,
 /// TOC and `.bss`, and `MSR[FP,VEC,VSX]` set.
 #[cfg(target_arch = "powerpc64")]
 #[no_mangle]
-pub unsafe extern "C" fn kmain(fdt: usize, _opal_base: u64, _opal_entry: u64) -> ! {
-    // SAFETY: OPAL's entry point was recorded by the stub; nothing else is
-    // driving the console.
+pub unsafe extern "C" fn kmain(fdt: usize, opal_base: u64, opal_entry: u64, r6: u64) -> ! {
+    // SAFETY: r3 holds the flattened tree, from skiboot or from a kexec;
+    // translation is off, so the address is directly readable.
+    let tree = unsafe { nanochrono_baremetal::fdt::Fdt::from_ptr(fdt as *const u8) };
+    // OPAL as the device tree names it — skiboot publishes it there as well
+    // as in r8/r9, and a kexec's purgatory is not bound to pass it on.
+    let published = tree.as_ref().and_then(opal_from_tree);
+    if let Some((base, entry)) = published {
+        // SAFETY: before the first OPAL call.
+        unsafe { arch::ppc::set_opal(base, entry) };
+    }
+    // SAFETY: OPAL's entry point is recorded; nothing else is driving the
+    // console.
     unsafe { Serial::init() };
-    println!("booted by: skiboot (OPAL)");
+    let loader = if r6 == EPAPR_MAGIC { "skiboot" } else { "kexec (petitboot)" };
+    let source = match published {
+        Some(p) if p == (opal_base, opal_entry) => "the device tree and r8/r9",
+        Some(_) => "the device tree",
+        None => "r8/r9",
+    };
+    println!("booted by: {loader}, OPAL from {source}");
+    // SAFETY: hypervisor state, once.
+    unsafe { nanochrono_baremetal::cpu_control::configure() };
     nanochrono_baremetal::irq_priority::open_unset();
 
-    // SAFETY: skiboot passes the flattened tree in r3; translation is off, so
-    // the address is directly readable.
-    match unsafe { nanochrono_baremetal::fdt::Fdt::from_ptr(fdt as *const u8) } {
+    match tree {
         Some(tree) => {
             if let Some(hz) = tree.timebase_frequency() {
                 nanochrono_core::arch::powerpc::set_timebase_hz(hz);
@@ -444,6 +561,18 @@ pub unsafe extern "C" fn kmain(fdt: usize, _opal_base: u64, _opal_entry: u64) ->
     unsafe { selftest::run() };
     // SAFETY: as above; the console owns the machine from here on.
     unsafe { nanochrono_baremetal::console::run() }
+}
+
+/// OPAL's base and entry from the `ibm,opal` node: `opal-base-address` and
+/// `opal-entry-address`, 64-bit big-endian.
+#[cfg(target_arch = "powerpc64")]
+fn opal_from_tree(tree: &nanochrono_baremetal::fdt::Fdt<'_>) -> Option<(u64, u64)> {
+    let be64 = |v: &[u8]| Some(u64::from_be_bytes(v.get(..8)?.try_into().ok()?));
+    [&b"ibm,opal-v3"[..], b"ibm,opal-v2"].iter().find_map(|compatible| {
+        let base = tree.compatible_property(compatible, b"opal-base-address")?;
+        let entry = tree.compatible_property(compatible, b"opal-entry-address")?;
+        Some((be64(base)?, be64(entry)?))
+    })
 }
 
 /// Where the e500 UART's 1 MiB window is mapped. Above the RAM the loader
@@ -503,6 +632,8 @@ pub unsafe extern "C" fn kmain(fdt: usize, of_entry: usize) -> ! {
 
     // SAFETY: supervisor state; the UART, if any, was just mapped.
     unsafe { Serial::init() };
+    // SAFETY: supervisor state, once.
+    unsafe { nanochrono_baremetal::cpu_control::configure() };
     match (tree.is_some(), uart) {
         (true, Some(phys)) => println!("booted by: ePAPR loader, uart at {phys:#x}"),
         (true, None) => println!("booted by: ePAPR loader, no ns16550 in the device tree"),
@@ -518,27 +649,72 @@ pub unsafe extern "C" fn kmain(fdt: usize, of_entry: usize) -> ! {
 // 32-bit ARM entry (ARMv7-A, QEMU `virt` with a Cortex-A7/A15).
 //
 // QEMU enters an ELF `-kernel` in SVC mode with the MMU and caches off and
-// every core running. Before Rust: park the secondaries, give PL1 and PL0
-// access to the VFP/NEON coprocessors (CPACR cp10/cp11) and switch the unit
-// on (FPEXC.EN) — the hard-float ABI uses it from the first function — then
-// a stack and a zeroed `.bss`.
+// every core running — or in HYP mode, on a machine with the virtualization
+// extensions switched on (`-M virt,virtualization=on`), which is also how a
+// hypervisor-capable bootloader hands over. Before Rust: park the
+// secondaries, then make VFP and Advanced SIMD (NEON) usable at every level
+// that could trap them — the hard-float ABI uses them from the first
+// function:
+//
+// * HYP: HCPTR.TCP10/TCP11 trap cp10/cp11 (VFP and NEON) to HYP, TASE traps
+//   Advanced SIMD alone and TTA trace access; all four cleared. The kernel
+//   then drops to SVC, where it runs: its exception vectors and banked
+//   stacks are PL1's.
+// * CPACR (PL1): cp10/cp11 full access, and ASEDIS (bit 31) and D32DIS
+//   (bit 30) cleared — set, they disable Advanced SIMD or registers
+//   D16-D31 with VFP still on, and NEON code then dies on its first
+//   instruction. NSACR, the secure side's say over the same coprocessors,
+//   is not writable from the non-secure state the kernel is entered in; QEMU
+//   and firmware set it for the non-secure world.
+// * FPEXC.EN switches the unit on.
+//
+// Then the exception vectors (`arch::arm32`): without them an undefined
+// instruction — a VFP or NEON one with the unit off, say — or an abort jumps
+// through whatever VBAR reset left, and the core dies silently. Last, a stack
+// and a zeroed `.bss`.
 #[cfg(target_arch = "arm")]
 core::arch::global_asm!(
     r#"
 .section .text.boot, "ax"
 .arm
 .fpu neon
+.arch_extension virt
+.arch_extension sec
 .global _start
 _start:
     mrc p15, 0, r0, c0, c0, 5       @ MPIDR
     ands r0, r0, #3
     bne 9f
-    mrc p15, 0, r0, c1, c0, 2       @ CPACR
+    mrs r0, cpsr
+    and r0, r0, #0x1f
+    cmp r0, #0x1a                   @ HYP mode?
+    bne 2f
+    mrc p15, 4, r0, c1, c1, 2       @ HCPTR
+    bic r0, r0, #(3 << 10)          @ TCP10, TCP11
+    bic r0, r0, #(1 << 15)          @ TASE
+    bic r0, r0, #(1 << 20)          @ TTA
+    mcr p15, 4, r0, c1, c1, 2
+    isb
+    mov r0, #0xd3                   @ SVC, IRQ and FIQ masked
+    orr r0, r0, #0x100              @ asynchronous aborts masked
+    msr spsr_hyp, r0
+    adr r0, 2f
+    msr elr_hyp, r0
+    eret
+2:  mrc p15, 0, r0, c1, c0, 2       @ CPACR
     orr r0, r0, #(0xf << 20)        @ cp10, cp11: full access
+    bic r0, r0, #(3 << 30)          @ ASEDIS, D32DIS
     mcr p15, 0, r0, c1, c0, 2
     isb
     mov r0, #0x40000000             @ FPEXC.EN
     vmsr fpexc, r0
+    ldr r0, =nanochrono_arm32_vectors
+    mcr p15, 0, r0, c12, c0, 0      @ VBAR
+    mrc p15, 0, r0, c1, c0, 0       @ SCTLR
+    bic r0, r0, #(1 << 13)          @ V: vectors at VBAR, not 0xffff0000
+    bic r0, r0, #(1 << 30)          @ TE: exceptions taken in ARM state, as the table is
+    mcr p15, 0, r0, c1, c0, 0
+    isb
     ldr sp, =__arm_stack_top
     ldr r0, =__bss_start
     ldr r1, =__bss_end
@@ -553,7 +729,7 @@ _start:
 .section .bss
 .balign 16
 __arm_stack_bottom:
-    .skip 131072
+    .skip 262144
 __arm_stack_top:
 "#
 );
@@ -568,6 +744,14 @@ pub unsafe extern "C" fn kmain() -> ! {
     // SAFETY: PL1; nothing else drives the PL011.
     unsafe { Serial::init() };
     println!("booted by: -kernel (AArch32, SVC mode)");
+    // Caches on for the image, as on AArch64: the counterpart of x86's
+    // CR0.PG (see `arch::arm32::enable_mmu`).
+    // SAFETY: once, at PL1, MMU still off.
+    if let Err(why) = unsafe { arch::arm32::enable_mmu() } {
+        println!("warning: MMU left off ({why}); memory is strongly ordered, loads are uncached");
+    }
+    // SAFETY: PL1, once.
+    unsafe { nanochrono_baremetal::cpu_control::configure() };
     // As on AArch64: QEMU leaves the devicetree at the start of RAM for an
     // ELF linked clear of it (boot/arm32.ld).
     // SAFETY: MMU off, so every physical address is directly readable.
@@ -624,6 +808,14 @@ pub unsafe extern "C" fn kmain(hart: usize, fdt: usize) -> ! {
 
     // SAFETY: S-mode; nothing else drives the UART.
     unsafe { Serial::init() };
+    // Translation on, identity-mapped: the counterpart of x86's CR0.PG (see
+    // `arch::riscv::enable_paging`).
+    // SAFETY: once, in S-mode with satp Bare.
+    if let Err(why) = unsafe { arch::riscv::enable_paging() } {
+        println!("warning: paging left off ({why})");
+    }
+    // SAFETY: S-mode, once.
+    unsafe { nanochrono_baremetal::cpu_control::configure() };
     match (tree.is_some(), uart) {
         (true, Some(phys)) => println!("booted by: SBI, hart {hart}, uart at {phys:#x}"),
         (true, None) => println!("booted by: SBI, hart {hart}, console via SBI"),
@@ -657,6 +849,8 @@ unsafe fn kmain_open_firmware(of_entry: usize) -> ! {
     }
     // SAFETY: supervisor state.
     unsafe { Serial::init() };
+    // SAFETY: supervisor state, once.
+    unsafe { nanochrono_baremetal::cpu_control::configure() };
     nanochrono_baremetal::irq_priority::open_unset();
     println!(
         "booted by: Open Firmware, client interface at {of_entry:#x}{}",

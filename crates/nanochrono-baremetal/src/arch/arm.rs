@@ -22,6 +22,37 @@ pub fn current_el() -> u8 {
     ((v >> 2) & 0b11) as u8
 }
 
+/// The SVE vector length and SME streaming vector length in bytes, as this
+/// core now runs them — after the boot stub set every reachable `ZCR_ELx`
+/// and `SMCR_ELx` to ask for the longest. `None` where the feature is absent.
+///
+/// `RDVL x0, #1` and `RDSVL x0, #1` are written as their encodings so the
+/// assembler needs neither `+sve` nor `+sme`. RDVL is only legal outside
+/// streaming mode with SVE present (SME alone does not give it), RDSVL
+/// whenever SME is present.
+pub fn vector_lengths() -> (Option<u64>, Option<u64>) {
+    let f = nanochrono_core::cpu::features();
+    let vl = f.sve.then(|| {
+        let v: u64;
+        // SAFETY: SVE exists and the boot stub enabled it at every level; the
+        // instruction only reads the vector length into x0.
+        unsafe {
+            core::arch::asm!(".inst 0x04bf5020", out("x0") v, options(nomem, nostack, preserves_flags));
+        }
+        v
+    });
+    let svl = f.sme.then(|| {
+        let v: u64;
+        // SAFETY: SME exists and the boot stub enabled it; RDSVL reads the
+        // streaming vector length without entering streaming mode.
+        unsafe {
+            core::arch::asm!(".inst 0x04bf5820", out("x0") v, options(nomem, nostack, preserves_flags));
+        }
+        v
+    });
+    (vl, svl)
+}
+
 // ---------------------------------------------------------------------------
 // Exception vectors
 // ---------------------------------------------------------------------------

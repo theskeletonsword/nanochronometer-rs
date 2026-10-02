@@ -113,10 +113,50 @@ impl<const N: usize> Text<N> {
     }
 
     pub fn as_str(&self) -> &str {
-        // Everything written is ASCII by construction: the only entry points
-        // are `push` from this module's own formatters and `str` from string
-        // literals in the interface.
-        core::str::from_utf8(&self.buf[..self.len]).unwrap_or("?")
+        // Mostly ASCII by construction; where a multi-byte character was cut
+        // by the end of the buffer, the valid prefix is what is shown.
+        match core::str::from_utf8(&self.buf[..self.len]) {
+            Ok(s) => s,
+            Err(e) => core::str::from_utf8(&self.buf[..e.valid_up_to()]).unwrap_or(""),
+        }
+    }
+
+    /// Removes the last character, whole (a multi-byte one too).
+    pub fn pop(&mut self) -> Option<char> {
+        let c = self.as_str().chars().next_back()?;
+        self.len -= c.len_utf8();
+        Some(c)
+    }
+
+    /// Appends a character, whole or not at all.
+    pub fn char(&mut self, c: char) -> &mut Self {
+        let mut utf8 = [0u8; 4];
+        let s = c.encode_utf8(&mut utf8);
+        if self.has_room_for(s.len()) {
+            self.str(s);
+        }
+        self
+    }
+}
+
+impl<const N: usize> core::fmt::Write for Text<N> {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        self.str(s);
+        Ok(())
+    }
+}
+
+impl<const N: usize> Clone for Text<N> {
+    fn clone(&self) -> Text<N> {
+        Text { buf: self.buf, len: self.len }
+    }
+}
+
+impl<const N: usize> Copy for Text<N> {}
+
+impl<const N: usize> core::fmt::Debug for Text<N> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        core::fmt::Debug::fmt(self.as_str(), f)
     }
 }
 

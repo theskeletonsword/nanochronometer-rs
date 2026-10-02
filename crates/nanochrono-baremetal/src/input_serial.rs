@@ -30,6 +30,9 @@ pub struct Motion {
 pub struct Key {
     pub scancode: u8,
     pub pressed: bool,
+    /// As on x86: the key is one set 1 sends behind `0xE0` (here, the
+    /// arrows a terminal sends as escape sequences).
+    pub extended: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -40,7 +43,7 @@ pub enum Event {
 
 pub struct Input {
     /// The release still owed for the last press.
-    pending_release: Option<u8>,
+    pending_release: Option<(u8, bool)>,
     recent: [u8; 8],
     recent_len: usize,
 }
@@ -133,21 +136,25 @@ impl Input {
     /// # Safety
     /// Reads the UART.
     pub unsafe fn poll(&mut self) -> Option<Event> {
-        if let Some(code) = self.pending_release.take() {
-            return Some(Event::Key(Key { scancode: code, pressed: false }));
+        if let Some((code, extended)) = self.pending_release.take() {
+            return Some(Event::Key(Key { scancode: code, pressed: false, extended }));
         }
         let byte = serial::read_byte()?;
         self.remember(byte);
+        let mut extended = false;
         let code = if byte == 0x1B {
             // An arrow is ESC [ A..D, sent together; a lone ESC is Escape.
             match serial::read_byte() {
-                Some(b'[') => match serial::read_byte() {
-                    Some(b'A') => 0x48,
-                    Some(b'B') => 0x50,
-                    Some(b'C') => 0x4D,
-                    Some(b'D') => 0x4B,
-                    _ => return None,
-                },
+                Some(b'[') => {
+                    extended = true;
+                    match serial::read_byte() {
+                        Some(b'A') => 0x48,
+                        Some(b'B') => 0x50,
+                        Some(b'C') => 0x4D,
+                        Some(b'D') => 0x4B,
+                        _ => return None,
+                    }
+                }
                 Some(other) => {
                     // Escape followed by an ordinary key: deliver Escape now
                     // and let the next poll see nothing of `other`, which
@@ -161,7 +168,7 @@ impl Input {
         } else {
             scancode(byte)?
         };
-        self.pending_release = Some(code);
-        Some(Event::Key(Key { scancode: code, pressed: true }))
+        self.pending_release = Some((code, extended));
+        Some(Event::Key(Key { scancode: code, pressed: true, extended }))
     }
 }

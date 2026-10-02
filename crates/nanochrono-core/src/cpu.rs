@@ -144,8 +144,11 @@ fn detect_arm32() -> CpuFeatures {
     #[cfg(any(target_os = "linux", target_os = "android"))]
     // SAFETY: `getauxval` has no preconditions.
     let hwcap = unsafe { libc::getauxval(libc::AT_HWCAP) } as u64;
+    // With no operating system to ask, the hardware is asked directly:
+    // MVFR1's Advanced SIMD fields (the freestanding kernel's boot stub has
+    // the FP unit on, which reading it needs).
     #[cfg(not(any(target_os = "linux", target_os = "android")))]
-    let hwcap = 0u64;
+    let hwcap = if crate::arch::arm32::mvfr1_reports_neon() { crate::arch::arm32::HWCAP_NEON } else { 0 };
     CpuFeatures {
         neon: hwcap & crate::arch::arm32::HWCAP_NEON != 0,
         // The generic timer is fixed-rate; the fallback is the monotonic

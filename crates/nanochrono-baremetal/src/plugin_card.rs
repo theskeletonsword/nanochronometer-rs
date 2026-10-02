@@ -265,6 +265,9 @@ pub fn refused(fb: &Framebuffer, input: &mut Input, name: &str, error: LoadError
         LoadError::Corrupt => "Its digest does not match: damaged, or edited after packing.",
         LoadError::Privileged => "Privileged services need a creator or trusted-root signature.",
         LoadError::UnresolvedImport => "It needs a kernel symbol this kernel does not export.",
+        LoadError::WrongArch => "Install the package for this machine's architecture.",
+        LoadError::NotRunnable => "Drivers load at boot; libraries live in /usr/lib.",
+        LoadError::BadPackage(_) => "It breaks the .ncplu package format. Nothing from it was loaded.",
     };
     draw::text(fb, &BODY, x + 28, y + 120 + BODY.line_height as u32 + 6, note, p.muted);
     fb.present(0, 0, fb.width, fb.height);

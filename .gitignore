@@ -56,6 +56,25 @@ mldsa.seed
 p521.scalar
 *.ncplu-key
 /keys/
+# The same for every key the ecosystem uses (docs/ECOSYSTEM.md, section 3):
+# the four creator roots (creator and verification, ring 3 and ring 0) and
+# owner (MOK) keys of any algorithm — Ed25519, RSA, ECDSA, ML-DSA, hybrids.
+# Private halves never enter the tree; the build reads public keys from
+# outside it. Plus the password pepper and a state-partition image, which
+# hold secrets of the machine they came from.
+*.seed
+*.scalar
+*.priv
+*.secret
+*-private.*
+*_private.*
+*.mok
+/keys*/
+**/ncplu-keys/
+**/mok-keys/
+pepper.bin
+*.pepper
+NCSTATE.BIN
 
 # Per-machine notes for Claude (paths on the maintainer's PC)
 /CLAUDE.local.md

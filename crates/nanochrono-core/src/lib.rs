@@ -69,6 +69,7 @@ pub mod aml;
 pub mod arch;
 pub mod backend;
 pub mod cpu;
+pub mod cpu_control;
 /// Checking the primary counter against an independent clock.
 ///
 /// `no_std` and pure: the caller reads both clocks and passes the pair.
@@ -88,11 +89,18 @@ pub mod kernels;
 /// `no_std` and pure: the freestanding kernel parses untrusted plugins with
 /// it, and the hosted test build fuzzes it — the same code on the same bytes.
 pub mod ncplu;
+/// The `.ncplu` package format: one download for every architecture.
+///
+/// `no_std` and pure, like [`ncplu`]: the manifest, the entry table and the
+/// per-architecture selection, fuzzed on the host with the same code the
+/// freestanding kernel runs.
+pub mod ncpkg;
 pub mod pmu_leaf;
 /// The typed code a restart or power-off waits for (BadUSB defence).
 ///
 /// `no_std` and pure, like [`reprobe`]: the caller supplies time and entropy.
 pub mod power_confirm;
+pub mod qoi;
 pub mod redundancy;
 pub mod reprobe;
 /// NC_RNG: the entropy pool — timing jitter, `RDSEED`/`RDRAND`, event

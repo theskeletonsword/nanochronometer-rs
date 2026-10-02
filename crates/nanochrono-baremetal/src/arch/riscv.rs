@@ -125,7 +125,7 @@ nc_rv_probe_site_instret:
 .section .bss.nc_stack, "aw", @nobits
 .balign 16
 nc_stack_bottom:
-    .skip 65536
+    .skip 262144
 nc_stack_top:
 .balign 16
 nc_exc_stack_bottom:
@@ -301,4 +301,101 @@ pub fn sstatus() -> usize {
 /// kernel requires both before a vector instruction is dispatched.
 pub fn vector_state_enabled() -> bool {
     sstatus() & (0b11 << 9) != 0
+}
+
+// ---------------------------------------------------------------------------
+// Paging: satp, the counterpart of x86's CR0.PG
+// ---------------------------------------------------------------------------
+//
+// OpenSBI enters with `satp` = Bare: no translation, no protection. This
+// turns translation on with an identity map, so every physical address the
+// drivers use stays what it was — the device tree's, the UART's, fw_cfg's —
+// and the kernel gains the machinery memory protection needs: guard pages,
+// read-only text, U-mode pages for apps. RV64: Sv39, one root table of 1 GiB
+// gigapages over the 256 GiB the canonical lower half covers. RV32: Sv32,
+// one root table of 4 MiB megapages over all 4 GiB — the same shape as the
+// i386 kernel's PSE map. Global (G), accessed and dirty preset: a hart that
+// raises a fault to have A and D set (Svade) never needs to.
+//
+// Cacheability is not the page tables' business here: without Svpbmt it is
+// the platform's physical memory attributes, which treat RAM as RAM and MMIO
+// as I/O whatever the PTE says.
+
+#[repr(C, align(4096))]
+struct RootTable([usize; 4096 / core::mem::size_of::<usize>()]);
+
+static mut ROOT: RootTable = RootTable([0; 4096 / core::mem::size_of::<usize>()]);
+
+const PTE_V: usize = 1 << 0;
+const PTE_R: usize = 1 << 1;
+const PTE_W: usize = 1 << 2;
+const PTE_X: usize = 1 << 3;
+const PTE_G: usize = 1 << 5;
+const PTE_A: usize = 1 << 6;
+const PTE_D: usize = 1 << 7;
+
+static PAGING: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Whether [`enable_paging`] turned translation on.
+pub fn paging_enabled() -> bool {
+    PAGING.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// The translation mode in force, for the report.
+pub fn paging_mode() -> &'static str {
+    if !paging_enabled() {
+        "bare"
+    } else if cfg!(target_arch = "riscv64") {
+        "sv39"
+    } else {
+        "sv32"
+    }
+}
+
+/// Builds the identity map and switches `satp` to it.
+///
+/// # Safety
+/// Once, in S-mode with `satp` Bare, before anything depends on the absence
+/// of translation (nothing can: the map is the identity).
+pub unsafe fn enable_paging() -> Result<(), &'static str> {
+    let flags = PTE_V | PTE_R | PTE_W | PTE_X | PTE_G | PTE_A | PTE_D;
+    // SAFETY: once, before translation is on; nothing else references the
+    // table.
+    let root = unsafe { &mut *core::ptr::addr_of_mut!(ROOT) };
+    #[cfg(target_arch = "riscv64")]
+    let satp = {
+        // Entry i maps the gigapage at i GiB: PPN = i << 18, PTE = PPN << 10.
+        for (i, entry) in root.0.iter_mut().enumerate() {
+            *entry = if i < 256 { (i << 28) | flags } else { 0 };
+        }
+        (8usize << 60) | (root.0.as_ptr() as usize >> 12)
+    };
+    #[cfg(target_arch = "riscv32")]
+    let satp = {
+        // Entry i maps the megapage at i * 4 MiB: PPN = i << 10.
+        for (i, entry) in root.0.iter_mut().enumerate() {
+            *entry = (i << 20) | flags;
+        }
+        (1usize << 31) | (root.0.as_ptr() as usize >> 12)
+    };
+    let read_back: usize;
+    // SAFETY: the table is complete and maps every address the kernel uses
+    // to itself; the fences order the table stores before the walk and drop
+    // any stale translation.
+    unsafe {
+        asm!(
+            "sfence.vma",
+            "csrw satp, {s}",
+            "sfence.vma",
+            "csrr {r}, satp",
+            s = in(reg) satp, r = out(reg) read_back,
+            options(nostack),
+        );
+    }
+    // satp is WARL: a hart without this mode keeps Bare and reads back 0.
+    if read_back != satp {
+        return Err("the hart does not implement this translation mode");
+    }
+    PAGING.store(true, core::sync::atomic::Ordering::Relaxed);
+    Ok(())
 }

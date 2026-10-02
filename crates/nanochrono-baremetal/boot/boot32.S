@@ -181,11 +181,19 @@ check_long_mode:
  * the SIMD probes it shares with the hosted build are the whole point of
  * measuring here — so the enable has to happen, and it has to happen before
  * any Rust runs. Executing an SSE instruction with CR0.EM set or CR4.OSFXSR
- * clear is #UD, not a slow path. */
+ * clear is #UD, not a slow path.
+ *
+ * Every floating-point and SIMD fault must then reach the IDT, and from it
+ * the stop screen: CR0.NE makes an x87 error #MF (vector 16) — clear, it is
+ * reported the PC/AT way, FERR# to IRQ 13, and with interrupts masked for
+ * the whole run the core just stops at the next x87 instruction, with no
+ * fault and nothing on the screen; CR4.OSXMMEXCPT makes an unmasked SSE/AVX
+ * exception #XM (vector 19) rather than #UD; and CR0.TS is cleared, or the
+ * first SSE instruction would be #NM. */
 enable_sse:
     mov %cr0, %eax
-    and $~(1 << 2), %eax            /* EM: no coprocessor emulation */
-    or  $(1 << 1), %eax             /* MP: monitor coprocessor */
+    and $~((1 << 2) | (1 << 3)), %eax   /* EM: no emulation; TS: no task-switch trap */
+    or  $((1 << 1) | (1 << 5)), %eax    /* MP: monitor coprocessor; NE: native #MF */
     mov %eax, %cr0
 
     mov %cr4, %eax
@@ -199,13 +207,18 @@ enable_sse:
      * exactly the trap the hosted build's XGETBV check exists to avoid, and
      * here it has to be made *true* rather than merely detected.
      *
-     * OSXSAVE is set whenever XSAVE exists, not only when AVX does: it is
-     * what makes XGETBV legal, and the feature detection reads XCR0 to decide
-     * what the OS has enabled. Leaving it clear would make that read return
-     * zero and every wide register file look disabled. */
+     * OSXSAVE is set only when XSAVE *and* AVX exist (the CPUID half of the
+     * control dispatcher, nanochrono_core::cpu_control): XSAVE without AVX
+     * has no state beyond x87 and SSE to manage, and turning the machinery on
+     * for nothing costs power and a larger state footprint. With it clear,
+     * XGETBV is #UD, so the feature detection reads XCR0 only after
+     * CPUID.1:ECX.OSXSAVE says the bit is set (xcr0_safe) and reports AVX
+     * and AVX-512 off, which on such a part they are. */
     mov $1, %eax
     cpuid
     test $(1 << 26), %ecx           /* CPUID.1:ECX[26], XSAVE */
+    jz 2f
+    test $(1 << 28), %ecx           /* CPUID.1:ECX[28], AVX */
     jz 2f
 
     mov %cr4, %eax
@@ -232,6 +245,12 @@ enable_sse:
     or  %ebx, %eax
     xsetbv
 2:
+    /* A defined x87 and SSE state, whatever the loader left: every exception
+     * masked, round to nearest (FCW 0x037F, MXCSR 0x1F80). */
+    fninit
+    push $0x1F80
+    ldmxcsr (%esp)
+    add $4, %esp
     ret
 
 /* Identity-maps the first 512 GiB with 1 GiB pages.
@@ -298,14 +317,21 @@ build_page_tables:
  * path otherwise leaves unused), and the one 2 MiB page containing the guard
  * as 4 KiB pages with the guard's entry not present. The linker script
  * asserts the image lies inside that first gigabyte. The first gigabyte stays
- * cached, exactly as before. */
+ * cached, exactly as before.
+ *
+ * Its mappings are global (G, bit 8): once the control dispatcher sets
+ * CR4.PGE (src/cpu_control.rs), they survive every CR3 load — the VM
+ * manager's VM exits load the host's — instead of being refetched. Anything
+ * that edits these entries afterwards (the plugin guards, ring 3's user
+ * pages) flushes with arch::x86::flush_tlb_all, which reaches global
+ * entries too; a CR3 reload alone would not. */
 install_stack_guard:
     cmpb $0, have_gib_pages
     je 1f
     xor %ecx, %ecx
 2:  mov %ecx, %eax
     shl $21, %eax
-    or $0b10000011, %eax            /* present + writable + 2 MiB */
+    or $0b110000011, %eax           /* present + writable + 2 MiB + global */
     mov %eax, pd(, %ecx, 8)
     movl $0, pd + 4(, %ecx, 8)
     inc %ecx
@@ -324,7 +350,7 @@ install_stack_guard:
 3:  mov %ecx, %eax
     shl $12, %eax
     add %edx, %eax
-    or $0b11, %eax                  /* present + writable, 4 KiB */
+    or $0x103, %eax                 /* present + writable + global, 4 KiB */
     mov %eax, guard_pt(, %ecx, 8)
     movl $0, guard_pt + 4(, %ecx, 8)
     inc %ecx
@@ -374,9 +400,11 @@ build_2m_tables:
     mov %ecx, %eax
     shl $21, %eax                   /* low half of the physical address */
     or $0b10000011, %eax            /* present + writable + huge */
-    cmp $512, %ecx                  /* the first gigabyte stays cached */
-    jb 3f
-    or $0b10000, %eax               /* PCD */
+    cmp $512, %ecx                  /* the first gigabyte: cached and global */
+    jae 4f
+    or $0x100, %eax                 /* G */
+    jmp 3f
+4:  or $0b10000, %eax               /* PCD */
 3:
     mov %eax, pd(, %ecx, 8)
 
@@ -618,7 +646,10 @@ setup_exceptions:
     ret
 
 /* One stub per vector, 16 bytes apart so the loop above can compute each
- * address. The CPU pushes an error code for 8, 10-14, 17, 21, 29 and 30;
+ * address — every architectural exception, the floating-point and SIMD ones
+ * included: #NM (7), #MF (16, x87), #AC (17), #XM (19, SSE/AVX/AVX-512), and
+ * the newer #VE, #CP, #HV, #VC and #SX. The CPU pushes an error code for 8,
+ * 10-14, 17, 21, 29 and 30;
  * the others push a zero so every frame has the same shape:
  *   [vector, error, RIP, CS, RFLAGS, RSP, SS]
  * `isr_common` then pushes the fifteen general registers below it, so the
@@ -637,6 +668,10 @@ isr_stubs:
 
 isr_common:
     cld
+    /* CR0.TS clear before any Rust, which uses SSE freely: for an #NM (an SSE
+     * instruction with TS set) the handler would otherwise fault on its own
+     * first one, and end in the nested-fault halt instead of the report. */
+    clts
     /* In reverse, so that in memory they read RAX first: the layout of
      * `crashdump::TrapFrame`. */
     push %r15
@@ -759,9 +794,11 @@ nc_stack_guard:
 .global nc_stack_bottom
 nc_stack_bottom:
 stack_bottom:
-    /* 64 KiB. The kernel makes no deep calls and allocates nothing, but the
-     * measurement buffers are stack-resident. */
-    .skip 65536
+    /* 256 KiB. The kernel allocates nothing, so what a frame needs is on
+     * the stack: the measurement buffers, and the desktop's and the shell's
+     * fixed-size scratch (a directory listing, a file preview) — which an
+     * -O0 build lays out with no reuse at all. .bss, so free in the image. */
+    .skip 262144
 .global nc_stack_top
 nc_stack_top:
 stack_top:

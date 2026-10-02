@@ -129,7 +129,7 @@ const DEV_GET_DEVICE_ID: u8 = 0xF2;
 ///
 /// Indexed from usage 0x04, the first key usage.
 #[rustfmt::skip]
-const HID_TO_SET1: [u8; 0x50] = [
+const HID_TO_SET1: [u8; 0x62] = [
     // 0x04..0x1D: a b c d e f g h i j k l m n o p q r s t u v w x y z
     0x1E, 0x30, 0x2E, 0x20, 0x12, 0x21, 0x22, 0x23,
     0x17, 0x24, 0x25, 0x26, 0x32, 0x31, 0x18, 0x19,
@@ -151,7 +151,46 @@ const HID_TO_SET1: [u8; 0x50] = [
     0x4D, 0x4B, 0x50, 0x48,
     // 0x53: num lock
     0x45,
+    // 0x54..0x63: keypad / * - + enter 1 2 3 4 5 6 7 8 9 0 .
+    0x35, 0x37, 0x4A, 0x4E, 0x1C, 0x4F, 0x50, 0x51,
+    0x4B, 0x4C, 0x4D, 0x47, 0x48, 0x49, 0x52, 0x53,
+    // 0x64: the ISO key between left Shift and Z (`< >` on a Spanish or
+    // German keyboard, `\ |` on a UK one); 0x65: application (menu)
+    0x56, 0x5D,
 ];
+
+/// Whether set 1 sends the key a HID usage maps to behind `0xE0`: the
+/// navigation cluster and arrows (0x49..=0x52 bar Num Lock), keypad `/` and
+/// Enter, the application key. Print Screen and Pause map to nothing.
+fn hid_extended(usage: u8) -> bool {
+    matches!(usage, 0x49..=0x52 | 0x54 | 0x58 | 0x65)
+}
+
+/// The modifier byte of a boot-protocol report, bit by bit, as set 1 codes:
+/// left Ctrl, Shift, Alt, GUI, then right Ctrl, Shift, Alt (AltGr), GUI —
+/// with whether each comes behind `0xE0`.
+const HID_MODIFIERS: [(u8, bool); 8] = [
+    (0x1D, false),
+    (0x2A, false),
+    (0x38, false),
+    (0x5B, true),
+    (0x1D, true),
+    (0x36, false),
+    (0x38, true),
+    (0x5C, true),
+];
+
+/// The first modifier that changed between two reports' modifier bytes, as
+/// a key event.
+fn modifier_changed(previous: u8, current: u8) -> Option<Event> {
+    let changed = previous ^ current;
+    if changed == 0 {
+        return None;
+    }
+    let bit = changed.trailing_zeros() as usize;
+    let (scancode, extended) = HID_MODIFIERS[bit];
+    Some(Event::Key(Key { scancode, pressed: current & (1 << bit) != 0, extended }))
+}
 
 /// The first HID usage the table covers.
 const HID_FIRST_USAGE: u8 = 0x04;
@@ -244,6 +283,12 @@ pub struct Motion {
 pub struct Key {
     pub scancode: u8,
     pub pressed: bool,
+    /// The key is one set 1 sends behind an `0xE0` prefix — the navigation
+    /// cluster, the arrows, Right Ctrl, Right Alt (AltGr), keypad Enter and
+    /// `/`, the GUI keys — reported under its base code. What tells AltGr
+    /// from Alt, and Home from keypad 7; the interface's own bindings ignore
+    /// it, a keyboard layout cannot.
+    pub extended: bool,
 }
 
 /// What arrived from the controller.
@@ -299,8 +344,9 @@ pub struct Input {
     recent: [u8; RECENT_BYTES],
     recent_len: usize,
     /// The previous I2C-HID keyboard report, for turning held-key state into
-    /// press and release events.
+    /// press and release events, and the latest one read (see `UsbInput`).
     i2c_previous: [u8; 8],
+    i2c_latest: [u8; 8],
     /// Set once a `0xF0` arrives: this controller delivers set 2.
     set2: bool,
     /// The next byte is a set 2 release.
@@ -371,8 +417,11 @@ pub struct UsbInput {
     keyboard: Option<usize>,
     pointer: Option<usize>,
     /// Previous keyboard report, to turn a held-key state into press and
-    /// release events.
+    /// release events, and the latest one read: they differ while a report
+    /// that changed several keys at once is still being delivered, one event
+    /// per poll.
     previous: [u8; 8],
+    latest: [u8; 8],
     /// Which device to service next, so one that reports constantly cannot
     /// starve the other.
     next: usize,
@@ -403,6 +452,7 @@ impl Input {
             recent: [0; RECENT_BYTES],
             recent_len: 0,
             i2c_previous: [0; 8],
+            i2c_latest: [0; 8],
             set2: false,
             set2_break: false,
             ps2: false,
@@ -839,7 +889,7 @@ impl Input {
         if extended && matches!(scancode, SCAN_LEFT_SHIFT | SCAN_RIGHT_SHIFT) {
             return None;
         }
-        Some(Event::Key(Key { scancode, pressed }))
+        Some(Event::Key(Key { scancode, pressed, extended }))
     }
 
     /// Which scan code set the keyboard turned out to be using.
@@ -920,6 +970,11 @@ impl Input {
     /// Drives the I2C controller; requires ring 0.
     unsafe fn poll_i2c(&mut self) -> Option<Event> {
         let _crumb = Driver::I2cHid.enter();
+        // The rest of a keyboard report that changed several keys at once,
+        // before the bus is asked for another.
+        if let Some(event) = next_key_change(&mut self.i2c_previous, &self.i2c_latest) {
+            return Some(event);
+        }
         // Not yet due. Compared by wrapped difference, so a counter that
         // rolls over does not make every deadline fire at once.
         let now = crate::arch::counter_ordered();
@@ -956,9 +1011,8 @@ impl Input {
                 // The same held-key diffing the USB path does, against the
                 // same eight-byte shape — which is why the layout converts to
                 // it rather than inventing a third representation.
-                let event = keys_changed(&self.i2c_previous, &report);
-                self.i2c_previous = report;
-                event
+                self.i2c_latest = report;
+                next_key_change(&mut self.i2c_previous, &self.i2c_latest)
             }
         }
     }
@@ -1007,6 +1061,7 @@ impl UsbInput {
             keyboard: None,
             pointer: None,
             previous: [0; 8],
+            latest: [0; 8],
             next: 0,
             #[cfg(target_arch = "x86_64")]
             crash_file: None,
@@ -1127,36 +1182,20 @@ impl UsbInput {
     /// Drives the controller; requires ring 0.
     unsafe fn poll_keyboard(&mut self) -> Option<Event> {
         let device = self.keyboard?;
-        let mut report = [0u8; 8];
-        // SAFETY: forwarded from this function's own contract.
-        unsafe { self.controller.poll_report(device, &mut report)? };
-
         // Boot protocol: byte 0 is modifiers, byte 1 reserved, bytes 2..8 are
         // up to six held keycodes. It reports *state*, not events, so a press
         // is a keycode that was not in the previous report and a release is
-        // one that has left it.
-        for &code in &report[2..8] {
-            if code == 0 || self.previous[2..8].contains(&code) {
-                continue;
-            }
-            self.previous = report;
-            return Some(Event::Key(Key {
-                scancode: hid_to_scancode(code),
-                pressed: true,
-            }));
+        // one that has left it. One event per poll; a report that changed
+        // several keys at once (Shift and a letter in the same 8 ms) is
+        // delivered over the next polls before another is read.
+        if let Some(event) = next_key_change(&mut self.previous, &self.latest) {
+            return Some(event);
         }
-        for &code in &self.previous[2..8] {
-            if code == 0 || report[2..8].contains(&code) {
-                continue;
-            }
-            self.previous = report;
-            return Some(Event::Key(Key {
-                scancode: hid_to_scancode(code),
-                pressed: false,
-            }));
-        }
-        self.previous = report;
-        None
+        let mut report = [0u8; 8];
+        // SAFETY: forwarded from this function's own contract.
+        unsafe { self.controller.poll_report(device, &mut report)? };
+        self.latest = report;
+        next_key_change(&mut self.previous, &self.latest)
     }
 
     /// # Safety
@@ -1187,23 +1226,74 @@ impl UsbInput {
 /// keys currently held — where the interface wants events, and the difference
 /// between two reports is where the events are.
 fn keys_changed(previous: &[u8; 8], current: &[u8; 8]) -> Option<Event> {
-    for &code in &current[2..8] {
-        if code != 0 && !previous[2..8].contains(&code) {
-            return Some(Event::Key(Key {
-                scancode: hid_to_scancode(code),
-                pressed: true,
-            }));
-        }
+    // Modifiers first: a Shift pressed in the same report as a letter has to
+    // reach the layout before the letter does.
+    if let Some(event) = modifier_changed(previous[0], current[0]) {
+        return Some(event);
     }
+    // Releases before presses, so a key that replaced another in one report
+    // finds the slot the other left (see `advance`).
     for &code in &previous[2..8] {
         if code != 0 && !current[2..8].contains(&code) {
             return Some(Event::Key(Key {
                 scancode: hid_to_scancode(code),
                 pressed: false,
+                extended: hid_extended(code),
+            }));
+        }
+    }
+    for &code in &current[2..8] {
+        if code != 0 && !previous[2..8].contains(&code) {
+            return Some(Event::Key(Key {
+                scancode: hid_to_scancode(code),
+                pressed: true,
+                extended: hid_extended(code),
             }));
         }
     }
     None
+}
+
+/// The next event between the held-key state delivered so far and the latest
+/// report, with `previous` advanced past it; `None`, and the two made equal,
+/// once nothing differs.
+fn next_key_change(previous: &mut [u8; 8], latest: &[u8; 8]) -> Option<Event> {
+    match keys_changed(previous, latest) {
+        Some(Event::Key(k)) => {
+            advance(previous, latest, k);
+            Some(Event::Key(k))
+        }
+        _ => {
+            *previous = *latest;
+            None
+        }
+    }
+}
+
+/// Folds one delivered change into `previous`, so the remaining difference
+/// to `current` is what the next call reports: a modifier bit, or one key
+/// code added to or removed from the held set.
+fn advance(previous: &mut [u8; 8], current: &[u8; 8], delivered: Key) {
+    let changed = previous[0] ^ current[0];
+    if changed != 0 {
+        previous[0] ^= 1 << changed.trailing_zeros();
+        return;
+    }
+    if !delivered.pressed {
+        if let Some(slot) = previous[2..8].iter_mut().find(|s| **s != 0 && !current[2..8].contains(s)) {
+            *slot = 0;
+            return;
+        }
+    } else if let Some(code) = current[2..8].iter().copied().find(|&c| c != 0 && !previous[2..8].contains(&c)) {
+        // Every release was delivered first, so what `previous` still holds
+        // is a subset of `current`, smaller by at least this key: a free
+        // slot exists.
+        if let Some(slot) = previous[2..8].iter_mut().find(|s| **s == 0) {
+            *slot = code;
+            return;
+        }
+    }
+    *previous = *current;
 }
 
 /// Maps a set 2 code to set 1, leaving anything outside the table alone.

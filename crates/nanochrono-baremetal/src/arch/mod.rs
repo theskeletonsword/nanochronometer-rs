@@ -21,6 +21,10 @@ pub mod arm;
 #[cfg(target_arch = "arm")]
 mod aeabi;
 
+/// 32-bit ARM's exception vectors, installed by the entry stub.
+#[cfg(target_arch = "arm")]
+pub mod arm32;
+
 #[cfg(any(target_arch = "powerpc", target_arch = "powerpc64"))]
 pub use nanochrono_core::arch::powerpc;
 

@@ -241,8 +241,8 @@ pub unsafe fn memory_v1(info: u64) -> Memory {
 /// Tag type 1: the kernel command line, NUL-terminated.
 const TAG_COMMAND_LINE: u32 = 1;
 
-/// The longest command line read. Only `crashtest=` is looked for in it.
-const COMMAND_LINE_MAX: usize = 256;
+/// The longest command line (or module string) read.
+const COMMAND_LINE_MAX: usize = 512;
 
 /// The command line a multiboot2 loader passed (`multiboot2 /boot/kernel
 /// <args>` in GRUB), or `None`.
@@ -307,6 +307,125 @@ pub unsafe fn command_line_v1(info: u64) -> Option<&'static str> {
     // SAFETY: the loader placed the string below 4 GiB, inside the identity
     // map; it is read up to its NUL or the bound, whichever comes first.
     unsafe { c_str(address, COMMAND_LINE_MAX) }
+}
+
+/// Tag type 3: a module the loader placed in memory (`module2 <file>
+/// <string>` in GRUB).
+const TAG_MODULE: u32 = 3;
+
+/// One module: where its bytes are, and the string the loader gave it — the
+/// path the kernel files it under (`/usr/lib/libfoo.nsdyn`, `initrd.cpio`).
+#[derive(Debug, Clone, Copy)]
+pub struct Module {
+    pub start: u64,
+    pub end: u64,
+    pub name: &'static str,
+}
+
+impl Module {
+    /// The module's bytes. Its memory is the loader's and never reclaimed —
+    /// there is no allocator — so the borrow is `'static`.
+    ///
+    /// # Safety
+    /// The module must be one [`modules`] reported, from the loader's own
+    /// structure.
+    pub unsafe fn bytes(&self) -> &'static [u8] {
+        let len = self.end.saturating_sub(self.start) as usize;
+        if self.start == 0 || len == 0 {
+            return &[];
+        }
+        // SAFETY: forwarded; the loader placed `len` bytes at `start`, inside
+        // the identity map.
+        unsafe { core::slice::from_raw_parts(self.start as usize as *const u8, len) }
+    }
+}
+
+/// Calls `found` with every module a multiboot2 (`magic` = mb2) or
+/// multiboot1 loader loaded, in the loader's order.
+///
+/// # Safety
+/// `info` must be the information pointer the loader passed with `magic`, or
+/// zero.
+pub unsafe fn modules(info: u64, multiboot2: bool, mut found: impl FnMut(Module)) {
+    if info == 0 {
+        return;
+    }
+    let base = info as usize;
+    if multiboot2 {
+        if info % 8 != 0 {
+            return;
+        }
+        // SAFETY: forwarded from this function's own contract.
+        let total = unsafe { core::ptr::read_volatile(base as *const u32) } as usize;
+        if !(16..0x10_0000).contains(&total) {
+            return;
+        }
+        let mut offset = 8;
+        while offset + 8 <= total {
+            // SAFETY: bounded by the total size the header declares.
+            let (kind, size) = unsafe {
+                (
+                    core::ptr::read_volatile((base + offset) as *const u32),
+                    core::ptr::read_volatile((base + offset + 4) as *const u32) as usize,
+                )
+            };
+            if kind == TAG_END || size < 8 || offset + size > total {
+                return;
+            }
+            if kind == TAG_MODULE && size >= 16 {
+                // SAFETY: the tag's declared size covers both words and the
+                // string after them.
+                let (start, end, name) = unsafe {
+                    (
+                        core::ptr::read_volatile((base + offset + 8) as *const u32) as u64,
+                        core::ptr::read_volatile((base + offset + 12) as *const u32) as u64,
+                        c_str(base + offset + 16, size - 16).unwrap_or(""),
+                    )
+                };
+                if end > start {
+                    found(Module { start, end, name });
+                }
+            }
+            offset += (size + 7) & !7;
+        }
+    } else {
+        if info % 4 != 0 {
+            return;
+        }
+        // Flag bit 3: `mods_count` (offset 20) and `mods_addr` (offset 24)
+        // are valid; each entry is start, end, string, reserved.
+        // SAFETY: the caller guarantees a multiboot1 structure.
+        let (flags, count, table) = unsafe {
+            (
+                core::ptr::read_volatile(base as *const u32),
+                core::ptr::read_volatile((base + 20) as *const u32) as usize,
+                core::ptr::read_volatile((base + 24) as *const u32) as usize,
+            )
+        };
+        if flags & (1 << 3) == 0 || table == 0 {
+            return;
+        }
+        for i in 0..count.min(256) {
+            let entry = table + i * 16;
+            // SAFETY: the loader's module table, `count` entries long.
+            let (start, end, string) = unsafe {
+                (
+                    core::ptr::read_volatile(entry as *const u32) as u64,
+                    core::ptr::read_volatile((entry + 4) as *const u32) as u64,
+                    core::ptr::read_volatile((entry + 8) as *const u32) as usize,
+                )
+            };
+            let name = if string == 0 {
+                ""
+            } else {
+                // SAFETY: the loader's string, below 4 GiB.
+                unsafe { c_str(string, COMMAND_LINE_MAX) }.unwrap_or("")
+            };
+            if end > start {
+                found(Module { start, end, name });
+            }
+        }
+    }
 }
 
 /// A NUL-terminated string of at most `max` bytes at `address`, if it is

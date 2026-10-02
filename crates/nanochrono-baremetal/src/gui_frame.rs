@@ -1250,6 +1250,13 @@ pub unsafe fn run(fb: &Framebuffer, memory: Memory) -> ! {
     // for the rest of the run — hand the crash dumper the USB stick it found,
     // if any. The dumper keeps a pointer into `input`, so this cannot be done
     // from `init`, whose `Input` is still moving.
+    // The i386 kernel has no dump, only the report and the stop screen: its
+    // crashtest fires here all the same, with the interface up.
+    #[cfg(target_arch = "x86")]
+    // SAFETY: CPL 0, the IDT is installed; faulting is the point.
+    unsafe {
+        crate::crashdump::fire_pending_crashtest()
+    };
     #[cfg(target_arch = "x86_64")]
     {
         input.install_crash_sink();

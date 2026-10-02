@@ -164,7 +164,8 @@ fi
 # are, and the bootable images in iso/.
 bm="${build}/baremetal"
 install -Dm644 "${repo}/packaging/baremetal/README.release.md" "${stage}/bmdocs/README.md"
-for row in x86_64:x86_64 i386:i386 arm64:aarch64 ppc_of:ppc-openfirmware; do
+for row in x86_64:x86_64 i386:i386 arm64:aarch64 arm32:arm32 riscv64:riscv64 riscv32:riscv32 \
+        ppc64:ppc64 ppc64le:ppc64le ppc_of:ppc-openfirmware; do
     [[ -f "${bm}/nanochronometer_${row%%:*}.iso" ]] || { echo "error: no ${row%%:*} ISO in ${bm}" >&2; exit 1; }
     install -Dm644 "${bm}/nanochronometer_${row%%:*}.iso" "${stage}/iso/nanochronometer-${version}-${row#*:}.iso"
 done

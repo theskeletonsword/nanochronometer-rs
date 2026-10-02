@@ -83,7 +83,14 @@ pub const H_CAPABILITIES: usize = 84;
 /// The SHA-512 digest of the signed region, taken with this field zeroed.
 pub const H_DIGEST: usize = 88;
 pub const DIGEST_LEN: usize = 64;
-// 152..160: pad.
+/// The architecture the module was built for ([`Arch`]), as a
+/// little-endian `u16`. Zero is x86-64, so every module packed before this
+/// field existed already reads correctly.
+pub const H_ARCH: usize = 152;
+/// What the module is ([`Kind`]), as a little-endian `u16`: an app, a
+/// driver (`.ncdri`) or a shared library (`.nsdyn`).
+pub const H_KIND: usize = 154;
+// 156..160: reserved, zero.
 
 /// Header flag: the plugin asks for privileged kernel symbols, which only an
 /// officially signed plugin is granted.
@@ -119,6 +126,117 @@ pub const SIGNATURE_LEN: usize = SIG_P521_OFF + SIG_P521_LEN;
 pub const ROOT_MLDSA_LEN: usize = 2592;
 pub const ROOT_P521_LEN: usize = 133;
 
+/// The architecture a module was built for ([`H_ARCH`]).
+///
+/// One app per architecture lives in a package ([`crate::ncpkg`]); the loader
+/// runs the one that matches and refuses the rest, so installing a package
+/// built for another machine fails with a reason rather than with a fault.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u16)]
+pub enum Arch {
+    X86_64 = 0,
+    I386 = 1,
+    Aarch64 = 2,
+    Arm32 = 3,
+    Riscv64 = 4,
+    Riscv32 = 5,
+    Ppc64 = 6,
+    Ppc64Le = 7,
+    Ppc = 8,
+}
+
+impl Arch {
+    pub const fn from_u16(v: u16) -> Option<Arch> {
+        match v {
+            0 => Some(Arch::X86_64),
+            1 => Some(Arch::I386),
+            2 => Some(Arch::Aarch64),
+            3 => Some(Arch::Arm32),
+            4 => Some(Arch::Riscv64),
+            5 => Some(Arch::Riscv32),
+            6 => Some(Arch::Ppc64),
+            7 => Some(Arch::Ppc64Le),
+            8 => Some(Arch::Ppc),
+            _ => None,
+        }
+    }
+
+    /// The architecture's name, as the package manifest and the SDK spell it.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Arch::X86_64 => "x86_64",
+            Arch::I386 => "i386",
+            Arch::Aarch64 => "aarch64",
+            Arch::Arm32 => "arm32",
+            Arch::Riscv64 => "riscv64",
+            Arch::Riscv32 => "riscv32",
+            Arch::Ppc64 => "ppc64",
+            Arch::Ppc64Le => "ppc64le",
+            Arch::Ppc => "ppc",
+        }
+    }
+
+    pub const fn from_name(name: &[u8]) -> Option<Arch> {
+        match name {
+            b"x86_64" | b"x64" => Some(Arch::X86_64),
+            b"i386" | b"x86" => Some(Arch::I386),
+            b"aarch64" | b"arm64" => Some(Arch::Aarch64),
+            b"arm32" | b"arm" => Some(Arch::Arm32),
+            b"riscv64" => Some(Arch::Riscv64),
+            b"riscv32" => Some(Arch::Riscv32),
+            b"ppc64" => Some(Arch::Ppc64),
+            b"ppc64le" => Some(Arch::Ppc64Le),
+            b"ppc" => Some(Arch::Ppc),
+            _ => None,
+        }
+    }
+}
+
+/// What a module is ([`H_KIND`]): the file extension, the VFS directory and
+/// the loader's policy all follow from it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u16)]
+pub enum Kind {
+    /// A runnable app or plugin (`.ncapp`): has an entry point.
+    App = 0,
+    /// A driver for hardware the kernel does not build in (`.ncdri`):
+    /// essential drivers stay in the kernel. No licence header is required.
+    Driver = 1,
+    /// A shared library loaded at run time (`.nsdyn`): installed in
+    /// `/usr/lib` or carried inside a package.
+    Library = 2,
+}
+
+impl Kind {
+    pub const fn from_u16(v: u16) -> Option<Kind> {
+        match v {
+            0 => Some(Kind::App),
+            1 => Some(Kind::Driver),
+            2 => Some(Kind::Library),
+            _ => None,
+        }
+    }
+
+    /// The file extension for this kind.
+    pub const fn extension(self) -> &'static str {
+        match self {
+            Kind::App => ".ncapp",
+            Kind::Driver => ".ncdri",
+            Kind::Library => ".nsdyn",
+        }
+    }
+
+    pub const fn from_extension(name: &[u8]) -> Option<Kind> {
+        match name {
+            b".ncapp" => Some(Kind::App),
+            b".ncdri" => Some(Kind::Driver),
+            b".nsdyn" => Some(Kind::Library),
+            // The single-module package from before kinds existed.
+            b".ncplu" => Some(Kind::App),
+            _ => None,
+        }
+    }
+}
 // Table entry sizes.
 pub const SECTION_SIZE: usize = 24;
 pub const IMPORT_SIZE: usize = 16;
@@ -182,6 +300,9 @@ pub enum FormatError {
     BadRelocation,
     /// An import or export name is out of bounds or fails its hash.
     BadSymbol,
+    /// Unknown architecture or module kind: built for no machine this
+    /// format names.
+    BadArch,
     /// No entry export, or one outside the code.
     NoEntry,
 }
@@ -201,6 +322,7 @@ impl FormatError {
             FormatError::OverlappingSections => "two sections overlap in memory",
             FormatError::BadRelocation => "a relocation writes outside its section or into code",
             FormatError::BadSymbol => "a symbol name is out of bounds or corrupt",
+            FormatError::BadArch => "unknown architecture or module kind",
             FormatError::NoEntry => "no entry point inside the code",
         }
     }
@@ -311,6 +433,16 @@ impl<'a> Image<'a> {
         }
         if rd32(file, H_ABI_VERSION)? != ABI_VERSION {
             return Err(FormatError::AbiMismatch);
+        }
+        // Who the module was built for, and what it is. Both live in bytes
+        // that were reserved zero, so a module from before either existed
+        // reads as an x86-64 app — which is what every such module is.
+        if Arch::from_u16(rd16(file, H_ARCH)?).is_none() || Kind::from_u16(rd16(file, H_KIND)?).is_none() {
+            return Err(FormatError::BadArch);
+        }
+        // 156..160 stay reserved: a future field must read zero today.
+        if file.get(156..160) != Some(&[0u8; 4][..]) {
+            return Err(FormatError::BadVersion);
         }
 
         // The file's own length claim: at least a header (the rest of the
@@ -446,6 +578,19 @@ impl<'a> Image<'a> {
     /// The digest the packer recorded in the header.
     pub fn header_digest(&self) -> &'a [u8] {
         self.bytes.get(H_DIGEST..H_DIGEST + DIGEST_LEN).unwrap_or(&[])
+    }
+
+    /// The architecture the module was built for. Always valid: `parse`
+    /// refused the file otherwise.
+    pub fn arch(&self) -> Arch {
+        let at = self.bytes.get(H_ARCH..H_ARCH + 2).unwrap_or(&[0, 0]);
+        Arch::from_u16(u16::from_le_bytes([at[0], at[1]])).unwrap_or(Arch::X86_64)
+    }
+
+    /// What the module is: an app, a driver or a shared library.
+    pub fn kind(&self) -> Kind {
+        let at = self.bytes.get(H_KIND..H_KIND + 2).unwrap_or(&[0, 0]);
+        Kind::from_u16(u16::from_le_bytes([at[0], at[1]])).unwrap_or(Kind::App)
     }
 
     pub fn section_count(&self) -> usize {
@@ -707,6 +852,44 @@ mod tests {
         assert_eq!(img.reloc(1), Ok(Reloc::Import { offset: 0x2008, import: 0 }));
         assert_eq!(img.import_name(0), Ok(&b"nc_abi_version"[..]));
         assert!(img.signature_block().is_some());
+    }
+
+    #[test]
+    fn a_module_without_arch_reads_as_an_x86_64_app() {
+        let b = build();
+        let img = Image::parse(&b).expect("valid image");
+        assert_eq!(img.arch(), Arch::X86_64);
+        assert_eq!(img.kind(), Kind::App);
+    }
+
+    #[test]
+    fn arch_and_kind_travel_in_the_header() {
+        for (arch, kind) in [(Arch::Aarch64, Kind::App), (Arch::X86_64, Kind::Driver), (Arch::Riscv64, Kind::Library)] {
+            let mut b = build();
+            b[H_ARCH..H_ARCH + 2].copy_from_slice(&(arch as u16).to_le_bytes());
+            b[H_KIND..H_KIND + 2].copy_from_slice(&(kind as u16).to_le_bytes());
+            let img = Image::parse(&b).expect("valid image");
+            assert_eq!(img.arch(), arch);
+            assert_eq!(img.kind(), kind);
+        }
+        assert_eq!(Arch::from_name(b"arm64"), Some(Arch::Aarch64));
+        assert_eq!(Arch::from_name(b"nope"), None);
+        assert_eq!(Kind::from_extension(b".ncdri"), Some(Kind::Driver));
+        assert_eq!(Kind::from_extension(b".nsdyn"), Some(Kind::Library));
+        assert_eq!(Kind::App.extension(), ".ncapp");
+    }
+
+    #[test]
+    fn unknown_arch_kind_or_reserved_is_refused() {
+        let mut b = build();
+        b[H_ARCH..H_ARCH + 2].copy_from_slice(&0xFFu16.to_le_bytes());
+        assert_eq!(Image::parse(&b).err(), Some(FormatError::BadArch));
+        let mut b = build();
+        b[H_KIND..H_KIND + 2].copy_from_slice(&0xFFu16.to_le_bytes());
+        assert_eq!(Image::parse(&b).err(), Some(FormatError::BadArch));
+        let mut b = build();
+        b[158] = 1;
+        assert_eq!(Image::parse(&b).err(), Some(FormatError::BadVersion));
     }
 
     #[test]

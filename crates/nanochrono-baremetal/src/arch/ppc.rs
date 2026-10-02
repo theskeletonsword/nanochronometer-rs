@@ -138,6 +138,24 @@ macro_rules! be_to_le_switch {
     };
 }
 
+/// The rest of the entry's first 256 bytes, laid out as a ppc64 kexec
+/// expects of a kernel: Linux's `kexec_file` purgatory takes those bytes as
+/// the code its secondary threads run, from offset 0x60, and reads its
+/// `run_at_load` word from offset 0x5c and stores it back into the kernel
+/// there before the jump. So 0x5c holds a word of data and 0x60 a spin —
+/// neither on the boot thread's path, which has branched away by then; on
+/// powernv OPAL holds the other threads anyway.
+#[cfg(target_arch = "powerpc64")]
+macro_rules! kexec_layout {
+    () => {
+        "
+    .org _start + 0x5c
+    .long 0
+    b .
+"
+    };
+}
+
 #[cfg(all(target_arch = "powerpc64", target_endian = "little"))]
 core::arch::global_asm!(
     "
@@ -153,8 +171,43 @@ _start:
     "
 1:
     b nc_ppc64_common_entry
-"
+",
+    kexec_layout!()
 );
+
+/// The mirror of [`be_to_le_switch`], for the big-endian image entered on a
+/// little-endian core — by a kexec from petitboot, whose Linux runs
+/// little-endian on POWER9: the same steps with MSR[LE] cleared instead of
+/// set, its words stored little-endian because a little-endian core runs
+/// them.
+///
+/// ```text
+/// mfmsr   r11
+/// li      r12, 1
+/// andc    r11, r11, r12     # MSR[LE] off
+/// bcl     20, 31, $+4
+/// mflr    r12
+/// addi    r12, r12, 20      # past the rfid
+/// mtsrr0  r12
+/// mtsrr1  r11
+/// rfid
+/// ```
+#[cfg(all(target_arch = "powerpc64", target_endian = "big"))]
+macro_rules! le_to_be_switch {
+    () => {
+        "
+    .byte 0xa6, 0x00, 0x60, 0x7d
+    .byte 0x01, 0x00, 0x80, 0x39
+    .byte 0x78, 0x60, 0x6b, 0x7d
+    .byte 0x05, 0x00, 0x9f, 0x42
+    .byte 0xa6, 0x02, 0x88, 0x7d
+    .byte 0x14, 0x00, 0x8c, 0x39
+    .byte 0xa6, 0x03, 0x9a, 0x7d
+    .byte 0xa6, 0x03, 0x7b, 0x7d
+    .byte 0x24, 0x00, 0x00, 0x4c
+"
+    };
+}
 
 #[cfg(all(target_arch = "powerpc64", target_endian = "big"))]
 core::arch::global_asm!(
@@ -162,8 +215,18 @@ core::arch::global_asm!(
 .section .text.boot, \"ax\"
 .global _start
 _start:
+    // Big-endian core (skiboot): a trap that never fires (TO = 0), then over
+    // the switch. Little-endian core (a kexec from petitboot): these bytes
+    // read `b .+8`, into the switch.
+    tdi 0, 0, 0x48
+    b 1f
+",
+    le_to_be_switch!(),
+    "
+1:
     b nc_ppc64_common_entry
-"
+",
+    kexec_layout!()
 );
 
 #[cfg(target_arch = "powerpc64")]
@@ -171,8 +234,11 @@ core::arch::global_asm!(
     "
 .section .text.boot, \"ax\"
 nc_ppc64_common_entry:
-    // skiboot: r3 = device tree, r8 = OPAL base, r9 = OPAL entry. Kept in
-    // non-volatile registers across the setup below.
+    // r3 = device tree, r8 = OPAL base, r9 = OPAL entry, and r6 the ePAPR
+    // magic when skiboot is the loader (a kexec purgatory leaves its
+    // run_at_load word there). Kept in non-volatile registers across the
+    // setup below.
+    mr 28, 6
     mr 29, 3
     mr 30, 8
     mr 31, 9
@@ -224,6 +290,7 @@ nc_ppc64_common_entry:
     mr 3, 29
     mr 4, 30
     mr 5, 31
+    mr 6, 28
     bl kmain
     nop
 4:  b 4b
@@ -231,7 +298,7 @@ nc_ppc64_common_entry:
 .section .bss.nc_stack, \"aw\", @nobits
 .balign 16
 nc_stack_bottom:
-    .skip 65536
+    .skip 262144
 nc_stack_top:
 
 .section .data.nc_opal, \"aw\"
@@ -356,6 +423,26 @@ pub const OPAL_BUSY_EVENT: i64 = -12;
 pub unsafe fn opal_call(token: u64, a0: u64, a1: u64, a2: u64) -> i64 {
     // SAFETY: forwarded from this function's contract.
     unsafe { nc_opal_call(token, a0, a1, a2) }
+}
+
+/// Records OPAL's base and entry from the device tree's `ibm,opal` node,
+/// which skiboot publishes and a kexec carries over — the only place a
+/// kernel started from petitboot finds them, as nothing is left in r8/r9.
+///
+/// # Safety
+/// Before the first OPAL call, with the values the firmware published.
+#[cfg(target_arch = "powerpc64")]
+pub unsafe fn set_opal(base: u64, entry: u64) {
+    extern "C" {
+        static mut nc_opal_base: u64;
+        static mut nc_opal_entry: u64;
+    }
+    // SAFETY: no OPAL call is in flight (this function's contract), so
+    // nothing reads the pair while it changes.
+    unsafe {
+        core::ptr::write_volatile(&raw mut nc_opal_base, base);
+        core::ptr::write_volatile(&raw mut nc_opal_entry, entry);
+    }
 }
 
 /// Whether OPAL's entry point was handed over, i.e. whether calls can work.
@@ -524,7 +611,7 @@ nc_ppc32_fatal:
 .section .bss.nc_stack, \"aw\", @nobits
 .balign 16
 nc_stack_bottom:
-    .skip 65536
+    .skip 262144
 nc_stack_top:
 .balign 16
 nc_exc_stack_bottom:

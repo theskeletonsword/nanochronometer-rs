@@ -20,7 +20,10 @@
 #   packaging/baremetal/build.sh gdb x86_64 [crashtest=<de|pf|gp|ud|so|df|panic>] [plugin=<name>]
 #                                                # debug build, QEMU stopped for GDB
 #   packaging/baremetal/build.sh boot x86_64 [crashtest=...] [plugin=<name>]
-#                                                # the same, running at once (no GDB wait)
+#                                                # the same, running at once (no GDB wait);
+#                                                # mode=desktop|cli, kbd=es|us,
+#                                                # wallpaper=<n> and ncdri.*= reach the
+#                                                # kernel command line as well
 #
 # OPT=-O0|-Og|-O1|-O2|-O3|-Os|-Oz|-Ofast builds at that level instead of the
 # mode's default (release -O2, debug -O0, debug-og -Og); see
@@ -55,7 +58,10 @@ set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 crate="${repo_root}/crates/nanochrono-baremetal"
-out_dir="${repo_root}/build/baremetal"
+# NC_BUILD_ROOT=<dir> writes everything below to <dir>/baremetal... instead of
+# build/: a trial build that leaves the release and debug output alone.
+build_root="${NC_BUILD_ROOT:-${repo_root}/build}"
+out_dir="${build_root}/baremetal"
 
 # `x86_64-nanochrono-none` is a custom spec: the built-in `x86_64-unknown-none`
 # has a soft-float ABI where no vector register can be allocated, so the SIMD
@@ -180,6 +186,57 @@ build_shared() {
         -soname libnanochrono.so -z notext --hash-style=both --build-id \
         -o "${so}"
     split_debug "${so}" || { echo "error: could not split the debug information of ${so}" >&2; exit 1; }
+    check_header_symbols "${arch}" "${so}"
+}
+
+# The OpenPOWER image must be entered the same way by both of its loaders
+# (boot/powerpc64.ld): skiboot runs the file in place from 0x2000_0000, so
+# every address is 0x2000_0000 plus its file offset; a kexec enters at the
+# start of the loaded segment, so that must be the entry point.
+check_ppc64_layout() {
+    local elf="$1" entry off vaddr
+    entry="$(llvm-readelf -h "${elf}" | awk '/Entry point/ { print $NF }')"
+    read -r off vaddr < <(llvm-readelf -l -W "${elf}" | awk '$1 == "LOAD" { print $2, $3; exit }')
+    if (( vaddr - off != 0x20000000 || entry != vaddr )); then
+        echo "error: ${elf##*/}: segment ${vaddr} at offset ${off}, entry ${entry}:" \
+             "skiboot and kexec would not both enter at _start (boot/powerpc64.ld)" >&2
+        exit 1
+    fi
+}
+
+# The header declares the library's whole symbol table: every C-named symbol
+# the .so exports or imports (nm -D) — abi.rs's functions, and what
+# src/abi_symbols.h adds for the rest. Checked by compiling, for the arch's
+# target, a file that takes each symbol's address: an undeclared one is an
+# error, so a new symbol cannot ship without its declaration.
+declare -A header_triple=(
+    [x86_64]=x86_64-unknown-none-elf [i386]=i686-unknown-none-elf
+    [aarch64]=aarch64-unknown-none-elf [arm32]=armv7a-none-eabihf
+    [ppc64]=powerpc64-unknown-none-elf [ppc64le]=powerpc64le-unknown-none-elf
+    [ppc]=powerpc-unknown-none-eabi
+    [riscv64]=riscv64-unknown-elf [riscv32]=riscv32-unknown-elf
+)
+check_header_symbols() {
+    local arch="$1" so="$2" check
+    [[ -f "${header}" ]] && command -v clang >/dev/null 2>&1 && command -v llvm-nm >/dev/null 2>&1 ||
+        return 0
+    check="$(mktemp --suffix=.c)"
+    {
+        echo '#include "nanochrono.h"'
+        echo 'void *nc_header_check[] = {'
+        llvm-nm -D "${so}"
+    } | awk 'NR <= 2 { print; next }
+             { n = $NF; if (n ~ /^(_ZN|_R)/) next
+               if (n == "__global_pointer$") n = "nc_global_pointer"
+               print "    (void *)&" n "," }
+             END { print "};" }' > "${check}"
+    if ! clang --target="${header_triple[${arch}]}" -ffreestanding -std=c11 -fsyntax-only \
+            -I "$(dirname "${header}")" "${check}"; then
+        echo "error: ${header#"${repo_root}/"} does not declare every symbol of ${so##*/} (${arch})" >&2
+        command rm -f "${check}"
+        exit 1
+    fi
+    command rm -f "${check}"
 }
 
 build_one() {
@@ -221,6 +278,9 @@ build_one() {
     # image stripped of its names looks as though it hides what it is. It costs
     # under 200 KiB on any architecture.
     cp "${elf}" "${out_dir}/${arch}/nanochrono-kernel.elf"
+    if [[ "${arch}" == ppc64 || "${arch}" == ppc64le ]]; then
+        check_ppc64_layout "${out_dir}/${arch}/nanochrono-kernel.elf"
+    fi
     # Shipped as libnanochrono, the name every platform's release uses, so a
     # C kernel links it with -lnanochrono and includes nanochrono.h.
     cp "${target_dir}/${target}/${profile_dir}/libnanochrono_baremetal.a" \
@@ -451,6 +511,12 @@ run_gdb() {
         echo "error: no ISO to boot (is grub-mkrescue installed?)" >&2
         return 1
     fi
+    # NC_BUILD_ONLY=1: the ISO (with the arguments) and nothing else — for
+    # a test harness that boots it itself.
+    if [[ -n "${NC_BUILD_ONLY:-}" ]]; then
+        echo "=== built ${iso}"
+        return 0
+    fi
     local stick="${out_dir}/gdb-stick.img"
     cp "${iso}" "${stick}"
     local display=()
@@ -527,14 +593,15 @@ if [[ "${mode}" == "debug" || "${mode}" == "debug-og" || "${mode}" == "gdb" || "
     build_kind="debug"
     # Beside the release output, not over it: a debug kernel is 8 MiB of
     # DWARF and never ships.
-    out_dir="${repo_root}/build/baremetal-debug"
+    out_dir="${build_root}/baremetal-debug"
     [[ "${debug_opt}" == "Og" ]] && out_dir+="-og"
     if [[ "${mode}" == "gdb" || "${mode}" == "boot" ]]; then
         args=()
         for a in "$@"; do
             case "${a}" in
                 crashtest=*) crashtest="${a}" ;;
-                plugin=*) kernel_extra="${kernel_extra} ${a}" ;;
+                plugin=* | mode=* | kbd=* | wallpaper=* | ncdri.*=*)
+                    kernel_extra="${kernel_extra} ${a}" ;;
                 *) args+=("${a}") ;;
             esac
         done
@@ -758,29 +825,86 @@ build_iso_x86() {
     rm -rf "${staging}"
     mkdir -p "${staging}/boot/grub"
     cp "${out_dir}/${arch}/nanochrono-kernel.elf" "${staging}/boot/nanochrono-kernel"
+    # The menu's own wallpaper: the first of the embedded ones.
+    local background
+    background="$(ls "${repo_root}/assets/wallpapers/"*.png 2>/dev/null | head -1)"
+    [[ -n "${background}" ]] && cp "${background}" "${staging}/boot/grub/background.png"
+    # Packages and drivers travel on the ISO and reach the kernel as
+    # multiboot2 modules, each filed under its path (src/vfs.rs): the
+    # Desktop Experience and the CLI list and run them. x86_64 only, where
+    # the loader for them exists.
+    local modules=""
+    if [[ "${arch}" == "x86_64" ]]; then
+        build_plugins
+        local plug
+        for plug in "${out_dir}/plugins/"*.NCPLU "${out_dir}/plugins/"*.ncplu "${out_dir}/plugins/"*.NCDRI \
+                    "${out_dir}/plugins/"*.ncdri "${out_dir}/plugins/"*.nsdyn; do
+            [[ -f "${plug}" ]] || continue
+            local dest="/apps/${plug##*/}"
+            case "${plug,,}" in
+                *.ncdri) dest="/boot/drivers/${plug##*/}" ;;
+                *.nsdyn) dest="/usr/lib/${plug##*/}" ;;
+            esac
+            mkdir -p "${staging}$(dirname "${dest}")"
+            command cp -f "${plug}" "${staging}${dest}"
+            modules+="    module2 ${dest} ${dest}"$'\n'
+        done
+    fi
     sed -e "s/@ARCH@/${arch}/g" -e "s/@ARGS@/${kernel_args}/g" > "${staging}/boot/grub/grub.cfg" <<'CFG'
-set timeout=3
+set timeout=5
 set default=0
 
 insmod all_video
 insmod gfxterm
+insmod png
 
 set gfxmode=1920x1200x32,1920x1080x32,1680x1050x32,1600x900x32,1440x900x32,1366x768x32,1280x1024x32,1280x800x32,1024x768x32,auto
 terminal_output gfxterm
 set gfxpayload=keep
+if background_image /boot/grub/background.png; then
+    set menu_color_normal=white/black
+    set menu_color_highlight=black/light-green
+    set color_normal=light-gray/black
+fi
 
-menuentry "NanoChronometer @ARCH@ (freestanding)" {
+menuentry "NanoChronometer (@ARCH@)" {
     multiboot2 /boot/nanochrono-kernel @ARGS@
-    set gfxpayload=keep
+@MODULES@    set gfxpayload=keep
     boot
 }
 
-menuentry "NanoChronometer @ARCH@ (text mode)" {
+menuentry "NanoChronometer Desktop Experience (@ARCH@)" {
+    multiboot2 /boot/nanochrono-kernel mode=desktop @ARGS@
+@MODULES@    set gfxpayload=keep
+    boot
+}
+
+menuentry "NanoChronometer CLI (@ARCH@)" {
+    multiboot2 /boot/nanochrono-kernel mode=cli @ARGS@
+@MODULES@    set gfxpayload=keep
+    boot
+}
+
+menuentry "NanoChronometer CLI, Spanish keyboard (@ARCH@)" {
+    multiboot2 /boot/nanochrono-kernel mode=cli kbd=es @ARGS@
+@MODULES@    set gfxpayload=keep
+    boot
+}
+
+menuentry "NanoChronometer (@ARCH@, text mode)" {
     set gfxpayload=text
     multiboot2 /boot/nanochrono-kernel @ARGS@
     boot
 }
 CFG
+    # The module lines go where @MODULES@ stands (sed cannot take a
+    # multi-line replacement portably; this can).
+    python3 - "${staging}/boot/grub/grub.cfg" "${modules}" <<'PY'
+import sys
+path, modules = sys.argv[1], sys.argv[2]
+cfg = open(path).read().replace("@MODULES@", modules)
+open(path, "w").write(cfg)
+PY
     # The debug ISO boots straight into each forced fault as well, to check
     # on real hardware that a fault ends in a crash dump and the stop screen
     # rather than a reset (see crashdump::CrashTest).
@@ -803,7 +927,6 @@ CFG
     # which is where the kernel looks when it sees the protective entry.
     local xorriso_args=()
     if [[ "${arch}" == "x86_64" ]]; then
-        build_plugins
         local fat="${staging}.crashfat.img"
         if make_crash_partition "${fat}"; then
             xorriso_args=(-- -append_partition 3 0x0e "${fat}"
@@ -888,6 +1011,126 @@ build_efi_app() {
         echo "error: lld-link failed to link the ARM64 EFI application" >&2
         return 1
     }
+}
+
+# The EFI loader for 32-bit ARM and RISC-V (boot/efi_loader.c), with the
+# kernel embedded, as a PE/COFF EFI application: compiled for the target,
+# linked as one flat image (boot/efi_loader.ld) — at two bases, which must give
+# the same bytes, so it holds no absolute address — and wrapped by
+# tools/mkefi.py, since lld links no PE for these targets. Debug builds
+# compile it at the kernel's debug level, releases at -O2.
+build_efi_loader() {
+    local arch="$1" kernel_elf="$2" out_efi="$3"
+    local boot="${repo_root}/crates/nanochrono-baremetal/boot"
+    local target march
+    case "${arch}" in
+        arm32) target=armv7a-none-eabi march=(-marm -mfloat-abi=soft) ;;
+        riscv64) target=riscv64-unknown-elf march=(-march=rv64imac -mabi=lp64 -mcmodel=medany -mno-relax) ;;
+        riscv32) target=riscv32-unknown-elf march=(-march=rv32imac -mabi=ilp32 -mcmodel=medany -mno-relax) ;;
+        *) echo "error: no EFI loader for ${arch}" >&2; return 1 ;;
+    esac
+    local opt=-O2
+    if [[ "${build_kind}" == "debug" ]]; then
+        opt="-${debug_opt}"
+    fi
+    local clang lld
+    clang="$(command -v clang || true)"
+    lld="$(command -v ld.lld || true)"
+    if [[ -z "${clang}" || -z "${lld}" ]]; then
+        echo "note: clang/ld.lld not found; skipping the ${arch} ISO"
+        return 1
+    fi
+    local work
+    work="$(mktemp -d)"
+    # The kernel as the firmware loads it: its debug information stays in
+    # the build directory (a release kernel has none in it already).
+    llvm-objcopy --strip-debug "${kernel_elf}" "${work}/kernel.elf"
+    "${clang}" --target="${target}" "${march[@]}" "${opt}" -g -ffreestanding -fno-builtin -nostdlib \
+        -fPIE -fvisibility=hidden -fno-stack-protector -fno-jump-tables -Wall -Wextra -Werror \
+        -c "${boot}/efi_loader.c" -o "${work}/loader.o" &&
+    "${clang}" --target="${target}" "${march[@]}" -c -DKERNEL_BLOB="\"${work}/kernel.elf\"" \
+        "${boot}/kernel_blob.S" -o "${work}/blob.o" || { command rm -rf "${work}"; return 1; }
+    local b
+    for b in 0x1000 0x101000; do
+        "${lld}" -static -nostdlib -T "${boot}/efi_loader.ld" --defsym=EFI_BASE="${b}" \
+            "${work}/loader.o" "${work}/blob.o" -o "${work}/loader-${b}.elf" &&
+            llvm-objcopy -O binary "${work}/loader-${b}.elf" "${work}/image-${b}.bin" ||
+            { command rm -rf "${work}"; return 1; }
+    done
+    if ! cmp -s "${work}/image-0x1000.bin" "${work}/image-0x101000.bin"; then
+        echo "error: the ${arch} EFI loader holds an absolute address (its images differ by base)" >&2
+        command rm -rf "${work}"
+        return 1
+    fi
+    python3 "${repo_root}/tools/mkefi.py" "${work}/loader-0x1000.elf" "${out_efi}"
+    local rc=$?
+    command rm -rf "${work}"
+    return "${rc}"
+}
+
+# An ISO that UEFI firmware — and U-Boot, through its EFI support — boots from
+# its removable-media path, EFI/BOOT/<name>: the loader above in a FAT EFI
+# system partition, as the El Torito EFI boot image (a CD) and as an MBR
+# partition appended to the image (a USB stick or a disk).
+build_iso_efi() {
+    local arch="$1" name="$2"
+    local mkiso
+    mkiso="$(command -v xorriso || true)"
+    if [[ -z "${mkiso}" ]] || ! command -v mkfs.fat >/dev/null || ! command -v mcopy >/dev/null; then
+        echo "note: no xorriso, mkfs.fat or mtools; skipping the ${arch} ISO"
+        return
+    fi
+    local staging="${out_dir}/.iso-${arch}"
+    rm -rf "${staging}"
+    mkdir -p "${staging}/iso/EFI/BOOT"
+    if ! build_efi_loader "${arch}" "${out_dir}/${arch}/nanochrono-kernel.elf" \
+            "${staging}/iso/EFI/BOOT/${name}"; then
+        echo "error: could not build the ${arch} EFI loader" >&2
+        rm -rf "${staging}"
+        return
+    fi
+    local esp="${staging}/iso/efiboot.img" kib
+    kib=$(( $(stat -c %s "${staging}/iso/EFI/BOOT/${name}") / 1024 + 1024 ))
+    mkfs.fat -C "${esp}" "${kib}" >/dev/null &&
+        MTOOLS_SKIP_CHECK=1 mmd -i "${esp}" ::/EFI ::/EFI/BOOT &&
+        MTOOLS_SKIP_CHECK=1 mcopy -i "${esp}" "${staging}/iso/EFI/BOOT/${name}" "::/EFI/BOOT/${name}" &&
+        "${mkiso}" -as mkisofs -quiet -R -J -V "NANOCHRONO" \
+            -e efiboot.img -no-emul-boot -append_partition 2 0xef "${esp}" \
+            -o "${out_dir}/nanochronometer_${arch}.iso" "${staging}/iso" >/dev/null 2>&1 ||
+        echo "error: could not write the ${arch} ISO" >&2
+    rm -rf "${staging}"
+}
+
+# An ISO for OpenPOWER machines, which boot through petitboot: a Linux in
+# the firmware that reads the GRUB configuration on a medium and kexecs the
+# kernel it names. Here, /boot/grub/grub.cfg names the kernel ELF beside it;
+# the kernel takes whichever byte order the kexec enters it in, and OPAL from
+# the device tree (src/arch/ppc.rs, src/main.rs).
+build_iso_petitboot() {
+    local arch="$1"
+    local mkiso
+    mkiso="$(command -v xorriso || true)"
+    if [[ -z "${mkiso}" ]]; then
+        echo "note: no xorriso; skipping the ${arch} ISO"
+        return
+    fi
+    local staging="${out_dir}/.iso-${arch}"
+    rm -rf "${staging}"
+    mkdir -p "${staging}/boot/grub"
+    # The kernel as the firmware loads it; its debug information stays here.
+    llvm-objcopy --strip-debug "${out_dir}/${arch}/nanochrono-kernel.elf" "${staging}/boot/nanochrono-kernel.elf"
+    cat > "${staging}/boot/grub/grub.cfg" <<CFG
+set timeout=5
+set default=0
+
+menuentry "NanoChronometer (${arch})" {
+    linux /boot/nanochrono-kernel.elf
+}
+CFG
+    "${mkiso}" -as mkisofs -quiet -R -J -V "NANOCHRONO" \
+        -o "${out_dir}/nanochronometer_${arch}.iso" "${staging}" >/dev/null 2>&1 ||
+        echo "error: could not write the ${arch} ISO" >&2
+    rm -rf "${staging}"
 }
 
 build_iso_arm64() {
@@ -976,6 +1219,19 @@ if [[ -f "${out_dir}/aarch64/nanochrono-kernel.elf" ]]; then
     build_iso_arm64
     [[ -f "${out_dir}/nanochronometer_arm64.iso" ]] && iso_made="${iso_made} arm64"
 fi
+for arch in ppc64 ppc64le; do
+    if [[ -f "${out_dir}/${arch}/nanochrono-kernel.elf" ]]; then
+        build_iso_petitboot "${arch}"
+        [[ -f "${out_dir}/nanochronometer_${arch}.iso" ]] && iso_made="${iso_made} ${arch}"
+    fi
+done
+for row in arm32:BOOTARM.EFI riscv64:BOOTRISCV64.EFI riscv32:BOOTRISCV32.EFI; do
+    arch="${row%%:*}"
+    if [[ -f "${out_dir}/${arch}/nanochrono-kernel.elf" ]]; then
+        build_iso_efi "${arch}" "${row#*:}"
+        [[ -f "${out_dir}/nanochronometer_${arch}.iso" ]] && iso_made="${iso_made} ${arch}"
+    fi
+done
 if [[ -f "${out_dir}/ppc/nanochrono-kernel.elf" ]]; then
     build_iso_ppc_of
     [[ -f "${out_dir}/nanochronometer_ppc_of.iso" ]] && iso_made="${iso_made} ppc-of"

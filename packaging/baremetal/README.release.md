@@ -34,11 +34,16 @@ it, each lands beside the file it describes:
                                      sections, to link instead
 ```
 
-The bootable images are in `iso/`: `nanochronometer-<version>-x86_64.iso`
-and `-i386.iso` (BIOS and UEFI, from a USB stick or a CD), `-aarch64.iso`
-(UEFI: GRUB starts a small EFI loader that places the kernel and hands it
-the machine with the MMU off) and `-ppc-openfirmware.iso` (G3/G4 Macs through
-Open Firmware).
+The bootable images are in `iso/`, one per architecture, each written to a
+USB stick (`dd`) or burnt to a CD as it is:
+
+| `nanochronometer-<version>-….iso` | Boots through |
+|---|---|
+| `x86_64`, `i386` | BIOS and UEFI: GRUB, multiboot2 |
+| `aarch64` | UEFI: GRUB starts a small EFI loader that places the kernel and hands it the machine with the MMU off |
+| `arm32`, `riscv64`, `riscv32` | UEFI — firmware such as EDK2, or U-Boot's UEFI support — from the removable-media path (`EFI/BOOT/BOOTARM.EFI`, `BOOTRISCV64.EFI`, `BOOTRISCV32.EFI`): an EFI loader that places the kernel at its address and hands it the device tree (and, on RISC-V, the boot hart) |
+| `ppc64`, `ppc64le` | OpenPOWER: petitboot reads its `/boot/grub/grub.cfg` and kexecs the kernel; the kernel finds OPAL in the device tree and switches to its own byte order |
+| `ppc-openfirmware` | G3/G4 Macs through Open Firmware |
 
 ## `include/nanochrono.h`
 
@@ -46,6 +51,10 @@ The C ABI that both libraries export, generated from the Rust source: the PMU
 (`nc_bm_pmu_*`), the architectural counter (`nc_bm_counter*`) and the entropy
 pool (`nc_rng_*`, with the same functions, constants and `nc_rng_status_t` as
 the hosted libnanochrono, so the same C builds against either).
+
+It declares the libraries' whole symbol table: every name `nm -D
+libnanochrono.so` lists on that architecture — what the library exports, its
+trap and entry points, and the few symbols it imports — is declared in it.
 
 It is freestanding — only `<stdbool.h>`, `<stddef.h>` and `<stdint.h>` — and
 it can be `#include`d from a `.S` file: the constants are plain `#define`s, and
@@ -101,8 +110,9 @@ loader and runtime symbol resolver yourself.** It has to:
    refers to symbols the NanoChronometer kernel image defines for itself: the
    image's bounds (`__kernel_start`, `__kernel_end`) on every architecture,
    and on x86_64 its stacks and text bounds, `kmain` on PowerPC and RISC-V,
-   `__global_pointer$` on RISC-V. A module you load never runs the boot code,
-   but the relocations still name them. List them with
+   `__global_pointer$` on RISC-V — `nanochrono.h` declares each of them. A
+   module you load never runs the boot code, but the relocations still name
+   them. List them with
 
    ```sh
    readelf --dyn-syms --wide <arch>/lib64/libnanochrono.so | grep UND

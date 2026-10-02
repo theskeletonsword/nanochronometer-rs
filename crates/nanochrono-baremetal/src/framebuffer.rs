@@ -47,6 +47,11 @@ pub struct Framebuffer {
     /// how a display ends up sheared diagonally.
     pitch: u32,
     bytes_per_pixel: u32,
+    /// Whether drawing widens the screen's damage rectangle. True for the
+    /// screen; false for an off-screen [`Framebuffer::surface`] (a desktop
+    /// window), whose coordinates are its own and whose pixels reach the
+    /// screen only when the compositor copies them.
+    damage: bool,
 }
 
 /// A colour, as the framebuffer wants it.
@@ -60,6 +65,8 @@ pub type Colour = u32;
 /// back to drawing straight onto the device, which works and merely flickers.
 const SHADOW_W: usize = 1920;
 const SHADOW_H: usize = 1200;
+/// The back buffer's size, for the memory report.
+pub const SHADOW_BYTES: usize = SHADOW_W * SHADOW_H * 4;
 
 /// The back buffer itself.
 ///
@@ -111,6 +118,42 @@ impl Framebuffer {
             height,
             pitch,
             bytes_per_pixel: (bits_per_pixel as u32).div_ceil(8),
+            damage: true,
+        }
+    }
+
+    /// An off-screen surface over `width * height` pixels of `0x00RRGGBB`
+    /// at `pixels`, rows `width` apart: every drawing routine here works on
+    /// it, nothing marks the screen's damage, and [`present`](Self::present)
+    /// does nothing — a desktop window draws into one, and the compositor
+    /// copies it to the screen.
+    ///
+    /// # Safety
+    /// `pixels` must be valid for reads and writes of `width * height` `u32`s
+    /// for as long as the surface (or a copy of it) is used, and nothing else
+    /// may write them meanwhile.
+    pub const unsafe fn surface(pixels: *mut u32, width: u32, height: u32) -> Framebuffer {
+        Framebuffer {
+            base: core::ptr::null_mut(),
+            shadow: pixels,
+            width,
+            height,
+            pitch: width * 4,
+            bytes_per_pixel: 4,
+            damage: false,
+        }
+    }
+
+    /// Whether this is an off-screen [`surface`](Self::surface).
+    pub fn is_surface(&self) -> bool {
+        self.base.is_null() && !self.shadow.is_null()
+    }
+
+    /// Marks screen damage, unless this is an off-screen surface.
+    #[inline]
+    fn mark(&self, x: u32, y: u32, w: u32, h: u32) {
+        if self.damage {
+            mark(x, y, w, h);
         }
     }
 
@@ -180,7 +223,7 @@ impl Framebuffer {
             // SAFETY: the bounds check above keeps the index inside the back
             // buffer, whose rows are exactly `width` pixels.
             unsafe { self.shadow.add((y * self.width + x) as usize).write(colour) };
-            mark(x, y, 1, 1);
+            self.mark(x, y, 1, 1);
             return;
         }
         // SAFETY: bounds-checked above; `new`'s caller guaranteed the surface.
@@ -277,7 +320,7 @@ impl Framebuffer {
                     }
                 }
             }
-            mark(x, y, right - x, bottom - y);
+            self.mark(x, y, right - x, bottom - y);
             return;
         }
 
@@ -287,6 +330,117 @@ impl Framebuffer {
                 unsafe { self.store(col, row, colour) };
             }
         }
+    }
+
+    /// Copies a `w x h` block of `0x00RRGGBB` pixels, rows `stride` apart in
+    /// `src`, to `(x, y)`, clipped to this surface (a negative origin clips
+    /// the left or top). What the compositor composes windows with.
+    pub fn blit(&self, x: i32, y: i32, w: u32, h: u32, src: &[u32], stride: usize) {
+        let (cx0, cy0) = (x.max(0) as u32, y.max(0) as u32);
+        let skip_x = (cx0 as i64 - x as i64) as u32;
+        let skip_y = (cy0 as i64 - y as i64) as u32;
+        if skip_x >= w || skip_y >= h || cx0 >= self.width || cy0 >= self.height {
+            return;
+        }
+        let cw = (w - skip_x).min(self.width - cx0);
+        let ch = (h - skip_y).min(self.height - cy0);
+        for row in 0..ch {
+            let from = (skip_y + row) as usize * stride + skip_x as usize;
+            let Some(line) = src.get(from..from + cw as usize) else { return };
+            if !self.shadow.is_null() {
+                // SAFETY: clipped to the surface; the back buffer's rows are
+                // `width` pixels and `line` is `cw` long.
+                unsafe {
+                    let dst = self.shadow.add(((cy0 + row) * self.width + cx0) as usize);
+                    core::ptr::copy_nonoverlapping(line.as_ptr(), dst, cw as usize);
+                }
+            } else {
+                for (i, &p) in line.iter().enumerate() {
+                    // SAFETY: clipped to the surface above.
+                    unsafe { self.store(cx0 + i as u32, cy0 + row, p) };
+                }
+            }
+        }
+        self.mark(cx0, cy0, cw, ch);
+    }
+
+    /// Moves the `w x h` block at `(sx, sy)` to `(dx, dy)` inside the back
+    /// buffer, overlapping allowed: a terminal scrolls with it instead of
+    /// redrawing every line. A no-op without a back buffer (the caller then
+    /// redraws).
+    pub fn copy_within(&self, sx: u32, sy: u32, w: u32, h: u32, dx: u32, dy: u32) -> bool {
+        if self.shadow.is_null() {
+            return false;
+        }
+        let w = w.min(self.width.saturating_sub(sx)).min(self.width.saturating_sub(dx));
+        let h = h.min(self.height.saturating_sub(sy)).min(self.height.saturating_sub(dy));
+        if w == 0 || h == 0 {
+            return true;
+        }
+        let rows: &mut dyn Iterator<Item = u32> = if dy > sy { &mut (0..h).rev() } else { &mut (0..h) };
+        for row in rows {
+            // SAFETY: both rectangles were clipped to the back buffer; `copy`
+            // allows the overlap a scroll within one row band has.
+            unsafe {
+                let from = self.shadow.add(((sy + row) * self.width + sx) as usize);
+                let to = self.shadow.add(((dy + row) * self.width + dx) as usize);
+                core::ptr::copy(from, to, w as usize);
+            }
+        }
+        self.mark(dx, dy, w, h);
+        true
+    }
+
+    /// Draws an 8-bit coverage mask — a glyph — `w x h` at `(x, y)` in `fg`,
+    /// over `bg` where given (the cell is then filled) or over what is
+    /// already there. One pass and one damage mark, where `set` per pixel
+    /// would be one each.
+    pub fn draw_coverage(&self, x: u32, y: u32, w: u32, h: u32, coverage: &[u8], fg: Colour, bg: Option<Colour>) {
+        if x >= self.width || y >= self.height {
+            return;
+        }
+        let cw = w.min(self.width - x);
+        let ch = h.min(self.height - y);
+        for row in 0..ch {
+            for col in 0..cw {
+                let a = coverage.get((row * w + col) as usize).copied().unwrap_or(0);
+                let (px, py) = (x + col, y + row);
+                let colour = match (a, bg) {
+                    (0, Some(b)) => b,
+                    (0, None) => continue,
+                    (255, _) => fg,
+                    (a, Some(b)) => crate::draw::blend(b, fg, a),
+                    (a, None) => crate::draw::blend(self.get(px, py), fg, a),
+                };
+                if !self.shadow.is_null() {
+                    // SAFETY: clipped to the surface above.
+                    unsafe { self.shadow.add((py * self.width + px) as usize).write(colour) };
+                } else {
+                    // SAFETY: clipped to the surface above.
+                    unsafe { self.store(px, py, colour) };
+                }
+            }
+        }
+        self.mark(x, y, cw, ch);
+    }
+
+    /// The back buffer's pixels, rows `width` apart, for a caller that
+    /// composes a whole region itself.
+    ///
+    /// # Safety
+    /// No other reference to the pixels may be used while the slice lives.
+    pub unsafe fn pixels_mut(&self) -> Option<&mut [u32]> {
+        if self.shadow.is_null() {
+            return None;
+        }
+        // SAFETY: forwarded; the back buffer holds `width * height` pixels.
+        Some(unsafe { core::slice::from_raw_parts_mut(self.shadow, (self.width * self.height) as usize) })
+    }
+
+    /// Marks a rectangle as changed after drawing into
+    /// [`pixels_mut`](Self::pixels_mut) directly.
+    pub fn damaged(&self, x: u32, y: u32, w: u32, h: u32) {
+        self.mark(x, y, w, h);
     }
 
     /// Fills the whole surface.
@@ -309,11 +463,28 @@ impl Framebuffer {
     ///
     /// A no-op without a back buffer, where the pixels are already there.
     pub fn present(&self, x: u32, y: u32, w: u32, h: u32) {
-        if self.shadow.is_null() || w == 0 || h == 0 || x >= self.width || y >= self.height {
+        if self.shadow.is_null() || self.base.is_null() || w == 0 || h == 0 || x >= self.width || y >= self.height {
             return;
         }
         let right = x.saturating_add(w).min(self.width);
         let bottom = y.saturating_add(h).min(self.height);
+
+        if self.bytes_per_pixel == 4 {
+            // The common case, with the format decided once per call rather
+            // than once per pixel: a desktop presents whole windows.
+            for row in y..bottom {
+                // SAFETY: clipped to the surface; rows are `width` pixels in
+                // the back buffer and `pitch` bytes on the device.
+                unsafe {
+                    let src = self.shadow.add((row * self.width + x) as usize);
+                    let dst = self.base.add((row * self.pitch + x * 4) as usize).cast::<u32>();
+                    for col in 0..(right - x) as usize {
+                        core::ptr::write_volatile(dst.add(col), src.add(col).read());
+                    }
+                }
+            }
+            return;
+        }
 
         for row in y..bottom {
             // SAFETY: clipped to the surface; the back buffer's rows are

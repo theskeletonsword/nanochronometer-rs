@@ -303,6 +303,61 @@ impl<'a> Fdt<'a> {
 
     /// The value of property `name` on the first CPU node (`/cpus/cpu@…`),
     /// e.g. `riscv,isa`.
+    /// A property of `/chosen`: `bootargs` (the kernel command line QEMU's
+    /// `-append` and boot loaders put there), `linux,initrd-start` and
+    /// `-end` (QEMU's `-initrd`).
+    pub fn chosen_property(&self, name: &[u8]) -> Option<&'a [u8]> {
+        let mut depth = 0usize;
+        let mut in_chosen = false;
+        let mut found = None;
+        self.walk(|token| {
+            match token {
+                Token::Begin(node) => {
+                    depth += 1;
+                    if depth == 2 {
+                        in_chosen = node == b"chosen";
+                    }
+                }
+                Token::End => {
+                    if depth == 2 {
+                        in_chosen = false;
+                    }
+                    depth = depth.saturating_sub(1);
+                }
+                Token::Prop(prop, value) => {
+                    if in_chosen && depth == 2 && prop == name {
+                        found = Some(value);
+                        return false;
+                    }
+                }
+            }
+            true
+        })?;
+        found
+    }
+
+    /// `/chosen/bootargs` as text, without its terminating NUL.
+    pub fn bootargs(&self) -> Option<&'a str> {
+        let raw = self.chosen_property(b"bootargs")?;
+        let raw = raw.split(|&b| b == 0).next()?;
+        core::str::from_utf8(raw).ok()
+    }
+
+    /// QEMU's `-initrd` (or a loader's): `/chosen/linux,initrd-start` and
+    /// `-end`, as 32- or 64-bit big-endian cells.
+    pub fn initrd(&self) -> Option<(u64, u64)> {
+        let cell = |v: &[u8]| -> Option<u64> {
+            match v.len() {
+                4 => Some(u32::from_be_bytes(v.try_into().ok()?) as u64),
+                8 => Some(u64::from_be_bytes(v.try_into().ok()?)),
+                _ => None,
+            }
+        };
+        let start = cell(self.chosen_property(b"linux,initrd-start")?)?;
+        let end = cell(self.chosen_property(b"linux,initrd-end")?)?;
+        (end > start).then_some((start, end))
+    }
+
     pub fn cpu_property(&self, name: &[u8]) -> Option<&'a [u8]> {
         let mut depth = 0usize;
         let mut in_cpus = false;

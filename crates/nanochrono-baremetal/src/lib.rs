@@ -47,6 +47,33 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 pub mod abi;
+/// The desktop's embedded pictures: wallpapers (QOI) and icons (RGBA).
+pub mod assets;
+/// What the loader handed over for the session: the command line, the
+/// interface it asks for (`mode=`), the modules.
+pub mod boot;
+/// The full-screen text terminal and shell (`mode=cli`).
+pub mod cli;
+/// The system's settings (NCVBS, ring-0 community code, the wallpaper).
+pub mod config;
+/// The NanoChronometer Desktop Experience (`mode=desktop`).
+pub mod desktop;
+/// The terminal's monospaced face.
+pub mod fonts;
+/// Keyboard layouts: scancodes to characters (`kbd=us|es`).
+pub mod kbd;
+/// Where the kernel's memory goes, pool by pool.
+pub mod memstat;
+/// Starts the interface the command line asked for.
+pub mod session;
+/// The Unix-like shell the CLI and the desktop's terminals run.
+pub mod shell;
+/// The machine as the shell and the desktop see it.
+pub mod system;
+/// A terminal: cells, ANSI, rendering.
+pub mod term;
+/// The read-only file tree: built-in files, boot modules, /proc, /dev.
+pub mod vfs;
 /// x86 and AArch64: ACPI on one, PSCI on the other. PowerPC boards describe
 /// themselves with a device tree ([`fdt`]) and power off through firmware.
 pub mod acpi;
@@ -59,6 +86,9 @@ pub mod bench;
 /// CPU load, effective frequency and the loop's own time accounting: the
 /// data behind the task-manager view.
 pub mod cpuload;
+/// The processor-control dispatcher: which control bits are switched on,
+/// decided from CPUID / the ID registers (`nanochrono_core::cpu_control`).
+pub mod cpu_control;
 /// x86: the driver breadcrumb everywhere, and on x86-64 the `.DMP` image a
 /// fault leaves over COM1.
 #[cfg(x86_any)]

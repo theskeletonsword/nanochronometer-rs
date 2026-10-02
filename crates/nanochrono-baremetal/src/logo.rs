@@ -22,7 +22,7 @@ pub struct Image {
 impl Image {
     /// Splits the header off. `const`, so a malformed asset fails the build
     /// rather than the boot.
-    const fn parse(bytes: &'static [u8]) -> Image {
+    pub const fn parse(bytes: &'static [u8]) -> Image {
         assert!(bytes.len() >= 8, "logo asset has no header");
         let width = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
         let height = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
@@ -32,6 +32,18 @@ impl Image {
         );
         let (_, pixels) = bytes.split_at(8);
         Image { width, height, pixels }
+    }
+
+    /// The straight RGBA pixel at `(x, y)`; transparent outside the image.
+    pub fn rgba(&self, x: u32, y: u32) -> [u8; 4] {
+        if x >= self.width || y >= self.height {
+            return [0; 4];
+        }
+        let i = ((y * self.width + x) * 4) as usize;
+        match self.pixels.get(i..i + 4) {
+            Some(p) => [p[0], p[1], p[2], p[3]],
+            None => [0; 4],
+        }
     }
 }
 

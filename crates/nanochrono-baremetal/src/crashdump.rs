@@ -860,7 +860,7 @@ fn hex<const N: usize>(line: &mut crate::text::Text<N>, v: u64) {
 /// Writes `v` as 16 hex digits straight to the UART, without `core::fmt`:
 /// for the nested-fault path, which must not depend on anything that could
 /// have been the thing that faulted.
-#[cfg(target_arch = "x86_64")]
+#[cfg(x86_any)]
 pub fn raw_hex(v: u64) {
     let mut digits = [0u8; 18];
     digits[0] = b'0';
@@ -878,38 +878,50 @@ pub fn raw_hex(v: u64) {
 
 /// A fault to raise on purpose, named on the kernel command line as
 /// `crashtest=<name>`.
-#[cfg(target_arch = "x86_64")]
+#[cfg(x86_any)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CrashTest {
     /// `#DE`: `div` by zero, in assembly (Rust would check and panic).
     Divide,
-    /// `#PF`: a read at 512 GiB, the first canonical address past the boot
-    /// identity map.
+    /// `#PF`: a read past the boot identity map — at 512 GiB on x86_64, the
+    /// first canonical address the map leaves out; at 0xFFC0_0000 on i386,
+    /// the top 4 MiB its page directory leaves unmapped.
     PageFault,
-    /// `#GP`: a read through a non-canonical address.
+    /// `#GP`: on x86_64 a read through a non-canonical address; on i386 a
+    /// data segment register loaded with a selector past the GDT's limit.
     Protection,
     /// `#UD`: `ud2`.
     Invalid,
     /// `#PF` on the guard page by unbounded recursion — a stack overflow,
-    /// taken on IST2.
+    /// taken on IST2. (The i386 kernel has no guard page.)
+    #[cfg(target_arch = "x86_64")]
     StackOverflow,
-    /// `#DF`: RSP made non-canonical, then a push. The fault that raises
-    /// (`#SS` on Intel silicon, `#GP` under TCG) cannot be delivered on that
-    /// stack, so the CPU raises `#DF`, which IST1 delivers — the case that
-    /// is a triple fault without one.
+    /// `#DF`, the case that is a triple fault without a stack of its own for
+    /// it. x86_64: RSP made non-canonical, then a push — the fault that
+    /// raises (`#SS` on Intel silicon, `#GP` under TCG) cannot be delivered
+    /// on that stack, and IST1 delivers the `#DF`. i386: SS loaded with a
+    /// segment one byte long, then a push — the `#SS` cannot be delivered on
+    /// that stack either, and a task gate delivers the `#DF` on its own.
     DoubleFault,
+    /// `#XM`: an SSE division by zero with the exception unmasked in MXCSR.
+    SimdFloatingPoint,
+    /// `#MF`: an x87 0/0 with the invalid-operation exception unmasked in
+    /// the control word, reported at the next x87 instruction.
+    X87FloatingPoint,
+    /// `#NM`: an SSE instruction with CR0.TS set.
+    DeviceNotAvailable,
     /// A plain Rust `panic!`.
     Panic,
 }
 
 /// A crashtest armed on the command line, waiting to be fired once the USB
 /// dump target is in place. See [`arm_crashtest`].
-#[cfg(target_arch = "x86_64")]
+#[cfg(x86_any)]
 static mut PENDING_CRASHTEST: Option<CrashTest> = None;
 
 /// Arms a forced fault to fire later, from [`fire_pending_crashtest`]. Set
 /// once at boot, on a single core before anything can panic.
-#[cfg(target_arch = "x86_64")]
+#[cfg(x86_any)]
 pub fn arm_crashtest(test: CrashTest) {
     // SAFETY: single core, interrupts masked, called once at boot.
     unsafe { PENDING_CRASHTEST = Some(test) };
@@ -922,7 +934,7 @@ pub fn arm_crashtest(test: CrashTest) {
 /// # Safety
 /// Deliberately faults when one is armed; call only at CPL 0 with the IDT
 /// installed.
-#[cfg(target_arch = "x86_64")]
+#[cfg(x86_any)]
 pub unsafe fn fire_pending_crashtest() {
     // SAFETY: see `arm_crashtest`; single core.
     if let Some(test) = unsafe { (*core::ptr::addr_of_mut!(PENDING_CRASHTEST)).take() } {
@@ -931,7 +943,7 @@ pub unsafe fn fire_pending_crashtest() {
     }
 }
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(x86_any)]
 impl CrashTest {
     /// Finds `crashtest=<name>` in a kernel command line.
     pub fn from_command_line(line: &str) -> Option<CrashTest> {
@@ -941,8 +953,12 @@ impl CrashTest {
             "pf" => CrashTest::PageFault,
             "gp" => CrashTest::Protection,
             "ud" => CrashTest::Invalid,
+            #[cfg(target_arch = "x86_64")]
             "so" => CrashTest::StackOverflow,
             "df" => CrashTest::DoubleFault,
+            "xm" => CrashTest::SimdFloatingPoint,
+            "mf" => CrashTest::X87FloatingPoint,
+            "nm" => CrashTest::DeviceNotAvailable,
             "panic" => CrashTest::Panic,
             _ => return None,
         })
@@ -957,7 +973,15 @@ impl CrashTest {
         Driver::CrashTest.set();
         crate::println!("crashtest: raising {:?}", self);
         // PML4 entry 1: `boot32.S` fills only entry 0, the first 512 GiB.
-        const UNMAPPED: u64 = 512 << 30;
+        #[cfg(target_arch = "x86_64")]
+        const UNMAPPED: usize = 512 << 30;
+        #[cfg(target_arch = "x86")]
+        const UNMAPPED: usize = 0xFFC0_0000;
+        // MXCSR's default with the divide-by-zero mask (ZM, bit 9) clear, and
+        // the x87 control word's with the invalid-operation mask (IM, bit 0)
+        // clear: 0/0 is invalid whichever way the operands are taken.
+        let mxcsr: u32 = 0x1F80 & !(1 << 9);
+        let fcw: u16 = 0x037F & !1;
         // SAFETY: every arm faults on purpose; the handler never returns.
         unsafe {
             match self {
@@ -966,18 +990,58 @@ impl CrashTest {
                     out("eax") _, out("ecx") _, out("edx") _, options(nomem, nostack),
                 ),
                 CrashTest::PageFault => {
-                    let _ = core::ptr::read_volatile(UNMAPPED as *const u64);
+                    let _ = core::ptr::read_volatile(UNMAPPED as *const u32);
                 }
+                #[cfg(target_arch = "x86_64")]
                 CrashTest::Protection => {
                     let _ = core::ptr::read_volatile(0x8000_0000_0000_0000u64 as *const u64);
                 }
+                #[cfg(target_arch = "x86")]
+                CrashTest::Protection => core::arch::asm!(
+                    "mov ds, {sel:x}",
+                    sel = in(reg) 0xFFF8u32, options(nomem, nostack),
+                ),
                 CrashTest::Invalid => core::arch::asm!("ud2", options(nomem, nostack)),
+                #[cfg(target_arch = "x86_64")]
                 CrashTest::StackOverflow => {
                     recurse(0);
                 }
+                #[cfg(target_arch = "x86_64")]
                 CrashTest::DoubleFault => core::arch::asm!(
                     "mov rsp, {bad}", "push rax",
                     bad = in(reg) 0x8000_0000_0000_0000u64, options(nomem),
+                ),
+                // 0x28: the one-byte stack segment boot_i386.S keeps for this.
+                #[cfg(target_arch = "x86")]
+                CrashTest::DoubleFault => core::arch::asm!(
+                    "mov ss, {sel:x}", "push eax",
+                    sel = in(reg) 0x28u32, options(nomem),
+                ),
+                CrashTest::SimdFloatingPoint => core::arch::asm!(
+                    "ldmxcsr [{m}]",
+                    "xorps xmm0, xmm0",
+                    "movd xmm1, {one:e}",
+                    "divss xmm1, xmm0",
+                    m = in(reg) &mxcsr,
+                    one = in(reg) 0x3F80_0000u32, // 1.0
+                    out("xmm0") _, out("xmm1") _, options(nostack),
+                ),
+                CrashTest::X87FloatingPoint => core::arch::asm!(
+                    "fninit",
+                    "fldcw [{cw}]",
+                    "fldz",
+                    "fldz",
+                    "fdivp st(1), st(0)",
+                    "fwait",
+                    cw = in(reg) &fcw,
+                    out("st(0)") _, out("st(1)") _, options(nostack),
+                ),
+                CrashTest::DeviceNotAvailable => core::arch::asm!(
+                    "mov {t}, cr0",
+                    "or {t}, 8", // CR0.TS
+                    "mov cr0, {t}",
+                    "xorps xmm0, xmm0",
+                    t = out(reg) _, out("xmm0") _, options(nomem, nostack),
                 ),
                 CrashTest::Panic => panic!("crashtest: a deliberate panic"),
             }

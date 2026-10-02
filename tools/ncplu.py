@@ -1,18 +1,25 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
-"""Packs a position-independent shared object into a NanoChronometer `.ncplu`
-plugin, and inspects one.
+"""Packs position-independent shared objects into NanoChronometer modules and
+packages, and inspects them.
 
 The kernel loader (crates/nanochrono-baremetal/src/ncplu.rs) has no ELF
 parser and no dynamic linker: it copies flat sections into a fixed arena and
-applies a tiny set of relocations. This turns a `.so` built for the
-`x86_64-nanochrono-none-dylib` target into exactly that flat form.
+applies a tiny set of relocations. This turns a `.so` built for a
+`<arch>-nanochrono-none-dylib` target into exactly that flat form — one
+`.ncapp` per architecture (an app), a `.ncdri` (driver) or an `.nsdyn`
+(shared library) — and bundles one of each into a `.ncplu` package:
 
-    tools/ncplu.py pack libsnake.so -o SNAKE.NCPLU
-    tools/ncplu.py dump SNAKE.NCPLU
+    tools/ncplu.py pack libsnake.so -o snake.x86_64.ncapp
+    tools/ncplu.py pack libsnake-arm.so -o snake.aarch64.ncapp --arch aarch64
+    tools/ncplu.py pack-pkg --manifest snake/MANIFEST -o SNAKE.NCPLU \
+        --entry x86_64:app:snake.x86_64.ncapp:snake.x86_64.ncapp \
+        --entry aarch64:app:snake.aarch64.ncapp:snake.aarch64.ncapp
+    tools/ncplu.py dump-pkg SNAKE.NCPLU
 
-Signing (`--sign`, ML-DSA-87 + P-521) is phase 2; an unsigned plugin loads as
-"community". The layout here is matched byte for byte by ncplu.rs.
+Signing (`--sign`, ML-DSA-87 + P-521) is phase 2; an unsigned module loads as
+"community". The layouts here are matched byte for byte by ncplu.rs (modules)
+and ncpkg.rs (packages).
 """
 
 import argparse
@@ -72,6 +79,35 @@ def parse_caps(spec: str) -> int:
             raise SystemExit(f"unknown capability {name!r}; known: {', '.join(CAP_BITS)}, all, none")
         mask |= CAP_BITS[name]
     return mask
+# Architecture and module-kind codes, in step with
+# crates/nanochrono-core/src/ncplu.rs (Arch, Kind: H_ARCH at 152, H_KIND
+# at 154). Zero is x86-64 / app, so modules packed before either field
+# existed already read correctly.
+ARCHES = {
+    "x86_64": 0, "x64": 0,
+    "i386": 1, "x86": 1,
+    "aarch64": 2, "arm64": 2,
+    "arm32": 3, "arm": 3,
+    "riscv64": 4, "riscv32": 5,
+    "ppc64": 6, "ppc64le": 7, "ppc": 8,
+}
+ARCH_NAMES = {
+    0: "x86_64", 1: "i386", 2: "aarch64", 3: "arm32", 4: "riscv64",
+    5: "riscv32", 6: "ppc64", 7: "ppc64le", 8: "ppc",
+}
+KINDS = {"app": 0, "driver": 1, "library": 2}
+KIND_NAMES = {0: "app", 1: "driver", 2: "library"}
+# The extension each kind ships as: .ncapp (one app, one architecture),
+# .ncdri (driver), .nsdyn (shared library in /usr/lib or inside a package).
+KIND_EXTENSIONS = {0: ".ncapp", 1: ".ncdri", 2: ".nsdyn"}
+
+# The package container (.ncplu holding one .ncapp per architecture),
+# in step with crates/nanochrono-core/src/ncpkg.rs.
+PKG_MAGIC = b"NCPKG\x1b\0\0"
+PKG_FORMAT_VERSION = 1
+PKG_ABI_VERSION = ABI_VERSION
+PKG_HEADER_SIZE = 128
+PKG_ENTRY_SIZE = 40
 FNV_PRIME = 0x100000001B3
 
 
@@ -212,7 +248,7 @@ def section_kind_flags(s: Section):
     return SECTION_RODATA, MF_R
 
 
-def pack(elf: Elf, entry: str, caps: int = CAP_ALL) -> bytes:
+def pack(elf: Elf, entry: str, caps: int = CAP_ALL, arch: str = "x86_64", kind: str = "app") -> bytes:
     # Allocated sections become the plugin's memory image, each kept at the
     # virtual address the linker gave it (the .so is linked at base 0, so the
     # address is the offset within the image). TLS is not supported.
@@ -361,9 +397,156 @@ def pack(elf: Elf, entry: str, caps: int = CAP_ALL) -> bytes:
     struct.pack_into("<I", body, 80, arena_size)
     struct.pack_into("<I", body, 84, caps)  # capabilities (FLAG_HAS_CAPS set)
 
+    struct.pack_into("<I", body, 80, arena_size)
+    struct.pack_into("<I", body, 84, caps)  # capabilities (FLAG_HAS_CAPS set)
+    try:
+        arch_code = ARCHES[arch.lower()]
+    except KeyError:
+        raise ValueError(f"unknown architecture {arch!r}; known: {', '.join(sorted(set(ARCHES)))}")
+    try:
+        kind_code = KINDS[kind.lower()]
+    except KeyError:
+        raise ValueError(f"unknown kind {kind!r}; known: app, driver, library")
+    struct.pack_into("<HH", body, 152, arch_code, kind_code)
+
     struct.pack_into("<64s", body, 88, signed_digest(body, signature_off))
 
     return bytes(body)
+
+
+# ---------------------------------------------------------------------------
+# The package container: one .ncplu holding one module per architecture
+# ---------------------------------------------------------------------------
+
+
+def pkg_signed_digest(image: bytes, sig_off: int) -> bytes:
+    """SHA-512 of the package up to the signature block, with the header's
+    own digest field (offset 52..116) taken as zero — the container's
+    version of signed_digest above."""
+    body = bytearray(image[:sig_off])
+    body[52:116] = b"\0" * 64
+    return hashlib.sha512(bytes(body)).digest()
+
+
+def pack_pkg(manifest: str, entries: list) -> bytes:
+    """Assemble a `.ncplu` package container.
+
+    `manifest` is the `key: value` text the kernel parses (title, version
+    and license required; creator and description optional). `entries` is a
+    list of (arch, kind, name, module_bytes): one `.ncapp` per architecture,
+    the `.nsdyn` libraries they share, and assets. Returns the file bytes.
+    """
+    man = manifest.encode("utf-8")
+    if not (0 < len(man) <= 4096):
+        raise ValueError("manifest must be 1..4096 bytes")
+    need = {"title": False, "version": False, "license": False}
+    for line in manifest.split("\n"):
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if ":" not in line:
+            raise ValueError(f"manifest line without a colon: {line!r}")
+        key, _, value = line.partition(":")
+        key, value = key.strip(), value.strip()
+        if key not in ("title", "version", "license", "creator", "description"):
+            raise ValueError(f"manifest key {key!r}: want title, version, license, creator, description")
+        if not value or len(value) > 256:
+            raise ValueError(f"manifest key {key!r}: value must be 1..256 chars")
+        if key in need:
+            need[key] = True
+    missing = [k for k, v in need.items() if not v]
+    if missing:
+        raise ValueError(f"manifest is missing: {', '.join(missing)}")
+    if len(entries) == 0 or len(entries) > 16:
+        raise ValueError("a package holds 1..16 entries")
+
+    names = bytearray()
+    blobs = []
+    table = []
+    for arch, kind, name, blob in entries:
+        try:
+            arch_code = ARCHES[arch.lower()]
+        except KeyError:
+            raise ValueError(f"unknown architecture {arch!r}")
+        try:
+            kind_code = KINDS[kind.lower()]
+        except KeyError:
+            raise ValueError(f"unknown kind {kind!r}; known: app, driver, library")
+        nb = name.encode("utf-8")
+        if not (0 < len(nb) <= 128):
+            raise ValueError(f"entry name {name!r}: must be 1..128 bytes")
+        name_off = len(names)
+        names.extend(nb)
+        blobs.append(bytes(blob))
+        table.append((arch_code, kind_code, name_off, len(nb)))
+
+    body = bytearray(b"\0" * PKG_HEADER_SIZE)
+    entries_off = len(body)
+    body += b"\0" * (len(table) * PKG_ENTRY_SIZE)
+    manifest_off = len(body)
+    body += man
+    while len(body) % 8:
+        body.append(0)
+    strings_off = len(body)
+    body += names
+    while len(body) % 8:
+        body.append(0)
+    payloads = []
+    for blob in blobs:
+        payloads.append(len(body))
+        body += blob
+        while len(body) % 8:
+            body.append(0)
+    signature_off = len(body)
+    body += b"\0" * SIGNATURE_LEN
+    total_size = len(body)
+
+    for i, (arch_code, kind_code, name_off, name_len) in enumerate(table):
+        at = entries_off + i * PKG_ENTRY_SIZE
+        struct.pack_into("<HHI", body, at, arch_code, kind_code, 0)
+        struct.pack_into("<QQ", body, at + 8, payloads[i], len(blobs[i]))
+        struct.pack_into("<II", body, at + 24, strings_off + name_off, name_len)
+
+    struct.pack_into("<8s", body, 0, PKG_MAGIC)
+    struct.pack_into("<HH", body, 8, PKG_FORMAT_VERSION, PKG_HEADER_SIZE)
+    struct.pack_into("<I", body, 12, 0)  # flags
+    struct.pack_into("<Q", body, 16, total_size)
+    struct.pack_into("<I", body, 24, PKG_ABI_VERSION)
+    struct.pack_into("<II", body, 28, manifest_off, len(man))
+    struct.pack_into("<II", body, 36, entries_off, len(table))
+    struct.pack_into("<II", body, 44, signature_off, SIGNATURE_LEN)
+    struct.pack_into("<II", body, 116, strings_off, len(names))
+    struct.pack_into("<64s", body, 52, pkg_signed_digest(body, signature_off))
+
+    return bytes(body)
+
+
+def dump_pkg(data: bytes):
+    if data[:8] != PKG_MAGIC:
+        sys.exit("not an .ncplu package (bad magic)")
+    (fmt, hsize) = struct.unpack_from("<HH", data, 8)
+    (flags,) = struct.unpack_from("<I", data, 12)
+    (total,) = struct.unpack_from("<Q", data, 16)
+    (abi,) = struct.unpack_from("<I", data, 24)
+    man_off, man_len = struct.unpack_from("<II", data, 28)
+    ent_off, ent_n = struct.unpack_from("<II", data, 36)
+    sig_off, sig_len = struct.unpack_from("<II", data, 44)
+    digest = data[52:116]
+    actual = pkg_signed_digest(data, sig_off)
+    str_off, str_len = struct.unpack_from("<II", data, 116)
+    print(f"package format {fmt}  abi {abi}  flags {flags:#x}  total {total}")
+    print(f"digest {'ok' if actual == digest else 'MISMATCH'}  signature {sig_len} bytes")
+    print("manifest:")
+    for line in data[man_off:man_off + man_len].decode("utf-8", "replace").split("\n"):
+        print(f"  {line}")
+    strings = data[str_off:str_off + str_len]
+    print(f"entries ({ent_n}):")
+    for i in range(ent_n):
+        at = ent_off + i * PKG_ENTRY_SIZE
+        arch, kind, _, off, size = struct.unpack_from("<HHIQQ", data, at)
+        no, nl = struct.unpack_from("<II", data, at + 24)
+        name = strings[no - str_off:no - str_off + nl].decode("utf-8", "replace")
+        print(f"  {ARCH_NAMES.get(arch, arch):8} {KIND_NAMES.get(kind, kind):7} {size:8}  {name}")
 
 
 # ---------------------------------------------------------------------------
@@ -388,11 +571,13 @@ def dump(data: bytes):
     (caps,) = struct.unpack_from("<I", data, 84)
     digest = data[88:152]
     actual = signed_digest(data, sig_off)
+    (arch, kind) = struct.unpack_from("<HH", data, 152)
 
     cap_names = "all" if (flags & FLAG_HAS_CAPS and caps == CAP_ALL) else (
         ",".join(n for n, bmask in CAP_BITS.items() if caps & bmask) or "none"
     ) if flags & FLAG_HAS_CAPS else "all (unset)"
     print(f"format {fmt}  abi {abi}  flags {flags:#x}  total {total}  arena {arena}  caps {cap_names}")
+    print(f"arch {ARCH_NAMES.get(arch, arch)}  kind {KIND_NAMES.get(kind, kind)}")
     print(f"digest {'ok' if actual == digest else 'MISMATCH'}  signature {sig_len} bytes")
     strings = data[str_off:str_off + str_len]
 
@@ -427,25 +612,58 @@ def dump(data: bytes):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
-    pk = sub.add_parser("pack", help="turn a .so into a .ncplu")
+    pk = sub.add_parser("pack", help="turn a .so into a module (.ncapp, .ncdri, .nsdyn)")
     pk.add_argument("shared_object")
     pk.add_argument("-o", "--output", required=True)
     pk.add_argument("--entry", default="ncplu_main")
     pk.add_argument("--caps", default="all",
                     help="capabilities the plugin may use: 'all', 'none', or a comma "
                          "list of screen,input,log,timer,pmu,rng")
-    dp = sub.add_parser("dump", help="inspect a .ncplu")
+    pk.add_argument("--arch", default="x86_64",
+                    help="architecture the module was built for (default x86_64)")
+    pk.add_argument("--kind", default="app",
+                    help="what the module is: app, driver or library (default app)")
+    dp = sub.add_parser("dump", help="inspect a module (.ncapp, .ncdri, .nsdyn, .ncplu)")
     dp.add_argument("ncplu")
+    pp = sub.add_parser("pack-pkg", help="assemble a .ncplu package from modules")
+    pp.add_argument("--manifest", required=True,
+                    help="a text file with title:, version: and license: lines "
+                         "(creator: and description: optional)")
+    pp.add_argument("--entry", action="append", default=[], metavar="ARCH:KIND:NAME:PATH",
+                    help="one module per architecture, e.g. x86_64:app:snake.x86_64.ncapp:snake.so.ncapp; "
+                         "repeat for every architecture")
+    pp.add_argument("-o", "--output", required=True)
+    dg = sub.add_parser("dump-pkg", help="inspect a .ncplu package")
+    dg.add_argument("package")
     args = ap.parse_args()
 
     if args.cmd == "pack":
         with open(args.shared_object, "rb") as f:
             elf = Elf(f.read())
-        out = pack(elf, args.entry, parse_caps(args.caps))
+        out = pack(elf, args.entry, parse_caps(args.caps), args.arch, args.kind)
         with open(args.output, "wb") as f:
             f.write(out)
         print(f"{args.output}: {len(out)} bytes")
         dump(out)
+    elif args.cmd == "pack-pkg":
+        with open(args.manifest) as f:
+            manifest = f.read()
+        entries = []
+        for spec in args.entry:
+            try:
+                arch, kind, name, path = spec.split(":", 3)
+            except ValueError:
+                sys.exit(f"entry {spec!r}: want ARCH:KIND:NAME:PATH")
+            with open(path, "rb") as f:
+                entries.append((arch, kind, name, f.read()))
+        out = pack_pkg(manifest, entries)
+        with open(args.output, "wb") as f:
+            f.write(out)
+        print(f"{args.output}: {len(out)} bytes")
+        dump_pkg(out)
+    elif args.cmd == "dump-pkg":
+        with open(args.package, "rb") as f:
+            dump_pkg(f.read())
     else:
         with open(args.ncplu, "rb") as f:
             dump(f.read())

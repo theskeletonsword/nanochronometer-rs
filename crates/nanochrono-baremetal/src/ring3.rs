@@ -182,10 +182,9 @@ unsafe fn set_bit(entry: *mut u64, bit: u64, on: bool) {
 /// # Safety
 /// Ring 0.
 unsafe fn flush_tlb() {
-    // SAFETY: reloading CR3 is valid at ring 0 and flushes the TLB.
-    unsafe {
-        core::arch::asm!("mov {t}, cr3", "mov cr3, {t}", t = out(reg) _, options(nostack, preserves_flags));
-    }
+    // SAFETY: ring 0. The user bit changes on pages the boot map marks
+    // global, which a CR3 reload alone would leave cached.
+    unsafe { crate::arch::x86::flush_tlb_all() };
 }
 
 /// Grants (or, with `user = false`, revokes) ring-3 access to every 2 MiB page
@@ -235,6 +234,17 @@ fn user_shared() -> (usize, usize) {
 static mut NC_R3_KERNEL_RSP: u64 = 0;
 static mut NC_R3_USER_RSP: u64 = 0;
 static mut NC_R3_SYSSTACK_TOP: u64 = 0;
+/// The kernel's MXCSR and x87 control word, saved by `nc_ring3_enter`, and
+/// the plugin's, saved across each syscall. `ldmxcsr` and `fldcw` are not
+/// privileged: a plugin can unmask a floating-point exception or change the
+/// rounding, and kernel code running with its settings — the syscall
+/// dispatch, or everything after the run — would take #XM or #MF on an
+/// ordinary division by zero. So the kernel's go back in on every entry to
+/// it, and the plugin's on every return to ring 3.
+static mut NC_R3_KERNEL_MXCSR: u32 = 0;
+static mut NC_R3_KERNEL_FCW: u16 = 0;
+static mut NC_R3_USER_MXCSR: u32 = 0;
+static mut NC_R3_USER_FCW: u16 = 0;
 static NC_R3_RESULT: AtomicU64 = AtomicU64::new(0);
 /// Set when the run must end (EXIT, an unknown call, or a fault) rather than
 /// return to ring 3.
@@ -249,6 +259,8 @@ core::arch::global_asm!(
     "push r13",
     "push r14",
     "push r15",
+    "stmxcsr [rip + {kmxcsr}]",
+    "fnstcw [rip + {kfcw}]",
     "mov [rip + {krsp}], rsp",
     "push {user_ss}",
     "push rsi",                // user stack pointer (return address already on it)
@@ -264,6 +276,11 @@ core::arch::global_asm!(
     ".global nc_ring3_return",
     "nc_ring3_return:",
     "mov rsp, [rip + {krsp}]",
+    // Whatever the plugin left in the x87 unit — values on its stack, an
+    // unmasked exception pending — goes, and the kernel's settings return.
+    "fninit",
+    "ldmxcsr [rip + {kmxcsr}]",
+    "fldcw [rip + {kfcw}]",
     "mov rax, [rip + {result}]",
     "pop r15",
     "pop r14",
@@ -273,6 +290,8 @@ core::arch::global_asm!(
     "pop rbp",
     "ret",
     krsp = sym NC_R3_KERNEL_RSP,
+    kmxcsr = sym NC_R3_KERNEL_MXCSR,
+    kfcw = sym NC_R3_KERNEL_FCW,
     result = sym NC_R3_RESULT,
     user_ss = const USER_SS,
     user_cs = const USER_CS,
@@ -285,6 +304,10 @@ core::arch::global_asm!(
     "mov rsp, [rip + {systop}]",
     "push rcx",                // user RIP  (SYSRET needs it)
     "push r11",                // user RFLAGS
+    "stmxcsr [rip + {umxcsr}]", // the plugin's float settings out, the kernel's in
+    "fnstcw [rip + {ufcw}]",
+    "ldmxcsr [rip + {kmxcsr}]",
+    "fldcw [rip + {kfcw}]",
     "mov r9, r8",              // shuffle to System V: dispatch(num,a1,a2,a3,a4,a5)
     "mov r8, r10",
     "mov rcx, rdx",
@@ -295,6 +318,8 @@ core::arch::global_asm!(
     "mov rcx, [rip + {unwind}]",
     "test rcx, rcx",
     "jnz 2f",
+    "ldmxcsr [rip + {umxcsr}]",
+    "fldcw [rip + {ufcw}]",
     "pop r11",
     "pop rcx",
     "mov rsp, [rip + {ursp}]",
@@ -304,6 +329,10 @@ core::arch::global_asm!(
     "jmp nc_ring3_return",
     ursp = sym NC_R3_USER_RSP,
     systop = sym NC_R3_SYSSTACK_TOP,
+    kmxcsr = sym NC_R3_KERNEL_MXCSR,
+    kfcw = sym NC_R3_KERNEL_FCW,
+    umxcsr = sym NC_R3_USER_MXCSR,
+    ufcw = sym NC_R3_USER_FCW,
     dispatch = sym dispatch,
     unwind = sym NC_R3_UNWIND,
     result = sym NC_R3_RESULT,
