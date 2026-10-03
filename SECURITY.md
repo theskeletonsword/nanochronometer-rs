@@ -20,14 +20,23 @@ to hear about it, and I will not treat you as an adversary for looking.
 **Please do not open a public issue, pull request or discussion for a
 security problem.**
 
-Report it privately to the maintainer through GitHub:
+Report it privately to the maintainer through either channel:
 
-> **<https://github.com/theskeletonsword/nanochronometer-rs/security/advisories/new>**
+| Channel | Where |
+|---|---|
+| **Signal** | **`@theskeletonsword.46`** |
+| **GitHub private advisory** | <https://github.com/theskeletonsword/nanochronometer-rs/security/advisories/new> (Repository → *Security* → *Report a vulnerability*) |
 
-(Repository → *Security* → *Report a vulnerability*.) Only the maintainer sees
-the report. If that form is unavailable to you, open an issue that says only
-"security contact requested", with no details, and you will be given a private
-channel.
+Both are private; only the maintainer sees the report. Signal is end-to-end
+encrypted, so use it for anything sensitive — a working exploit, a signing
+key, a crash dump with memory contents.
+
+**These are the only channels for vulnerabilities.** Social-media accounts
+(Instagram, TikTok and the like) are not, even where the maintainer has
+one: reports sent there will not be handled, and their messages are not
+end-to-end encrypted. Do not put vulnerability details in a public issue
+either; if neither channel above works for you, open an issue that says only
+"security contact requested", with no details.
 
 Any vulnerability is welcome, however small or theoretical it looks. A useful
 report includes:

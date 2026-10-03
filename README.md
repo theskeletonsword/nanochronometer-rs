@@ -1691,8 +1691,10 @@ declare and the migration had dropped.
 
 ## Security
 
-Report vulnerabilities privately — see [`SECURITY.md`](SECURITY.md), which also
-sets out the safe harbour for good-faith research.
+Report vulnerabilities privately — on Signal to **`@theskeletonsword.46`**, or
+through a GitHub private security advisory. Not through social media and not in
+public issues. [`SECURITY.md`](SECURITY.md) has the details and the safe harbor
+for good-faith research.
 
 ---
 
