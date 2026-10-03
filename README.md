@@ -1698,7 +1698,9 @@ Report vulnerabilities privately on Signal to **`@theskeletonsword.46`** (or, if
 there is no answer, through a GitHub private security advisory), with a
 reproducible proof of concept and demonstrable impact, scored with CVSS 4.0.
 Those two channels only — no other service — and not in public issues.
-Low, informational and cosmetic findings are welcome too. [`SECURITY.md`](SECURITY.md) has
+Low, informational and cosmetic findings are welcome too; Low and above make
+you a contributor. Nothing goes public — social networks included — until the
+patch is out. It is a disclosure policy, not a bug bounty. [`SECURITY.md`](SECURITY.md) has
 the details, the rules and the safe harbor for good-faith research.
 
 ---

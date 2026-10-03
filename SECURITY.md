@@ -110,15 +110,51 @@ the same way. They are fixed and credited like the rest.
 - **Acknowledgement** within 7 days.
 - **Assessment** — whether it reproduces and how severe it is — within 14
   days, and updates at least every 14 days after that until it is closed.
-- **Fix and disclosure**: coordinated with you. The target is a fix within 90
-  days of the report; if it needs longer, we agree on a date together. A
-  GitHub Security Advisory is published with the fix, and a CVE requested
-  where one applies.
-- **Credit** in the advisory and the release notes, under the name or handle
-  you choose — or none, if you prefer to stay anonymous.
+- **Fix**: the target is a fix within 90 days of the report; if it needs
+  longer, you are told why and given a date. A GitHub Security Advisory is
+  published with the fix, and a CVE requested where one applies.
+- **Disclosure**: once the patch is released, the vulnerability is yours to
+  publish — write-up, talk, video, posts, all of it. Not before (see
+  *Embargo* below).
+- **Credit** — see *Credit and contributor status* below.
 
-This is a project maintained by one person, not a company: there is no bug
-bounty, but every report gets a real answer.
+## Embargo: nothing public before the patch
+
+From the moment you find a vulnerability until the patch is released and
+its advisory is published, **publishing it anywhere is strictly
+forbidden**. That means no post, story, reel, video, stream, thread or
+message about it on any social network — X/Twitter, Instagram, TikTok,
+YouTube, Twitch, Discord servers, Telegram channels, Reddit, Mastodon,
+Bluesky, Threads, LinkedIn, Facebook or anything else — and no blog, gist,
+pastebin, forum, public issue or pull request, talk, CTF, mailing list or
+paper either. Teasers count: "found a 0-day in NanoChronometer, details
+soon" with a screenshot is a disclosure. Do not share it privately with
+anyone outside the report either, and never sell or hand it to a broker.
+
+After the patch: publish freely, and please link the advisory.
+
+The one exception is a maintainer who has gone silent: if neither Signal
+nor the GitHub advisory has had any answer at all for 90 days after the
+report, the embargo lapses — tell me on both channels 14 days before you
+publish.
+
+**Breaking the embargo** has consequences, and they are real ones:
+
+- **The safe harbor no longer applies to you.** Your research stops being
+  authorized under this policy, and the promises in *Safe harbor* below —
+  no legal action, no report to any authority, standing up for you if a
+  third party complains — are withdrawn for that research. What the law
+  says about how you got there is then between you and the law.
+- **No credit and no contributor status** for that finding, and no entry in
+  the advisory under your name.
+- **You may be blocked** from the repository and the project's channels,
+  and future reports or contributions from you may be refused.
+- The fix is shipped as fast as possible and the advisory published at
+  once, without waiting for you.
+- Any other remedy the law gives the maintainer stays available. The
+  Apache-2.0 licence lets you use, study and modify the code; it does not
+  authorise breaking an embargo you agreed to by reporting, and it is not a
+  shield for anything done to systems that are not yours.
 
 ## Scope
 
@@ -155,6 +191,9 @@ repository and the release assets built from it. In particular:
 - the host tools (`tools/`), the signing tools, and the build and packaging
   scripts — including anything that would let a published artifact differ
   from what its source and `SHA256SUMS` say;
+- **NCFS**: the on-disk format, its parsers and the `tools/ncfs` FUSE mount
+  — the recommended way to audit NCFS images from Linux without booting the
+  kernel — and the `ncfs` filesystem type in the Linux module once it lands;
 - cosmetic and informational issues (see *Severity* above).
 
 Out of scope:
@@ -173,6 +212,33 @@ Out of scope:
   friends, or the project's contributors — these are not findings, they are
   forbidden (see the rules below).
 
+## Credit and contributor status
+
+| Finding | What you get |
+|---|---|
+| **Low or above** (CVSS 4.0 from 0.1 up) | Credit in the advisory and the release notes, **and you are added as a contributor to NanoChronometer** |
+| Informational or cosmetic (CVSS 0.0) | Thanks in the release notes; not contributor status |
+
+Credit uses the name or handle you choose — or none, if you prefer to stay
+anonymous. Both require following this policy, the embargo included.
+
+## A vulnerability disclosure policy, not a bug bounty
+
+This file is NanoChronometer's **vulnerability disclosure policy (VDP)**. It
+is not a bug bounty: this is a project maintained by one person, there is
+no money, and none is promised. What there is: a real answer to every
+report, credit, contributor status, and the safe harbor below.
+
+Reporting here is enough. **You do not need to notify any agency or CSIRT**
+about a vulnerability in NanoChronometer — not Chile's ANCI (Agencia
+Nacional de Ciberseguridad) or its CSIRT, not CISA, CERT/CC, ENISA, INCIBE,
+the NCSC or any other — and please do not send them the details while the
+embargo runs. The maintainer requests CVEs (through GitHub's CNA) and, if a
+fix ever needs it, coordinates with a CSIRT. Duties the law places on you
+yourself are unaffected: an operator of essential services whose own
+systems suffer an incident still reports it as Chile's Ley 21.663, NIS2 or
+its own law requires.
+
 ## Safe harbor
 
 Security research done in good faith under this policy is **authorized**.
@@ -189,7 +255,49 @@ For research that follows the rules below:
 - If someone else brings an action against you over research that followed
   this policy, I will make it known that your work was authorized.
 - You are not expected to be perfect: an accidental, promptly reported
-  departure from these rules does not void the safe harbor.
+  departure from these rules does not void the safe harbor. Breaking the
+  embargo is not an accident (see *Embargo* above).
+
+### The legal frameworks this authorization is written for
+
+- **The Budapest Convention** — the Council of Europe Convention on
+  Cybercrime (ETS No. 185, 2001), to which Chile has been a party since
+  2017. Its offences — illegal access, illegal interception, data and
+  system interference (Articles 2–5) — are committed *without right*; this
+  policy is the right-holder's authorization, so research that follows it
+  is done *with right* as far as NanoChronometer is concerned. Writing and
+  keeping a proof of concept for authorized testing is what Article 6(2)
+  leaves outside the misuse-of-devices offence.
+- **The United Nations Convention against Cybercrime** (adopted by the
+  General Assembly in 2024), whose core offences are built the same way.
+- **National laws** that implement or parallel them, among others: Chile's
+  **Ley 21.459** on computer crime (which brought Chilean law in line with
+  the Budapest Convention), the U.S. **Computer Fraud and Abuse Act**, the
+  EU's **Directive 2013/40/EU** on attacks against information systems, the
+  UK's **Computer Misuse Act 1990**, and anti-circumvention rules such as
+  **DMCA §1201** and its security-research exemption.
+- **Coordinated vulnerability disclosure** as described by **ISO/IEC 29147**
+  and **ISO/IEC 30111**, the EU's **NIS2 Directive** (Article 12) and the
+  **Cyber Resilience Act** — this policy follows that model.
+
+### Personal data, and children's data above all
+
+NanoChronometer is not built to collect personal data, and research on it
+should never need any. If it ever touches some anyway:
+
+- **GDPR** (Regulation (EU) 2016/679) and data-protection laws like it —
+  Chile's **Ley 19.628** and **Ley 21.719** that reforms it, among others:
+  stop as soon as you see personal data, access no more than the minimum
+  that proves the issue, keep no copy, redact it from your report and
+  attachments, delete what you have once the report is in, and say in the
+  report that it happened.
+- **COPPA** (the U.S. Children's Online Privacy Protection Act) and GDPR's
+  rules on children (Article 8): if the data may belong to a child, stop
+  **immediately** — do not open, copy, keep or forward any of it — and tell
+  me at once. That is never a detail to demonstrate impact with.
+
+The safe harbor does not cover collecting, keeping or sharing personal
+data; it cannot, since that data is not the maintainer's to authorize.
 
 The rules:
 
@@ -199,9 +307,9 @@ The rules:
    across someone else's data, stop, and tell me in your report.
 3. Do not degrade services or systems that belong to others, and do not
    leave persistence or backdoors anywhere.
-4. Report promptly, and give a reasonable chance to fix the issue before
-   any public disclosure — by default the 90-day window above, or the date
-   we agree on.
+4. Report promptly, and **keep the embargo**: nothing public — on social
+   networks or anywhere else — until the patch is released (see *Embargo*
+   above).
 5. Do not use a vulnerability for anything beyond what you need to
    demonstrate it.
 6. **No DoS or DDoS** against other people: their machines, networks or
