@@ -20,24 +20,31 @@ to hear about it, and I will not treat you as an adversary for looking.
 **Please do not open a public issue, pull request or discussion for a
 security problem.**
 
-Report it privately to the maintainer on **Signal**, and only there:
+Report it privately to the maintainer through one of these two channels:
 
-> **Signal: `@theskeletonsword.46`**
+| Channel | Where |
+|---|---|
+| **Signal** (preferred) | **`@theskeletonsword.46`** |
+| **GitHub private advisory** | <https://github.com/theskeletonsword/nanochronometer-rs/security/advisories/new> (Repository → *Security* → *Report a vulnerability*) |
 
 Signal is end-to-end encrypted, which is what a working exploit, a signing
-key or a crash dump with memory contents deserve.
+key or a crash dump with memory contents deserve. The GitHub form is the
+backup: if I am busy with other things and do not answer on Signal, the
+report waits there in a private advisory only the maintainer sees, and it is
+picked up as soon as I am back. Either channel is fine; you do not need to
+send the same report to both.
 
-### Signal, and nothing else, for vulnerabilities
+### Signal or GitHub, and nothing else, for vulnerabilities
 
 I talk to friends and other contributors on Telegram, Instagram and TikTok —
 to send memes and have fun, not to receive vulnerability reports. Those are
 personal spaces, and a report does not belong in them: Telegram's ordinary
 chats are not end-to-end encrypted, and neither are Instagram's or TikTok's
 messages. A vulnerability sent through any of them **will not be handled**;
-you will be asked to send it again on Signal. Memes are still welcome there.
+you will be asked to send it again on Signal or through GitHub. Memes are still welcome there.
 
 Do not put vulnerability details in a public issue, pull request or
-discussion either. If you cannot use Signal, open an issue that says only
+discussion either. If you can use neither channel, open an issue that says only
 "security contact requested", with no details, and we will work it out.
 
 ### What a report must include
@@ -146,11 +153,11 @@ The rules:
 7. **No social engineering** — no phishing, pretexting, impersonation or
    pressure — against the maintainer, the maintainer's personal friends, or
    the project's contributors.
-8. **Report on Signal only.** Not on Instagram, Telegram or TikTok (see
-   above).
+8. **Report on Signal or through a GitHub private advisory only.** Not on
+   Instagram, Telegram or TikTok (see above).
 
 This safe harbor covers only the NanoChronometer project and what the
 maintainer controls. It cannot bind third parties — the owners of hardware,
 networks or services you test on, or the authors of dependencies — and it
 does not override the law where you are. If you are unsure whether something
-you plan to do is covered, ask first on Signal.
+you plan to do is covered, ask first on Signal or through GitHub.

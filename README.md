@@ -1691,7 +1691,8 @@ declare and the migration had dropped.
 
 ## Security
 
-Report vulnerabilities privately on Signal to **`@theskeletonsword.46`**, with a
+Report vulnerabilities privately on Signal to **`@theskeletonsword.46`** (or, if
+there is no answer, through a GitHub private security advisory), with a
 reproducible proof of concept and demonstrable impact. Not on Instagram,
 Telegram or TikTok, and not in public issues. [`SECURITY.md`](SECURITY.md) has
 the details, the rules and the safe harbor for good-faith research.
