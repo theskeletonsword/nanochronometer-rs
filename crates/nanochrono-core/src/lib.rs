@@ -104,6 +104,11 @@ pub mod kernels;
 /// LZ4 blocks: NCFS's fast transparent compression. `no_std`; the decoder
 /// is bounded and fuzzed, the compressor's table lent by the caller.
 pub mod lz4;
+/// NCFS, NanoChronometer's filesystem: copy-on-write, a BLAKE3 Merkle tree,
+/// snapshots, deduplication, LZ4/ZSTD. The reader is `no_std` and
+/// allocation-free (the kernel's); the writer, `fsck` and the `ncpkg` root
+/// need `alloc`.
+pub mod ncfs;
 /// The `.ncplu` plugin format and its validating parser.
 ///
 /// `no_std` and pure: the freestanding kernel parses untrusted plugins with

@@ -715,3 +715,47 @@ fn on_a_real_directory() {
     assert!(!dir.join("apps/org.example.a").exists());
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+/// The same manager, installing into an NCFS volume: the filesystem the
+/// system itself will install into, its promises kept by copy-on-write.
+#[test]
+fn on_an_ncfs_volume() {
+    use crate::ncfs::pkgfs::PkgFs;
+    use crate::ncfs::tests::MemDev;
+    use crate::ncfs::write::{FixedClock, Format, Options, Writer};
+    use crate::ncfs::{Scratch, SliceDev, Volume};
+    let w = Writer::format(MemDev::new(8192), &Format { label: b"root".to_vec(), fsid: [1; 16] }, Options::default(), std::boxed::Box::new(FixedClock(0))).unwrap();
+    let mut fs = PkgFs::new(w);
+    let mut a = Spec::gui("org.example.a", "1.0.0");
+    a.libs = vec![("libfoo", "1.2.0", true)];
+    a.commands = vec!["a"];
+    a.icon = Some(super::icon::tests::png(64, [9, 8, 7, 255]));
+    let pkg = build_pkg(&a);
+    let mut m = Manager::new(&mut fs, policy());
+    m.install(&pkg, &mut FakeVerifier::all(), &InstallOptions::default(), &mut |_: &Plan| true).unwrap();
+    assert!(m.check().unwrap().is_empty());
+    drop(m);
+    // What the kernel's reader sees on the committed volume.
+    let data = fs.writer.device().data.clone();
+    let mut s = std::boxed::Box::new(Scratch::new());
+    let mut v = Volume::open(SliceDev::new(&data), &mut s.node).unwrap();
+    for p in ["/usr/lib/libfoo.ncdyn", "/apps/org.example.a/main.ncapp", "/usr/bin/a", "/var/lib/ncpkg/db.json", "/var/cache/ncpkg/icons/org.example.a.png"] {
+        v.resolve(p.as_bytes(), &mut s).unwrap_or_else(|e| panic!("{p}: {e}"));
+    }
+    let db_ino = v.resolve(b"/var/lib/ncpkg/db.json", &mut s).unwrap();
+    let i = v.inode(db_ino, &mut s.node).unwrap();
+    let mut text = vec![0u8; i.size as usize];
+    v.read(db_ino, &i, 0, &mut text, &mut s).unwrap();
+    assert!(String::from_utf8(text).unwrap().contains("\"ref_count\": 1"));
+    let r = crate::ncfs::check::check(&mut SliceDev::new(&data), true).unwrap();
+    assert!(r.is_clean(), "{:#?}", r.errors);
+    let mut m = Manager::new(&mut fs, policy());
+    m.remove("org.example.a", &mut |_: &Plan| true).unwrap();
+    assert!(m.check().unwrap().is_empty());
+    drop(m);
+    fs.writer.commit().unwrap();
+    let data = fs.writer.device().data.clone();
+    let mut v = Volume::open(SliceDev::new(&data), &mut s.node).unwrap();
+    assert_eq!(v.resolve(b"/usr/lib/libfoo.ncdyn", &mut s), Err(crate::ncfs::Error::NotFound));
+    assert_eq!(v.resolve(b"/apps/org.example.a", &mut s), Err(crate::ncfs::Error::NotFound));
+}
