@@ -258,9 +258,12 @@ impl Alg {
 /// a stateful scheme, or a retired one. `None` for a name this does not
 /// recognise either way (it is then simply unknown).
 pub fn refusal(name: &str) -> Option<&'static str> {
-    let n = name.to_ascii_lowercase();
-    let n = n.as_str();
-    let starts = |p: &str| n.starts_with(p);
+    // Case-insensitive without allocating: the kernel reads manifests
+    // without a heap.
+    let n = name.as_bytes();
+    let starts = |p: &str| n.len() >= p.len() && n[..p.len()].eq_ignore_ascii_case(p.as_bytes());
+    let contains = |p: &str| n.windows(p.len()).any(|w| w.eq_ignore_ascii_case(p.as_bytes()));
+    let is = |p: &str| n.eq_ignore_ascii_case(p.as_bytes());
     if starts("dilithium") || starts("crystals-dilithium") {
         Some("CRYSTALS-Dilithium is the pre-standard submission; use ML-DSA (FIPS 204)")
     } else if starts("sphincs") {
@@ -271,13 +274,13 @@ pub fn refusal(name: &str) -> Option<&'static str> {
         Some("FN-DSA (Falcon) is not a finished standard")
     } else if starts("xmss") || starts("lms") || starts("hss") {
         Some("a stateful hash-based scheme (SP 800-208); use SLH-DSA (FIPS 205), which is stateless")
-    } else if n == "dsa" || starts("dsa-") {
+    } else if is("dsa") || starts("dsa-") {
         Some("DSA was withdrawn by FIPS 186-5")
     } else if starts("rainbow") || starts("picnic") || starts("gemss") || starts("sike") || starts("sidh") {
         Some("a broken or withdrawn post-quantum candidate")
-    } else if n.contains("sha1") || n.contains("md5") {
+    } else if contains("sha1") || contains("md5") {
         Some("SHA-1 and MD5 signatures are retired")
-    } else if starts("rsa") && n != "rsa-pss" {
+    } else if starts("rsa") && !is("rsa-pss") {
         Some("RSA signs here as RSASSA-PSS with SHA-512 (`rsa-pss`), 2048-bit modulus or more")
     } else {
         None

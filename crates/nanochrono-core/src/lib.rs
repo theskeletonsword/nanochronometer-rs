@@ -72,6 +72,9 @@ extern crate alloc;
 pub mod aml;
 pub mod arch;
 pub mod backend;
+/// BLAKE3: the checksum in every NCFS block pointer, which makes the
+/// filesystem a Merkle tree. `no_std`, allocation-free, endian-neutral.
+pub mod blake3;
 pub mod cpu;
 pub mod cpu_control;
 /// Checking the primary counter against an independent clock.
@@ -98,6 +101,9 @@ pub mod json;
 /// The microbenchmark kernels per ISA family. `no_std`; shared by the
 /// hosted dispatcher and the freestanding benchmark tab.
 pub mod kernels;
+/// LZ4 blocks: NCFS's fast transparent compression. `no_std`; the decoder
+/// is bounded and fuzzed, the compressor's table lent by the caller.
+pub mod lz4;
 /// The `.ncplu` plugin format and its validating parser.
 ///
 /// `no_std` and pure: the freestanding kernel parses untrusted plugins with
@@ -140,6 +146,9 @@ pub mod space_mode;
 #[cfg(feature = "std")]
 pub mod underwater;
 pub mod simd;
+/// Zstandard decoding (RFC 8878): NCFS extents and boot images compressed
+/// on a host. `no_std`, allocation-free, bounded, fuzzed.
+pub mod zstd;
 
 #[cfg(feature = "std")]
 pub mod clock;

@@ -6,6 +6,8 @@
 # stray in-place build leaves a target/ that must never be committed.
 /crates/nanochrono-plugins/*/target/
 /tools/ncplu-sign/target/
+/tools/ncpkg/target/
+/tools/ncfs/target/
 
 # The old output directory. Every script now writes to build/; kept ignored so
 # a stale checkout's dist/ never shows up as untracked.
