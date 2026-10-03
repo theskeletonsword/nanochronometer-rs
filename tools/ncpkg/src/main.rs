@@ -17,8 +17,9 @@
 //! sudo ncpkg remove org.example.app --root /mnt/ncfs
 //! ```
 
-mod crypto;
 mod source;
+
+use ncpkg::crypto;
 
 use clap::{Args, Parser, Subcommand};
 use nanochrono_core::json::{self, Json};

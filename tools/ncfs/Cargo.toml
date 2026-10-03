@@ -19,17 +19,21 @@ path = "src/main.rs"
 default = ["fuse"]
 # `ncfs mount`: NCFS through FUSE (ring 3), the recommended way to reach a
 # volume from Linux. Needs libfuse3 (pkg-config fuse3) to build.
-fuse = ["dep:fuser", "dep:libc"]
+fuse = ["dep:fuser"]
 
 [dependencies]
 nanochrono-core = { path = "../../crates/nanochrono-core" }
+# Keys, algorithms and verification for sealing: tools/ncpkg's, one
+# implementation for packages and volumes alike.
+ncpkg = { path = "../ncpkg" }
 clap = { version = "4.6", features = ["derive", "env"] }
 # Compression for images built here; decompression is nanochrono-core's own
 # decoder, the one the kernel runs.
 zstd = "0.13"
 getrandom = "0.4"
 fuser = { version = "0.18", optional = true }
-libc = { version = "0.2", optional = true }
+# SIGPIPE back to its default: `ncfs ls | head` ends quietly, as Unix tools do.
+libc = "0.2"
 
 [profile.release]
 strip = "none"

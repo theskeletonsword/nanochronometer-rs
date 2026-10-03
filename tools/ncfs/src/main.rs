@@ -15,6 +15,9 @@ mod hostio;
 use clap::{Parser, Subcommand, ValueEnum};
 use dev::{timestamp, FileDev, SystemClock, Zstd};
 use nanochrono_core::ncfs::check::check;
+use nanochrono_core::ncfs::seal::{self, OwnedSeal};
+use nanochrono_core::ncpkg::sig::{Role, Verdict, Verifier};
+use ncpkg::crypto;
 use nanochrono_core::ncfs::format::*;
 use nanochrono_core::ncfs::write::{Format, Options, Writer};
 use nanochrono_core::ncfs::{Error, Scratch, Volume};
@@ -150,9 +153,52 @@ enum Cmd {
         /// Leave free space (bytes, K, M, G) instead of shrinking to fit.
         #[arg(long)]
         free: Option<String>,
+        /// Seal and sign the image in this role when it is built.
+        #[arg(long)]
+        seal_role: Option<String>,
+        #[arg(long)]
+        seal_keys: Option<PathBuf>,
+        #[arg(long)]
+        seal_key: Option<PathBuf>,
     },
     /// Cuts an image file down to what it holds.
     Shrink { image: PathBuf },
+    /// Seals a volume (read-only from then on) and signs its superblock,
+    /// which covers every byte: what makes an ncinitramdisk trusted.
+    Seal {
+        image: PathBuf,
+        /// creator-ring0 (🌳), verify-ring0, creator-ring3, verify-ring3, self.
+        #[arg(long)]
+        role: String,
+        /// A root's ncplu-sign key directory (root roles).
+        #[arg(long)]
+        keys: Option<PathBuf>,
+        /// An `ncpkg keygen` key file (self).
+        #[arg(long)]
+        key: Option<PathBuf>,
+        /// Write the message to sign to this file instead (an offline
+        /// signer, an HSM).
+        #[arg(long)]
+        message: Option<PathBuf>,
+        /// Attach a signature made elsewhere (with --alg and --pubkey).
+        #[arg(long)]
+        sig: Option<PathBuf>,
+        #[arg(long)]
+        alg: Option<String>,
+        /// The signer's public key(s): a root's NCROOT01 file, or raw bytes.
+        #[arg(long)]
+        pubkey: Option<PathBuf>,
+    },
+    /// Checks a sealed volume's signatures against trusted roots.
+    Verify {
+        image: PathBuf,
+        /// A directory of <role>.pub root files.
+        #[arg(long)]
+        roots: Option<PathBuf>,
+        /// Enrolled self-signing key fingerprints, one per line.
+        #[arg(long)]
+        owner_keys: Option<PathBuf>,
+    },
     /// Mounts through FUSE until unmounted (fusermount3 -u MOUNTPOINT).
     #[cfg(feature = "fuse")]
     Mount {
@@ -538,7 +584,7 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
             }
             println!("clean");
         }
-        Cmd::Build { dir, output, size, label, compress, level, free } => {
+        Cmd::Build { dir, output, size, label, compress, level, free, seal_role, seal_keys, seal_key } => {
             if label.len() > 64 {
                 return Err(String::from("a label is at most 64 bytes"));
             }
@@ -571,6 +617,9 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
             if !r.is_clean() {
                 return Err(format!("the image fails its own check: {:?}", r.errors));
             }
+            if let Some(role) = seal_role {
+                seal_cmd(&output, &role, seal_keys.as_deref(), seal_key.as_deref(), None, None, None, None)?;
+            }
             eprintln!(
                 "{}: {} files, {} directories, {} links, {} bytes in {} KiB ({} blocks)",
                 output.display(),
@@ -589,6 +638,10 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
             w.device().truncate(n).map_err(|e| e.to_string())?;
             println!("{}: {} blocks ({} KiB)", image.display(), n, (n * BLOCK as u64) >> 10);
         }
+        Cmd::Seal { image, role, keys, key, message, sig, alg, pubkey } => {
+            seal_cmd(&image, &role, keys.as_deref(), key.as_deref(), message.as_deref(), sig.as_deref(), alg.as_deref(), pubkey.as_deref())?;
+        }
+        Cmd::Verify { image, roots, owner_keys } => return verify_cmd(&image, roots.as_deref(), owner_keys.as_deref()),
         #[cfg(feature = "fuse")]
         Cmd::Mount { image, mountpoint, ro, snapshot, compress } => {
             let mut opts = options(compress, true);
@@ -603,7 +656,102 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
     Ok(ExitCode::SUCCESS)
 }
 
+fn role(name: &str) -> Result<Role, String> {
+    Role::from_name(name).ok_or_else(|| format!("{name}: not a role (creator-ring3, creator-ring0, verify-ring3, verify-ring0, self)"))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn seal_cmd(
+    image: &Path,
+    role_name: &str,
+    keys: Option<&Path>,
+    key: Option<&Path>,
+    message: Option<&Path>,
+    sig: Option<&Path>,
+    alg: Option<&str>,
+    pubkey: Option<&Path>,
+) -> Result<(), String> {
+    let role = role(role_name)?;
+    let mut dev = FileDev::open(image, true).map_err(|e| format!("{}: {e}", image.display()))?;
+    let sb = seal::seal(&mut dev).map_err(|e| format!("{}: {e}", image.display()))?;
+    let m = seal::message(role, &sb);
+    if let Some(out) = message {
+        std::fs::write(out, m.as_bytes()).map_err(|e| format!("{}: {e}", out.display()))?;
+        println!("{}: sealed; the message for {} is in {}", image.display(), role.name(), out.display());
+        return Ok(());
+    }
+    let (alg, public, signature) = match sig {
+        Some(sig_path) => {
+            let alg = alg.ok_or("--sig needs --alg")?.to_string();
+            let pk_path = pubkey.ok_or("--sig needs --pubkey")?;
+            let public = if role.is_root() { crypto::read_root_pub(pk_path)? } else { std::fs::read(pk_path).map_err(|e| format!("{}: {e}", pk_path.display()))? };
+            let signature = std::fs::read(sig_path).map_err(|e| format!("{}: {e}", sig_path.display()))?;
+            match crypto::verify_all(&alg, &public, m.as_bytes(), &signature) {
+                Some(true) => {}
+                Some(false) => return Err(String::from("the signature does not verify over this volume's message (ncfs seal --message)")),
+                None => return Err(format!("unknown algorithm {alg:?}")),
+            }
+            (alg, public, signature)
+        }
+        None => {
+            let secret = match (role.is_root(), keys, key) {
+                (true, Some(dir), None) => crypto::SecretKey::load_root_dir(dir)?,
+                (true, _, _) => return Err(format!("{}: a root role signs with --keys <ncplu-sign key directory>", role.name())),
+                (false, None, Some(k)) => crypto::SecretKey::load(k)?,
+                (false, _, _) => return Err(String::from("self: sign with --key <file from ncpkg keygen>")),
+            };
+            let signature = secret.sign(m.as_bytes())?;
+            (secret.alg.clone(), secret.public(), signature)
+        }
+    };
+    let fp = crypto::fingerprint(&public);
+    let entry = OwnedSeal { role, alg: alg.clone(), key: fp.clone(), pubkey: if role.is_root() { Vec::new() } else { public }, sig: signature };
+    seal::add(&mut dev, entry).map_err(|e| format!("{}: {e}", image.display()))?;
+    println!("{}: sealed and signed as {} ({alg}, key {fp})", image.display(), role.name());
+    Ok(())
+}
+
+fn verify_cmd(image: &Path, roots: Option<&Path>, owner_keys: Option<&Path>) -> Result<ExitCode, String> {
+    let mut dev = FileDev::open(image, false).map_err(|e| format!("{}: {e}", image.display()))?;
+    let mut sb = [0u8; BLOCK];
+    let mut area = vec![0u8; seal::AREA];
+    let area: &mut [u8; seal::AREA] = area.as_mut_slice().try_into().map_err(|_| "internal")?;
+    if !seal::read(&mut dev, &mut sb, area).map_err(|e| format!("{}: {e}", image.display()))? {
+        println!("{}: not sealed", image.display());
+        return Ok(ExitCode::from(4));
+    }
+    let mut verifier = crypto::HostVerifier::load(roots, owner_keys)?;
+    let seals = seal::parse(&area[..]).map_err(|e| format!("{}: signature area: {e}", image.display()))?;
+    for s in seals.iter() {
+        let m = seal::message(s.role, &sb);
+        let verdict = verifier.verify(s.role, s.alg, s.key, s.pubkey, m.as_bytes(), s.sig);
+        let shown = match verdict {
+            Verdict::Valid => "valid",
+            Verdict::Invalid => "INVALID: the volume changed after it was signed",
+            Verdict::UnknownKey => "not a root this host trusts for the role",
+            Verdict::Unsupported => "an algorithm this build cannot check",
+        };
+        println!("{:<14} {:<26} key {}  {shown}", s.role.name(), s.alg, s.key);
+    }
+    let trust = seal::judge(&sb, &area[..], &mut verifier).map_err(|e| e.to_string())?;
+    let badge = trust.badge();
+    println!("badge: {} {}", badge.symbol(), badge.label());
+    if trust.tampered() {
+        return Ok(ExitCode::from(3));
+    }
+    if !trust.ring0_signed() {
+        println!("no valid ring-0 signature: the kernel boots this only with the community switch");
+        return Ok(ExitCode::from(4));
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
 fn main() -> ExitCode {
+    // Rust ignores SIGPIPE, which turns `ncfs ls | head` into a panic on the
+    // first write after the pipe closes; a command-line tool should simply
+    // stop.
+    // SAFETY: setting a signal's disposition to its default at start-up.
+    unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
     match run(Cli::parse()) {
         Ok(code) => code,
         Err(e) => {

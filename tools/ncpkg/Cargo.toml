@@ -11,6 +11,10 @@ description = "Builds, signs, verifies, installs and removes NanoChronometer .nc
 # database and the transaction engine are nanochrono-core's — this is the
 # command line, the cryptography and the TOML front end around them.
 
+[lib]
+name = "ncpkg"
+path = "src/lib.rs"
+
 [[bin]]
 name = "ncpkg"
 path = "src/main.rs"

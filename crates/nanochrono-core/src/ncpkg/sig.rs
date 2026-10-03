@@ -342,9 +342,17 @@ impl core::fmt::Debug for Message {
 
 impl Message {
     pub fn new(role: Role, signed: &[u8]) -> Message {
+        Message::in_domain(DOMAIN, role, signed)
+    }
+
+    /// The same framing under another domain (at most 16 bytes, ending in
+    /// NUL): what a sealed NCFS volume signs, so a package signature can
+    /// never pass for a volume's or the reverse.
+    pub fn in_domain(domain: &[u8], role: Role, signed: &[u8]) -> Message {
         let mut buf = [0u8; 96];
         let mut n = 0;
-        for part in [DOMAIN, role.name().as_bytes(), b"\0"] {
+        let domain = &domain[..domain.len().min(16)];
+        for part in [domain, role.name().as_bytes(), b"\0"] {
             buf[n..n + part.len()].copy_from_slice(part);
             n += part.len();
         }
@@ -469,6 +477,30 @@ pub struct Trust {
 impl Trust {
     pub const NONE: Trust = Trust { valid: 0, invalid: 0, unchecked: 0, self_key: None, self_enrolled: false };
 
+    /// Records one signature's verdict: how packages and sealed volumes
+    /// alike build their trust.
+    pub fn record(&mut self, role: Role, verdict: Verdict, key: &str, verifier: &mut dyn Verifier) {
+        let bit = role.bit();
+        match verdict {
+            Verdict::Valid => {
+                self.valid |= bit;
+                if role == Role::SelfSigned {
+                    let mut fp = [0u8; 19];
+                    fp.copy_from_slice(key.as_bytes().get(..19).unwrap_or(&[b'0'; 19]));
+                    self.self_key = Some(fp);
+                    self.self_enrolled = verifier.enrolled(key);
+                }
+            }
+            Verdict::Invalid => self.invalid |= bit,
+            Verdict::UnknownKey | Verdict::Unsupported => self.unchecked |= bit,
+        }
+    }
+
+    /// A signature that could not even be decoded: as good as invalid.
+    pub fn record_malformed(&mut self, role: Role) {
+        self.invalid |= role.bit();
+    }
+
     /// A valid signature in `role`.
     pub fn has(&self, role: Role) -> bool {
         self.valid & role.bit() != 0
@@ -569,19 +601,8 @@ pub fn evaluate<'a>(
             None => &[],
         };
         let message = Message::new(s.role, signed);
-        match verifier.verify(s.role, s.alg, s.key, pubkey, message.as_bytes(), sig) {
-            Verdict::Valid => {
-                trust.valid |= bit;
-                if s.role == Role::SelfSigned {
-                    let mut fp = [0u8; 19];
-                    fp.copy_from_slice(s.key.as_bytes().get(..19).unwrap_or(&[b'0'; 19]));
-                    trust.self_key = Some(fp);
-                    trust.self_enrolled = verifier.enrolled(s.key);
-                }
-            }
-            Verdict::Invalid => trust.invalid |= bit,
-            Verdict::UnknownKey | Verdict::Unsupported => trust.unchecked |= bit,
-        }
+        let verdict = verifier.verify(s.role, s.alg, s.key, pubkey, message.as_bytes(), sig);
+        trust.record(s.role, verdict, s.key, verifier);
     }
     trust
 }

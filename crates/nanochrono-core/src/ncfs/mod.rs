@@ -29,6 +29,7 @@
 //! |---|---|---|
 //! | [`format`] | the on-disk structures, checked field by field | nothing |
 //! | [`read`] | reading a volume through caller-provided buffers | nothing (the kernel's half) |
+//! | [`seal`] | sealed volumes: the signed superblock of an `ncinitramdisk` | nothing to check, `alloc` to seal |
 //! | [`write`] | mkfs, the copy-on-write engine, files, snapshots | `alloc` |
 //! | [`check`] | `fsck` and scrub: every rule, every checksum | `alloc` |
 //! | [`pkgfs`] | NCFS as the filesystem `ncpkg` installs into | `alloc` |
@@ -37,6 +38,7 @@
 
 pub mod format;
 pub mod read;
+pub mod seal;
 
 #[cfg(feature = "alloc")]
 pub mod check;
