@@ -128,7 +128,7 @@ pub fn parse(area: &[u8]) -> Result<Seals<'_>, Error> {
     }
     let count = rd16(area, 10);
     let used = rd32(area, 12);
-    if count == 0 || count > sig::MAX_SIGNATURES || used > AREA || used < HEADER {
+    if count == 0 || count > sig::MAX_SIGNATURES || !(HEADER..=AREA).contains(&used) {
         return Err(bad);
     }
     let mut at = HEADER;
