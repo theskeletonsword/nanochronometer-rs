@@ -6,6 +6,11 @@ ring 0, signature checks, file-system and package parsers, and optional kernel
 drivers for Linux and Windows. If you find a way to break any of that, I want
 to hear about it, and I will not treat you as an adversary for looking.
 
+> **Not legal advice.** This policy was written by the maintainer, not by a
+> lawyer, and nothing in it is legal advice — for the maintainer or for
+> you. Before relying on it in a real legal dispute, have it reviewed by
+> someone qualified in law in the jurisdictions involved.
+
 ## Supported versions
 
 | Version | Supported |
@@ -292,12 +297,39 @@ should never need any. If it ever touches some anyway:
   attachments, delete what you have once the report is in, and say in the
   report that it happened.
 - **COPPA** (the U.S. Children's Online Privacy Protection Act) and GDPR's
-  rules on children (Article 8): if the data may belong to a child, stop
+  rules on children — Article 8, often called **GDPR-K** — and laws like
+  them: if the data may belong to a child, stop
   **immediately** — do not open, copy, keep or forward any of it — and tell
   me at once. That is never a detail to demonstrate impact with.
 
 The safe harbor does not cover collecting, keeping or sharing personal
 data; it cannot, since that data is not the maintainer's to authorize.
+
+### If you are a minor
+
+Reports from minors are welcome, and the safe harbor applies to you exactly
+as it does to anyone else. The age that matters is the one your country
+sets for consenting to the processing of your own data online: between 13
+and 16 in the EU, depending on the member state (GDPR-K, Article 8), 13
+under COPPA in the U.S.; check your own country's law. If you are below it:
+
+- **You are never asked your age, your real name or proof of anything.**
+  Report under a handle; a Signal username or a GitHub account is all the
+  contact this needs, and it is all that is kept.
+- **Credit and contributor status use a handle only**, or nothing at all —
+  never a real name, a photo, a school or a location — unless a parent or
+  guardian agrees to more.
+- **Your contact data is deleted when the case closes**, if you or a parent
+  or guardian ask; the advisory keeps only the handle you chose.
+- **Involve a parent or guardian**, or a teacher you trust, before you test
+  — above all before anything that touches the law. The safe harbor is
+  written for adults' legal systems, and a grown-up on your side is worth
+  more than any policy.
+- If a parent or guardian contacts the maintainer about your report, they
+  are answered, and what you sent is handled as they and you agree.
+
+The rules are the same for everyone: the embargo, the closed list of
+channels and the limits on data apply to minors too.
 
 The rules:
 
@@ -326,3 +358,8 @@ maintainer controls. It cannot bind third parties — the owners of hardware,
 networks or services you test on, or the authors of dependencies — and it
 does not override the law where you are. If you are unsure whether something
 you plan to do is covered, ask first on Signal or through GitHub.
+
+**This is not legal advice.** The safe harbor and everything else in this
+policy were written by the maintainer, not by a lawyer. Before relying on
+them in a real legal dispute — yours or the maintainer's — have them
+reviewed by someone qualified in law in the jurisdictions involved.
