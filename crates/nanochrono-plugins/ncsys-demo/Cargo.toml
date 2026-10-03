@@ -1,0 +1,29 @@
+[package]
+name = "nanochrono-plugin-ncsys-demo"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "nccall from Rust at ring 3: POSIX-class calls through nanochrono-sys, with the red zone on"
+
+[lib]
+# A shared object (ET_DYN), which tools/ncplu.py packs into an .ncapp.
+crate-type = ["cdylib"]
+
+[dependencies]
+nanochrono-sys = { path = "../../nanochrono-sys", features = ["alloc"] }
+
+[profile.dev]
+opt-level = 0
+debug = true
+panic = "abort"
+
+[profile.release]
+opt-level = 2
+debug = false
+lto = true
+codegen-units = 1
+panic = "abort"
+
+[profile.debug-og]
+inherits = "dev"
+opt-level = 1

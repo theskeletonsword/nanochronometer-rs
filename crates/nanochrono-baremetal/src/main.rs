@@ -61,6 +61,14 @@ pub unsafe extern "C" fn kmain(magic: usize, multiboot_info: usize) -> ! {
     // anything that relies on them — the PMU, the counter, the hypervisor.
     // SAFETY: CPL 0, once, before any plugin.
     unsafe { nanochrono_baremetal::cpu_control::configure() };
+    // The kernel stacks: NMI, #MC and #DB on stacks of their own, every other
+    // exception on RSP0 or the current stack (docs/NCCALL.md §3). boot32.S's
+    // early tables covered everything up to here.
+    // SAFETY: CPL 0, once, interrupts masked.
+    #[cfg(target_arch = "x86_64")]
+    if let Err(e) = unsafe { nanochrono_baremetal::kstack::install() } {
+        println!("kstack: {e}; the boot-time stack plan stays");
+    }
 
     let loader = match magic {
         MULTIBOOT2_BOOTLOADER_MAGIC => "multiboot2",

@@ -76,6 +76,17 @@ pub(crate) fn cap_granted(cap: u32) -> bool {
     GRANTED_CAPS.load(Ordering::Relaxed) & cap == cap
 }
 
+/// The capability groups currently granted.
+pub(crate) fn granted_caps() -> u32 {
+    GRANTED_CAPS.load(Ordering::Relaxed)
+}
+
+/// Grants exactly `caps`: for the boot selftest's ring-3 probe, which is no
+/// plugin and carries no header to grant them from.
+pub(crate) fn set_granted_caps(caps: u32) {
+    GRANTED_CAPS.store(caps, Ordering::Relaxed);
+}
+
 // ===========================================================================
 // Trust tier
 // ===========================================================================
@@ -1556,6 +1567,9 @@ pub unsafe fn run(
                     crate::println!(
                         "plugin: {name}: stopped \u{2014} nccall {num} needs a capability it was not granted"
                     );
+                }
+                if let Some(v) = crate::ring3::violation() {
+                    crate::println!("plugin: {name}: stopped \u{2014} {}", v.describe());
                 }
                 code
             }

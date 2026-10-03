@@ -461,6 +461,7 @@ dependencies = [
  "jpeg-decoder",
  "ml-dsa",
  "nanochrono-core",
+ "nanochrono-sys",
  "p521",
  "png",
  "sha2 0.10.9",
@@ -474,6 +475,10 @@ dependencies = [
  "libc",
  "windows-sys",
 ]
+
+[[package]]
+name = "nanochrono-sys"
+version = "4.0.0"
 
 [[package]]
 name = "num-traits"

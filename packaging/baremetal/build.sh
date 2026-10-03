@@ -705,7 +705,10 @@ build_plugins() {
     local profile_args=() opt="-O0" profile_dir="debug" cargo_profile="dev"
     case "${profile}" in
         release)
-            profile_args=(--release --config "target.x86_64-nanochrono-none-dylib.rustflags=${remap_toml}")
+            # Both targets an app may build for: the kernel-tier -dylib spec,
+            # and the ring-3 one (sdk/targets/), whose red zone is on.
+            profile_args=(--release --config "target.x86_64-nanochrono-none-dylib.rustflags=${remap_toml}"
+                --config "target.x86_64-unknown-nanochronometer.rustflags=${remap_toml}")
             opt="-O2" profile_dir="release" cargo_profile="release" ;;
         debug-og)
             profile_args=(--profile debug-og)
@@ -730,7 +733,16 @@ build_plugins() {
             echo "note: plugin ${name} failed to build; skipping"
             continue
         fi
-        so="$(ls "${target}/x86_64-nanochrono-none-dylib/${profile_dir}/"*.so 2>/dev/null | head -1)"
+        # Under whichever target its .cargo/config selects: the kernel-tier
+        # x86_64-nanochrono-none-dylib, or the ring-3 x86_64-unknown-nanochronometer.
+        so=""
+        for candidate in "${target}"/x86_64-nanochrono-none-dylib/"${profile_dir}"/*.so \
+                         "${target}"/x86_64-unknown-nanochronometer/"${profile_dir}"/*.so; do
+            if [[ -f "${candidate}" ]]; then
+                so="${candidate}"
+                break
+            fi
+        done
         if [[ -z "${so}" ]]; then
             echo "note: no shared object for plugin ${name}; skipping"
             continue

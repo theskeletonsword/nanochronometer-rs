@@ -195,6 +195,10 @@ pub mod plugin_card;
 /// user page mapping, SYSCALL/SYSRET (`nccall`) and fault containment.
 #[cfg(target_arch = "x86_64")]
 pub mod ring3;
+/// x86_64 only: which stack each kernel entry runs on (TSS.RSP0 and the IST
+/// plan), installed early and checked by the selftest (docs/NCCALL.md §3).
+#[cfg(target_arch = "x86_64")]
+pub mod kstack;
 
 pub use nanochrono_core::{arch as core_arch, cpu, Backend, Integrity, Protected, SimdFamily};
 

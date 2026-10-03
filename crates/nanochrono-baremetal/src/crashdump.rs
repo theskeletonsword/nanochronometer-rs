@@ -341,7 +341,7 @@ mod capture {
         (&raw const __text_start as u64, &raw const __text_end as u64)
     }
 
-    /// The stack `address` lies in — the kernel stack or one of the two IST
+    /// The stack `address` lies in — the kernel stack or one of the IST
     /// stacks — as `[bottom, top)`. `None` for an address in none of them,
     /// which is what a corrupted RSP or RBP looks like.
     pub(super) fn stack_containing(address: u64) -> Option<(u64, u64)> {
@@ -350,7 +350,11 @@ mod capture {
             (&raw const nc_ist1_bottom as u64, &raw const nc_ist1_top as u64),
             (&raw const nc_ist2_bottom as u64, &raw const nc_ist2_top as u64),
         ];
-        stacks.into_iter().find(|&(lo, hi)| (lo..hi).contains(&address))
+        // And the NMI, #MC and #DB stacks kstack installs.
+        stacks
+            .into_iter()
+            .chain(crate::kstack::own_stacks())
+            .find(|&(lo, hi)| (lo..hi).contains(&address))
     }
 }
 

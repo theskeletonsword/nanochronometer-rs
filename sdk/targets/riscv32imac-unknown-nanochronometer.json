@@ -1,0 +1,31 @@
+{
+  "arch": "riscv32",
+  "cpu": "generic-rv32",
+  "crt-objects-fallback": "false",
+  "data-layout": "e-m:e-p:32:32-i64:64-n32-S128",
+  "disable-redzone": false,
+  "dynamic-linking": true,
+  "eh-frame-header": false,
+  "emit-debug-gdb-scripts": false,
+  "features": "+m,+a,+c",
+  "has-thread-local": false,
+  "linker": "rust-lld",
+  "linker-flavor": "gnu-lld",
+  "llvm-abiname": "ilp32",
+  "llvm-target": "riscv32",
+  "max-atomic-width": 32,
+  "metadata": {
+    "description": "NanoChronometer ring 3 (.ncapp/.ncplu/.ncdyn/.ncar), riscv32",
+    "host_tools": false,
+    "std": false,
+    "tier": 3
+  },
+  "os": "nanochronometer",
+  "panic-strategy": "abort",
+  "position-independent-executables": true,
+  "relocation-model": "pic",
+  "relro-level": "off",
+  "static-position-independent-executables": true,
+  "target-pointer-width": 32,
+  "vendor": "unknown"
+}

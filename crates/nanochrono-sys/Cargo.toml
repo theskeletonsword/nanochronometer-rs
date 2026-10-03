@@ -1,0 +1,25 @@
+[package]
+name = "nanochrono-sys"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "nccall: NanoChronometer's ring 3 -> ring 0 system-call ABI, as data and as code, for every architecture the kernel supports"
+
+# No dependencies, on purpose: the kernel builds this crate for nine
+# freestanding targets (the call numbers and errno values it dispatches on),
+# and every ring-3 program links it (`nccall!`, the POSIX wrappers). Both
+# sides read the same constants from the same file.
+
+[features]
+default = []
+# A `GlobalAlloc` over the POSIX-class mmap/munmap (src/alloc.rs), for a
+# ring-3 program that wants `alloc::vec::Vec` and friends. Off by default:
+# the kernel links this crate and has no heap.
+alloc = []
+
+[lints.rust]
+# `target_os = "nanochronometer"` is what the ring-3 target specs in
+# sdk/targets/ name the system; rustc's own list does not know it.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_os, values("nanochronometer"))'] }

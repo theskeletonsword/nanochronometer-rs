@@ -1,0 +1,35 @@
+{
+  "arch": "riscv64",
+  "cpu": "generic-rv64",
+  "crt-objects-fallback": "false",
+  "data-layout": "e-m:e-p:64:64-i64:64-i128:128-n32:64-S128",
+  "disable-redzone": false,
+  "dynamic-linking": true,
+  "eh-frame-header": false,
+  "emit-debug-gdb-scripts": false,
+  "features": "+m,+a,+f,+d,+c,+zicsr,+zifencei",
+  "has-thread-local": false,
+  "linker": "rust-lld",
+  "linker-flavor": "gnu-lld",
+  "llvm-abiname": "lp64d",
+  "llvm-target": "riscv64",
+  "max-atomic-width": 64,
+  "metadata": {
+    "description": "NanoChronometer ring 3 (.ncapp/.ncplu/.ncdyn/.ncar), riscv64",
+    "host_tools": false,
+    "std": false,
+    "tier": 3
+  },
+  "os": "nanochronometer",
+  "panic-strategy": "abort",
+  "position-independent-executables": true,
+  "relocation-model": "pic",
+  "relro-level": "off",
+  "static-position-independent-executables": true,
+  "supported-sanitizers": [
+    "shadow-call-stack",
+    "kernel-address"
+  ],
+  "target-pointer-width": 64,
+  "vendor": "unknown"
+}

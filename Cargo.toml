@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/nanochrono-core",
+    "crates/nanochrono-sys",
     "crates/nanochrono-crypto",
     "crates/nanochrono-bench",
     "crates/nanochrono-cli",

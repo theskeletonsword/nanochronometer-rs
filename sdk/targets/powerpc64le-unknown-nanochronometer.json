@@ -1,0 +1,39 @@
+{
+  "abi": "elfv2",
+  "arch": "powerpc64",
+  "cpu": "pwr8",
+  "crt-static-default": false,
+  "crt-static-respected": false,
+  "data-layout": "e-m:e-Fn32-i64:64-i128:128-n32:64",
+  "disable-redzone": false,
+  "dynamic-linking": true,
+  "env": "",
+  "exe-suffix": "",
+  "executables": true,
+  "features": "+altivec,+vsx,+power8-vector",
+  "has-thread-local": false,
+  "linker": "rust-lld",
+  "linker-flavor": "ld.lld",
+  "llvm-abiname": "elfv2",
+  "llvm-target": "powerpc64le-unknown-unknown",
+  "max-atomic-width": 64,
+  "metadata": {
+    "description": "NanoChronometer ring 3 (.ncapp/.ncplu/.ncdyn/.ncar), powerpc64",
+    "host_tools": false,
+    "std": false,
+    "tier": 3
+  },
+  "os": "nanochronometer",
+  "panic-strategy": "abort",
+  "position-independent-executables": true,
+  "relocation-model": "pic",
+  "relro-level": "off",
+  "stack-probes": {
+    "kind": "inline"
+  },
+  "static-position-independent-executables": true,
+  "target-c-int-width": 32,
+  "target-endian": "little",
+  "target-pointer-width": 64,
+  "vendor": "unknown"
+}

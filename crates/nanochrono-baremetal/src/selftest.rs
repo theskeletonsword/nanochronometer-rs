@@ -60,8 +60,74 @@ pub unsafe fn run() {
     #[cfg(x86_any)]
     progress::leave(Phase::Hypervisor);
 
+    // SAFETY: forwarded from this function's own contract; no plugin runs.
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        report_kernel_stacks()
+    };
+
     report_rng();
     report_integrity();
+}
+
+/// The ring 3 / ring 0 boundary (docs/NCCALL.md): which stack each kernel
+/// entry runs on, read back from the live IDT and TSS, and the proof that a
+/// ring-3 red zone survives a nccall and an exception — with the control
+/// that shows the same probe's red zone destroyed at ring 0, where the
+/// exception frame lands on the stack in use.
+///
+/// # Safety
+/// Ring 0, no plugin running.
+#[cfg(target_arch = "x86_64")]
+unsafe fn report_kernel_stacks() {
+    println!("== Kernel stacks and the red zone ==");
+    match crate::kstack::verify() {
+        Ok(r) => {
+            println!(
+                "  RSP0           : {:#x}  ring-3 entries; {} vectors on RSP0 or the current stack",
+                r.rsp0, r.on_rsp0_or_current
+            );
+            for slot in crate::kstack::PLAN {
+                println!(
+                    "  IST{} {:<4}      : {:#x}  {}",
+                    slot.ist,
+                    slot.name,
+                    r.ist[slot.ist as usize - 1],
+                    slot.why
+                );
+            }
+            println!("  stack plan     : ok");
+        }
+        Err(e) => println!("  stack plan     : FAILED: {e}"),
+    }
+    // SAFETY: forwarded; ring 0, no plugin running.
+    let proof = unsafe { crate::ring3::prove_red_zone() };
+    // SAFETY: ring 0; prove_red_zone armed SYSCALL.
+    let mask = unsafe { crate::ring3::sfmask() };
+    let mask_ok = mask & crate::ring3::SFMASK == crate::ring3::SFMASK;
+    println!(
+        "  SFMASK         : {:#x}{}",
+        mask,
+        if mask_ok { " (clears IF DF TF AC NT)" } else { " MISSING BITS" }
+    );
+    println!(
+        "  ring 3         : red zone {} across a nccall and a #BP ({} nccalls{})",
+        if proof.ring3_intact { "intact" } else { "CORRUPTED" },
+        proof.ring3_calls,
+        if proof.ring3_clean_exit { "" } else { ", did not exit cleanly" }
+    );
+    println!(
+        "  ring 0 control : red zone {} by the #BP frame{}",
+        if proof.ring0_corrupted { "overwritten" } else { "NOT overwritten" },
+        if proof.ring0_corrupted {
+            " (the hazard is real, and the probe sees it)"
+        } else {
+            " (the probe cannot see corruption)"
+        }
+    );
+    let ok = mask_ok && proof.ring3_intact && proof.ring3_clean_exit && proof.ring0_corrupted && proof.breakpoints == 2;
+    println!("  red zone       : {}", if ok { "ok" } else { "FAILED" });
+    println!();
 }
 
 /// NC_RNG: starts the pool — known answers, sources, the timer's start-up

@@ -240,6 +240,11 @@ extern "C" fn nanochrono_x86_trap(frame: *mut crate::crashdump::TrapFrame) -> u6
     // SAFETY: the stub passes the frame it and the CPU just pushed, and only
     // this function touches it until the stub resumes from it.
     let f = unsafe { &mut *frame };
+    // The red-zone selftest's breakpoint, taken on purpose: resumed where it
+    // was raised, at ring 3 or ring 0 (`kstack::take_breakpoint`).
+    if crate::kstack::take_breakpoint(f.vector) {
+        return 1;
+    }
     crate::ncplu::contain_fault(f, cr2) as u64
 }
 

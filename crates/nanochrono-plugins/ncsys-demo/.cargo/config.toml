@@ -1,0 +1,22 @@
+# Ring-3 code: the user target spec (sdk/targets/), where the System V red
+# zone is the program's to use — unlike the kernel's and the kernel-tier
+# plugins' `-dylib` spec. The kernel never writes below a ring-3 stack
+# pointer (docs/NCCALL.md), and this app is how that is shown.
+[build]
+target = "x86_64-unknown-nanochronometer"
+
+[target.x86_64-unknown-nanochronometer]
+rustflags = [
+    "-Z", "unstable-options",
+    # A .so keeps undefined symbols as dynamic symbols resolved at load time.
+    "-C", "link-arg=-znodefaultlib",
+]
+
+[unstable]
+build-std = ["core", "compiler_builtins", "alloc"]
+build-std-features = ["compiler-builtins-mem"]
+
+# Forced: packaging/baremetal/build.sh exports the kernel's targets/ for every
+# build it runs, and the ring-3 specs are not there.
+[env]
+RUST_TARGET_PATH = { value = "../../../sdk/targets", relative = true, force = true }

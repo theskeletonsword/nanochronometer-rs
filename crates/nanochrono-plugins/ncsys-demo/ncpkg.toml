@@ -1,0 +1,24 @@
+# The manifest's `signed` part for the nccall demo as a .ncpkg package
+# (docs/NCPKG.md). packaging/baremetal/build.sh packs the module with exactly
+# these capabilities.
+id = "org.nanochronometer.ncsys-demo"
+name = "nccall demo"
+version = "1.0.0"
+type = "cli"
+summary = "POSIX-class nccalls from Rust at ring 3, the red zone in use across them"
+license = "Apache-2.0"
+homepage = "https://github.com/nanochronometer/nanochronometer"
+
+[creator]
+name = "NanoChronometer"
+url = "https://github.com/nanochronometer/nanochronometer"
+
+[app]
+entry = "main.ncapp"
+ring = 3
+# The command a cli package links into /usr/bin (docs/NCPKG.md §3).
+commands = ["ncsys-demo"]
+# write(2) to the console, clock_gettime, getrandom. mmap/munmap and getpid
+# need no capability: they touch only the app's own memory.
+capabilities = ["log", "timer", "rng"]
+categories = ["Developer Tools"]
