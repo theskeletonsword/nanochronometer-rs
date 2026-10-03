@@ -49,7 +49,10 @@ clock reads `hh:mm:ss:mmm:uuu:nnn` — a NanoChronometer, not a phone clock.
   `LGPL-2.1`/`LGPL-3.0`, `Proprietary` — and dual licences (`MIT OR
   Apache-2.0`), each shown with a plain-language explanation for newcomers.
   None given reads as `Proprietary`: all rights reserved, not "tainted".
-* **Icon**, title, description, version.
+* **Icon**: `icon.png` at the package's root — a square PNG, 256 × 256
+  recommended — copied at install to `/var/cache/ncpkg/icons/<id>.png`,
+  where the desktop, the dock and the package app read it. Title,
+  description, version.
 * **Creator**. None given: anonymous, which the launch card flags as
   suspicious for a ring-0 plugin or an `.ncdri`; it still runs.
 * **Badge status**, from the signatures (below).
@@ -88,8 +91,13 @@ the two roots it embeds; moving it to the four roles is the next step.
 
 **Owner keys (MOK)**: the machine owner's own keys, enrolled in UEFI NVRAM
 the way shim's MOK list is (a file on the state partition without UEFI).
-Self-signatures accept Ed25519, RSA-2048+, ECDSA P-256/P-384/P-521, ML-DSA-65
-and ML-DSA-87, and hybrids of them.
+Self-signatures accept only finished standards: Ed25519 (RFC 8032), RSA-PSS
+with 2048 bits or more and ECDSA P-256/P-384/P-521 (FIPS 186-5), ML-DSA-44/65/87
+(FIPS 204) and SLH-DSA in its twelve parameter sets (FIPS 205), alone or as a
+hybrid of two. Pre-standard submissions (Dilithium, SPHINCS+), key-encapsulation
+schemes (Kyber, ML-KEM — not signatures), FN-DSA until it is final, stateful
+schemes (XMSS, LMS), DSA and anything over SHA-1 or MD5 are refused by name,
+with the reason (docs/NCPKG.md §4).
 
 **Enable Ring0 Community Modules and Drivers**: off by default; without it an
 unsigned or self-signed ring-0 plugin or driver is refused.

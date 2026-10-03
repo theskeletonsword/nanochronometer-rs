@@ -33,6 +33,8 @@ C++, Rust, assembly.
 
 ```text
 ncpkg.meta                     the manifest: JSON, signed (section 3)
+icon.png                       the package's icon (optional): the desktop's,
+                               the dock's and the package app's (section 3)
 ncapp/<arch>/main.ncapp        the app, one per architecture (gui, cli)
 lib/<arch>/libfoo.ncdyn        shared libraries, per architecture
 plugins/<arch>/vgm.ncplu       plugins for other apps, per architecture
@@ -76,8 +78,8 @@ Table entry, 40 bytes: name offset (4, in the names region), name length
   sector-padded read) are not the package's.
 * Entry 0 is `ncpkg.meta`, **stored uncompressed**, 1 byte to 1 MiB: a kernel
   without an allocator reads it in place.
-* Every other path is `ncapp/<arch>/…`, `lib/<arch>/…`, `plugins/<arch>/…` or
-  `res/…`; components are `[A-Za-z0-9._+-]`, never start or end with a dot,
+* Every other path is `icon.png`, `ncapp/<arch>/…`, `lib/<arch>/…`,
+  `plugins/<arch>/…` or `res/…`; components are `[A-Za-z0-9._+-]`, never start or end with a dot,
   are never a name Windows/FAT reserves (`CON`, `COM1`…); at most 8 deep, 255
   bytes. Paths are in **strictly increasing case-folded order**: canonical,
   and no two equal on a case-insensitive volume (exFAT, FAT32).
@@ -112,7 +114,6 @@ JSON (RFC 8259), exactly three members:
       "entry": "main.ncapp",
       "ring": 3,
       "capabilities": ["screen", "input", "timer"],
-      "icon": "res/icon.png",
       "categories": ["Multimedia"]
     },
     "libraries": [
@@ -130,13 +131,14 @@ JSON (RFC 8259), exactly three members:
       "network": "client"
     },
     "files": [
+      {"path": "icon.png", "size": 3269, "sha512": "…"},
       {"path": "lib/aarch64/libavcodec.ncdyn", "size": 4198400, "sha512": "…"},
       {"path": "lib/x86_64/libavcodec.ncdyn", "size": 4211840, "sha512": "…"},
       {"path": "ncapp/aarch64/main.ncapp", "size": 51120, "sha512": "…"},
       {"path": "ncapp/x86_64/main.ncapp", "size": 52144, "sha512": "…"},
       {"path": "plugins/aarch64/vgm.ncplu", "size": 30912, "sha512": "…"},
       {"path": "plugins/x86_64/vgm.ncplu", "size": 31004, "sha512": "…"},
-      {"path": "res/icon.png", "size": 3269, "sha512": "…"}
+      {"path": "res/skins/default.json", "size": 812, "sha512": "…"}
     ]
   },
   "signatures": [
@@ -174,7 +176,21 @@ JSON (RFC 8259), exactly three members:
 `input`, `log`, `timer`, `pmu`, `rng`, the module header's `CAP_*` groups,
 and the installer refuses a module that asks for more than these;
 `commands` (required non-empty for `cli`, ≤ 16 lower-case names, linked into
-`/usr/bin`); `icon` (a `res/…` file); `categories` (≤ 8 short names).
+`/usr/bin`); `categories` (≤ 8 short names). The icon is not a field: it
+is the package's `icon.png` (below).
+
+**`icon.png`**, at the package's root, is the package's icon: what the
+desktop, the dock, the taskbar and the package app show. Optional, and a
+file like any other — listed in `files` with its SHA-512, so the
+signatures cover it. A PNG, square, 16 to 512 pixels a side (256 × 256 is
+the size it is drawn at; it is scaled down for the taskbar and the lists),
+not interlaced, at most 1 MiB; any colour type and bit depth, transparency
+kept. `ncpkg build` takes it from the tree's root and checks it; the
+installer checks it again, decodes it completely (an icon that parses but
+does not decode is refused) and copies it to
+`/var/cache/ncpkg/icons/<id>.png`, where the desktop finds every installed
+package's icon without opening a package again. A `lib` package may carry
+one too.
 
 `libraries[]`: `name` (lower case `[a-z0-9][a-z0-9._+-]*`, ≤ 64 — installed
 as `/usr/lib/<name>.ncdyn`), `version` (SemVer), `file` (under
@@ -264,17 +280,32 @@ where *signed bytes* are the exact bytes of the `signed` value in
 SHA-512, a signature covers every byte the package installs; since the role is
 in the message, a signature cannot move between roles even under one key.
 
-**Algorithms.** Roots: `mldsa87+p521`. Self-signatures: `mldsa87`, `mldsa65`,
-`ed25519`, `p256`, `p384`, `p521`, `rsa-pss` (RSASSA-PSS, SHA-512, ≥ 2048
-bits), or a pair joined by `+` — the post-quantum half first, both must
-verify. `sig` is the halves' signatures concatenated (base64); a
+**Algorithms: finished standards only.** Roots: `mldsa87+p521`.
+Self-signatures: ML-DSA (FIPS 204: `mldsa87`, `mldsa65`, `mldsa44`),
+SLH-DSA (FIPS 205: `slhdsa-sha2-128s`, `-128f`, `-192s`, `-192f`, `-256s`,
+`-256f` and the same six as `slhdsa-shake-…`), `ed25519` (RFC 8032),
+`p256`, `p384`, `p521` (ECDSA, FIPS 186-5), `rsa-pss` (RSASSA-PSS, SHA-512,
+≥ 2048 bits, FIPS 186-5), or a pair joined by `+` — two different halves,
+the post-quantum half first (lattice and hash together are allowed), both
+must verify.
+
+Names that are not finished standards are **refused by name**, with the
+reason, rather than treated as merely unknown: the pre-standard
+submissions (`dilithium…`, `crystals-dilithium…` → use ML-DSA;
+`sphincs…` → use SLH-DSA), key-encapsulation schemes that are not
+signatures at all (`kyber…`, `ml-kem…`), FN-DSA/Falcon (not yet a finished
+standard), stateful hash-based schemes (`xmss`, `lms`, `hss` — SP 800-208;
+SLH-DSA is the stateless one), DSA (withdrawn by FIPS 186-5), broken or
+withdrawn candidates (Rainbow, SIKE, SIDH, Picnic, GeMSS), anything over
+SHA-1 or MD5, and RSA other than `rsa-pss`. `sig` is the halves' signatures concatenated (base64); a
 self-signature carries `pubkey` (its public key(s), concatenated). `key` is
 the signing key's fingerprint: the first 8 bytes of SHA-512 over its public
 key(s), `xxxx-xxxx-xxxx-xxxx`.
 
 | Algorithm | Public key | Signature |
 |---|---|---|
-| ML-DSA-87 / -65 | 2592 / 1952 bytes | 4627 / 3309 |
+| ML-DSA-87 / -65 / -44 | 2592 / 1952 / 1312 bytes | 4627 / 3309 / 2420 |
+| SLH-DSA-…-128 / -192 / -256 (`s`, `f`) | 32 / 48 / 64 | 7856 / 16 224 / 29 792 (`s`), 17 088 / 35 664 / 49 856 (`f`) |
 | Ed25519 | 32 | 64 |
 | ECDSA P-256 / P-384 / P-521 (SHA-256/384/512) | SEC1 uncompressed 65 / 97 / 133 | r ‖ s 64 / 96 / 132 |
 | RSA-PSS (verified, not made by `ncpkg`) | DER SubjectPublicKeyInfo | the modulus' length |
@@ -301,6 +332,7 @@ module. The two must agree; a manifest cannot raise a module's privilege.
 /usr/lib/<name>.ncdyn                  a shared library, reference-counted
 /usr/lib/ncplu/<host>/<id>/<file>      a plugin, registered with its host
 /usr/bin/<command>                     a cli launcher: "#!ncapp /apps/<id>/<entry>"
+/var/cache/ncpkg/icons/<id>.png        its icon, for the desktop and the dock
 /var/lib/ncpkg/db.json                 the database (section 7)
 /var/lib/ncpkg/meta/<id>.meta          the installed manifest, for audits
 /var/lib/ncpkg/journal.json            a transaction in progress (section 8)
@@ -362,10 +394,12 @@ one transaction, and a library only the old version used goes.
       "manifest_sha512": "…",
       "files": [
         {"path": "/apps/org.example.player-plus/main.ncapp", "size": 52144, "sha512": "…"},
-        {"path": "/apps/org.example.player-plus/res/icon.png", "size": 3269, "sha512": "…"},
+        {"path": "/apps/org.example.player-plus/res/skins/default.json", "size": 812, "sha512": "…"},
         {"path": "/usr/lib/ncplu/nc.player/org.example.player-plus/vgm.ncplu", "size": 31004, "sha512": "…"},
+        {"path": "/var/cache/ncpkg/icons/org.example.player-plus.png", "size": 3269, "sha512": "…"},
         {"path": "/var/lib/ncpkg/meta/org.example.player-plus.meta", "size": 2210, "sha512": "…"}
       ],
+      "icon": "/var/cache/ncpkg/icons/org.example.player-plus.png",
       "libraries": [
         {"name": "libavcodec", "requirement": ">=61.0.0, <62.0.0", "resolved": "global", "version": "61.3.100"}
       ],
@@ -405,7 +439,8 @@ one is never written over — the manager stops and says why (`ncpkg check`):
    `path` is `/usr/lib/<name>.ncdyn`.
 3. Every package's `global` library exists, counts it, and is the version the
    package records; every `private` one is among the package's files; every
-   plugin and command is among its files.
+   plugin and command is among its files; its `icon`, when set, is its own
+   `/var/cache/ncpkg/icons/<id>.png` and among its files.
 4. No path is owned by two packages, nor by a package and the shared
    libraries.
 
@@ -527,7 +562,7 @@ hash, module); 4 conflict (files, commands, libraries, dependents, versions);
 | path | 255 bytes, 8 components |
 | libraries, depends, plugins | 64 each |
 | commands | 16 |
-| signatures | 8, one per role, ≤ 8192 bytes each |
+| signatures | 8, one per role, ≤ 64 KiB each (SLH-DSA-256f is 49 856 bytes) |
 
 ## 11. Where it runs today
 
@@ -552,6 +587,7 @@ system itself is the same `Manager` over an NCFS-backed `Fs`.
 | `…/ncpkg/sig.rs` | roles, the signed message, trust and badges |
 | `…/ncpkg/version.rs` | SemVer and requirements |
 | `…/ncpkg/path.rs` | the path and name alphabet |
+| `…/ncpkg/icon.rs`, `crates/nanochrono-core/src/png.rs` | the icon's rules, its cache path, thumbnails; PNG decoding |
 | `…/ncpkg/db.rs`, `journal.rs` | the database and the journal |
 | `…/ncpkg/fs.rs` | the filesystem promises; memory (with power cuts) and host implementations |
 | `…/ncpkg/manager.rs` | plan, install, remove, recover, check |
