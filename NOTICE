@@ -31,6 +31,16 @@ only through a text file in /proc, so the boundary is clean. The module is
 optional: nothing in the toolkit requires it.
 
 --------------------------------------------------------------------------
+Licensing exception: kernel/windows/
+--------------------------------------------------------------------------
+
+The optional Windows kernel driver under kernel/windows/ is licensed MIT, not
+Apache-2.0, so that it carries the same terms as the Linux module it mirrors
+(the MIT text is kernel/linux/LICENSE-MIT). Like that module it shares no
+source with the rest of the project and communicates only through IOCTLs on
+its device; nothing in the toolkit requires it.
+
+--------------------------------------------------------------------------
 Reference sources for the bare-metal drivers
 --------------------------------------------------------------------------
 
@@ -163,8 +173,14 @@ constants are reproduced; the code that uses them is written here.
                              Andrew Turner.
                            sys/riscv/riscv/exception.S     BSD-2-Clause
                              Ruslan Bukin.
-                             The entry sequences of docs/NCCALL.md §11.2 and
-                             §11.4 (documentation; no code yet).
+                             The shape of the AArch64 and RISC-V trap
+                             entries (docs/NCCALL.md §11.2 and §11.4): on
+                             AArch64 the frame built below the 128 bytes
+                             left alone under the interrupted stack pointer,
+                             crates/nanochrono-baremetal/src/arch/arm.rs; on
+                             RISC-V the scratch register taken through
+                             sscratch and the switch to a kernel stack before
+                             the first store, arch/riscv.rs
                            sys/kern/syscalls.master
                              The POSIX-class call numbers:
                              crates/nanochrono-sys/src/nr.rs, nccall.h
@@ -236,6 +252,39 @@ constants are reproduced; the code that uses them is written here.
   it. The BSD-3-Clause files add a no-endorsement clause: neither the
   FreeBSD Project, OpenBSD, NetBSD, the University of California, nor any
   of the authors above endorse this software.
+
+--------------------------------------------------------------------------
+Reference sources for the display path and physical memory
+--------------------------------------------------------------------------
+
+What the bare-metal kernel knows about monitors and display hardware was
+taken from published specifications and interface descriptions; no code was
+copied from any of the sources below.
+
+  VESA E-EDID (EDID 1.3 and 1.4) and VESA DisplayID 1.x and 2.0
+    The structure layouts — header, detailed timing descriptors, extension
+    blocks, DisplayID sections and timing data blocks — implemented from the
+    specifications in crates/nanochrono-core/src/edid.rs. No text of the
+    specifications is reproduced.
+
+  QEMU, docs/specs/standard-vga.rst                    GPL-2.0-or-later
+    The documented register interface of QEMU's standard VGA (the Bochs
+    "dispi" index/data registers, the MMIO bar, the EDID blob). Facts only:
+    sdk/drivers/qemu_stdvga.c was written from that description and contains
+    no QEMU code.
+
+  GNU GRUB, grub-core/video/efi_gop.c and i386/pc/vbe.c    GPL-3.0-or-later
+    Read only to learn how `gfxmode=auto` picks a mode, which decided that
+    the ISOs list explicit modes first and leave `auto` as the last resort. Nothing was reproduced, and no GRUB code is
+    linked into the kernel; GRUB ships on the ISOs as a separate program
+    under its own licence.
+
+  FreeBSD, phys_avail[] (sys/amd64/amd64/machdep.c)
+    The idea of a sorted table of free physical runs, carved out of the
+    firmware's memory map before the kernel's own ranges are reserved. The
+    design only (the file is listed above as consulted, not reproduced):
+    crates/nanochrono-core/src/frames.rs and
+    crates/nanochrono-baremetal/src/palloc.rs are written here.
 
 --------------------------------------------------------------------------
 Third-party components
