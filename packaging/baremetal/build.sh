@@ -21,7 +21,7 @@
 #                                                # debug build, QEMU stopped for GDB
 #   packaging/baremetal/build.sh boot x86_64 [crashtest=...] [plugin=<name>]
 #                                                # the same, running at once (no GDB wait);
-#                                                # mode=desktop|cli, kbd=es|us,
+#                                                # mode=gui|cli, kbd=es|us,
 #                                                # wallpaper=<n> and ncdri.*= reach the
 #                                                # kernel command line as well
 #
@@ -520,6 +520,12 @@ run_gdb() {
     accel_for x86_64 max
     local iso="${out_dir}/nanochronometer_x86_64.iso"
     local extra="${crashtest}${kernel_extra}"
+    # crashtest= and plugin= are served by the classic interface (it fires the
+    # armed fault once the USB dump target is in place, and runs the app);
+    # the GUI the menu now boots does not, so ask for it unless a mode= was.
+    if [[ "${extra}" =~ (crashtest|plugin)= && ! "${extra}" =~ (^|[[:space:]])mode= ]]; then
+        extra+=" mode=classic"
+    fi
     if [[ -n "${extra}" ]]; then
         iso="${out_dir}/gdb.iso"
         build_iso_x86 x86_64 "${iso}" "${extra# }"
@@ -958,7 +964,7 @@ build_iso_x86() {
     [[ -n "${background}" ]] && cp "${background}" "${staging}/boot/grub/background.png"
     # Packages and drivers travel on the ISO and reach the kernel as
     # multiboot2 modules, each filed under its path (src/vfs.rs): the
-    # Desktop Experience and the CLI list and run them. x86_64 only, where
+    # NanoChronometer GUI and the CLI list and run them. x86_64 only, where
     # the loader for them exists.
     local modules=""
     if [[ "${arch}" == "x86_64" ]]; then
@@ -1001,14 +1007,8 @@ if background_image /boot/grub/background.png; then
     set color_normal=light-gray/black
 fi
 
-menuentry "NanoChronometer (@ARCH@)" {
-    multiboot2 /boot/nanochrono-kernel @ARGS@
-@MODULES@    set gfxpayload=keep
-    boot
-}
-
-menuentry "NanoChronometer Desktop Experience (@ARCH@)" {
-    multiboot2 /boot/nanochrono-kernel mode=desktop @ARGS@
+menuentry "NanoChronometer GUI (@ARCH@)" {
+    multiboot2 /boot/nanochrono-kernel mode=gui @ARGS@
 @MODULES@    set gfxpayload=keep
     boot
 }
@@ -1025,10 +1025,10 @@ menuentry "NanoChronometer CLI, Spanish keyboard (@ARCH@)" {
     boot
 }
 
-menuentry "NanoChronometer (@ARCH@, text mode)" {
+menuentry "NanoChronometer CLI (@ARCH@, text mode)" {
     set gfxpayload=text
-    multiboot2 /boot/nanochrono-kernel @ARGS@
-    boot
+    multiboot2 /boot/nanochrono-kernel mode=cli @ARGS@
+@MODULES@    boot
 }
 CFG
     # The module lines go where @MODULES@ stands (sed cannot take a
@@ -1048,7 +1048,7 @@ PY
             cat >> "${staging}/boot/grub/grub.cfg" <<CFG
 
 menuentry "Crash test: crashtest=${t}" {
-    multiboot2 /boot/nanochrono-kernel crashtest=${t}
+    multiboot2 /boot/nanochrono-kernel mode=classic crashtest=${t}
     set gfxpayload=keep
     boot
 }
@@ -1257,8 +1257,8 @@ build_iso_petitboot() {
 set timeout=5
 set default=0
 
-menuentry "NanoChronometer (${arch})" {
-    linux /boot/nanochrono-kernel.elf
+menuentry "NanoChronometer CLI (${arch})" {
+    linux /boot/nanochrono-kernel.elf mode=cli
 }
 CFG
     "${mkiso}" -as mkisofs -quiet -R -J -V "NANOCHRONO" \
@@ -1319,12 +1319,9 @@ insmod all_video
 insmod gfxterm
 terminal_output gfxterm
 
-menuentry "NanoChronometer ARM64 (freestanding)" {
-    chainloader /boot/nanochrono-kernel.efi
-    boot
-}
-
-menuentry "NanoChronometer ARM64 (text mode)" {
+# One entry: the EFI loader hands the kernel no command line, so it starts
+# the default session — the GUI, or the CLI on a machine with no screen.
+menuentry "NanoChronometer GUI (ARM64)" {
     chainloader /boot/nanochrono-kernel.efi
     boot
 }

@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
-//! The NanoChronometer Desktop Experience (`mode=desktop`).
+//! The NanoChronometer GUI (`mode=gui`, the default session; `mode=desktop`
+//! is its old name).
 //!
 //! What a desktop operating system's session looks like — a wallpaper,
 //! icons, windows that move, a taskbar with a start menu and a clock — on a
@@ -1521,7 +1522,7 @@ pub unsafe fn run(fb: &Framebuffer, memory: Memory) -> ! {
                     // up for good.
                     crate::boot::Mode::Cli => unsafe { crate::cli::run(Some(fb), memory) },
                     crate::boot::Mode::Classic => unsafe { crate::gui::run(fb, memory) },
-                    crate::boot::Mode::Desktop => {}
+                    crate::boot::Mode::Gui => {}
                 }
             }
             Some(SessionRequest::Run(path)) => {

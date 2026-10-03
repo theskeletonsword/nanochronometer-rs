@@ -29,7 +29,7 @@ impl About {
         let mut v = Text::<64>::new();
         let _ = write!(v, "Version {} · {}", crate::VERSION, crate::system::MACHINE);
         line(&mut y, &UI15_SEMIBOLD, v.as_str(), theme::TEXT);
-        line(&mut y, &UI13, "Desktop Experience · freestanding, no operating system underneath", theme::TEXT_DIM);
+        line(&mut y, &UI13, "NanoChronometer GUI · freestanding, no operating system underneath", theme::TEXT_DIM);
         y += 10;
         if let Some(system) = crate::system::get() {
             let mut m = Text::<64>::new();

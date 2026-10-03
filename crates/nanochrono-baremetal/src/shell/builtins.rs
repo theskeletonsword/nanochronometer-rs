@@ -49,13 +49,13 @@ static COMMANDS: &[Command] = &[
     Command { name: "selftest", usage: "selftest", summary: "run the boot self-test again", run: selftest },
     Command { name: "bench", usage: "bench [isa|crypto|raw] [row]", summary: "the benchmarks (no row: list them)", run: bench },
     Command { name: "loadkeys", usage: "loadkeys <us|es>", summary: "the keyboard layout", run: loadkeys },
-    Command { name: "color", usage: "color [on|off]", summary: "colours in the output (off: plain text, the default)", run: color },
+    Command { name: "color", usage: "color [on|off]", summary: "colours in the GUI Terminal's output (the CLI is always plain text)", run: color },
     Command { name: "apps", usage: "apps", summary: "packages (.ncpkg), apps, libraries, plugins and drivers on this system", run: apps },
     Command { name: "ncpkg", usage: "ncpkg <info|verify|list|files|install|remove> ...", summary: "the package manager (read-only until NCFS is mounted)", run: super::ncpkg::run },
     Command { name: "sudo", usage: "sudo <command> [args]", summary: "run a command as the administrator (this session already is)", run: sudo },
     Command { name: "history", usage: "history", summary: "the commands typed so far", run: history },
     Command { name: "sleep", usage: "sleep <seconds>", summary: "wait", run: sleep },
-    Command { name: "desktop", usage: "desktop", summary: "switch to the Desktop Experience", run: desktop },
+    Command { name: "gui", usage: "gui", summary: "switch to the NanoChronometer GUI", run: gui },
     Command { name: "classic", usage: "classic", summary: "switch to the classic instrument", run: classic },
     Command { name: "reboot", usage: "reboot", summary: "restart the machine (asks for a code)", run: reboot },
     Command { name: "poweroff", usage: "poweroff", summary: "power the machine off (asks for a code)", run: poweroff },
@@ -66,7 +66,7 @@ static COMMANDS: &[Command] = &[
 
 /// Every command's name, for completion.
 pub fn names() -> impl Iterator<Item = &'static str> {
-    COMMANDS.iter().map(|c| c.name).chain(["shutdown", "cpuinfo", "halt"])
+    COMMANDS.iter().map(|c| c.name).chain(["shutdown", "cpuinfo", "halt", "desktop"])
 }
 
 /// Runs `argv` and returns its exit status.
@@ -74,6 +74,8 @@ pub fn dispatch(shell: &mut Shell, argv: &[&str], term: &mut Term, now_ns: u64) 
     let name = match argv[0] {
         "shutdown" | "halt" => "poweroff",
         "cpuinfo" => "lscpu",
+        // The GUI's old name.
+        "desktop" => "gui",
         other => other,
     };
     let mut out = Out::new(term, shell.mirror, shell.color);
@@ -658,6 +660,10 @@ fn sudo(shell: &mut Shell, out: &mut Out<'_>, argv: &[&str], now_ns: u64) -> i32
 
 fn color(shell: &mut Shell, out: &mut Out<'_>, argv: &[&str], _: u64) -> i32 {
     match argv.get(1).copied() {
+        Some("on") if shell.plain_only => {
+            let _ = writeln!(out, "color: the CLI is plain text; colours are the GUI Terminal's\r");
+            return 1;
+        }
         Some("on") => shell.color = true,
         Some("off") => shell.color = false,
         None => {}
@@ -701,9 +707,9 @@ fn parse_seconds(s: &str) -> Option<u64> {
     Some(ns)
 }
 
-fn desktop(shell: &mut Shell, out: &mut Out<'_>, _: &[&str], _: u64) -> i32 {
-    let _ = writeln!(out, "starting the Desktop Experience...\r");
-    shell.request = Request::Desktop;
+fn gui(shell: &mut Shell, out: &mut Out<'_>, _: &[&str], _: u64) -> i32 {
+    let _ = writeln!(out, "starting the NanoChronometer GUI...\r");
+    shell.request = Request::Gui;
     0
 }
 

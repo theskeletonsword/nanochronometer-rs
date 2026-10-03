@@ -13,15 +13,27 @@ One kernel, chosen on the command line (`mode=`), one GRUB entry each:
 
 | GRUB entry | `mode=` | What runs |
 |---|---|---|
-| NanoChronometer | `classic` (default) | the instrument, full screen |
-| NanoChronometer Desktop Experience | `desktop` | windows, taskbar, apps (`src/desktop/`) |
+| NanoChronometer GUI | `gui` (the default; `desktop`, its old name, still works) | windows, taskbar, apps (`src/desktop/`); with no framebuffer, the CLI |
 | NanoChronometer CLI | `cli` | a plain text terminal and a Unix-like shell (`src/cli.rs`, `src/shell/`) |
 | … CLI, Spanish keyboard | `cli kbd=es` | the same with the `es` layout |
+| … CLI, text mode | `cli` + `gfxpayload=text` | the CLI on the VGA text screen and the serial line |
 
-Off x86 the command line is the device tree's `/chosen/bootargs`.
+Off x86 the command line is the device tree's `/chosen/bootargs`; where the
+loader passes none (the ARM64 EFI ISO, Open Firmware) the default runs —
+the GUI, or the CLI on a machine with no screen (PPC64 and e500 have no
+framebuffer driver, so theirs is always the CLI). A later `mode=` overrides
+an earlier one.
 
-The CLI is **plain text by default**: light grey on black, no colours, no
-coloured prompt — a console, not a GUI dressed as one. `color on` opts in.
+The classic instrument — the stopwatch, clock, timer and **BENCH** tabs full
+screen — has no menu entry any more. It stays reachable as `mode=classic`,
+from the GUI's start menu and with the CLI's `classic` command, because the
+BENCH tab lives there and because it is the test harness: `crashtest=` and
+`plugin=` are served by it (the debug ISO's crash-test entries and
+`build.sh gdb|boot` add `mode=classic` for them).
+
+The CLI is **plain text, always**: light grey on black, no colours, no
+coloured prompt — a console, not a GUI dressed as one. Its shell refuses
+`color on`; colours exist only in the GUI's Terminal app.
 Its `nanochrono` command is the hosted CLI's command set with the same
 options and output; what needs an operating system (`ntp`, `tls`) says so.
 `top` shows CPU activity (APERF/MPERF, AMU, PURR), effective frequency, IPC,

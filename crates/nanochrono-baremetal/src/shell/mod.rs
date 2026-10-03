@@ -112,8 +112,8 @@ impl Write for Out<'_> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Request {
     None,
-    /// Switch the session to the desktop.
-    Desktop,
+    /// Switch the session to the NanoChronometer GUI.
+    Gui,
     /// Switch the session to the classic instrument.
     Classic,
     /// Close the terminal (a desktop window); ignored full screen.
@@ -163,6 +163,9 @@ pub struct Shell {
     pub mirror: bool,
     /// Colours in the output (see [`Out::color`]).
     pub color: bool,
+    /// The CLI session's shell: plain text for good, `color on` refused.
+    /// Colours belong to the GUI's Terminal.
+    pub plain_only: bool,
     /// The last command's exit status, for `$?` and the prompt.
     pub status: i32,
 }
@@ -190,8 +193,15 @@ impl Shell {
             utf8_need: 0,
             mirror,
             color,
+            plain_only: false,
             status: 0,
         }
+    }
+
+    /// The CLI session's shell: mirrored to the serial line, and plain text
+    /// whatever is asked — no colour, no coloured prompt.
+    pub fn cli() -> Shell {
+        Shell { plain_only: true, ..Shell::new(true, false) }
     }
 
     fn out<'a>(&self, term: &'a mut Term) -> Out<'a> {

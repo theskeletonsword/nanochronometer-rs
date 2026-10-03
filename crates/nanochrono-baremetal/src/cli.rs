@@ -102,7 +102,8 @@ pub unsafe fn run(fb: Option<&Framebuffer>, memory: Memory) -> ! {
 
     ACTIVE.store(true, core::sync::atomic::Ordering::Relaxed);
     restore_sink();
-    let mut shell = Shell::new(true, false);
+    // Plain text for good: `color on` is refused here (`Shell::cli`).
+    let mut shell = Shell::cli();
     shell.start(term);
 
     let mut next_frame = 0u64;
@@ -135,10 +136,10 @@ pub unsafe fn run(fb: Option<&Framebuffer>, memory: Memory) -> ! {
         shell.tick(term, now_ns);
         match shell.request {
             Request::None | Request::Close => shell.request = Request::None,
-            Request::Desktop => {
+            Request::Gui => {
                 ACTIVE.store(false, core::sync::atomic::Ordering::Relaxed);
                 restore_sink();
-                crate::boot::set_mode(crate::boot::Mode::Desktop);
+                crate::boot::set_mode(crate::boot::Mode::Gui);
                 if let Some(fb) = fb {
                     // SAFETY: kernel privilege; the CLI gives the screen up
                     // for good.

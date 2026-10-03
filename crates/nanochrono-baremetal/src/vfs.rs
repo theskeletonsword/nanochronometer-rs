@@ -119,7 +119,7 @@ Welcome to NanoChronometer — a chronometer with no operating system under it.
   nanochrono --help     the same commands as the hosted CLI
   help                  every shell command
   top                   what the machine is doing, live
-  desktop               the Desktop Experience
+  gui                   the NanoChronometer GUI
 
 ";
 

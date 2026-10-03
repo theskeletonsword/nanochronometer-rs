@@ -4,15 +4,19 @@
 //!
 //! # The interfaces
 //!
-//! One kernel, three ways to use it, chosen by `mode=` on the command line —
+//! One kernel, two ways to use it, chosen by `mode=` on the command line —
 //! which the ISO's GRUB menu sets, one entry each:
 //!
-//! * `mode=classic` (the default): the instrument — the stopwatch, clock and
-//!   timer full screen, as every release has drawn it.
-//! * `mode=desktop`: the NanoChronometer Desktop Experience — windows, a
-//!   taskbar, apps (`crate::desktop`).
-//! * `mode=cli`: a text terminal and a Unix-like shell, the hosted CLI's
-//!   `nanochrono` among its commands (`crate::cli`).
+//! * `mode=gui` (the default): the NanoChronometer GUI — windows, a taskbar,
+//!   apps (`crate::desktop`). Without a framebuffer it falls back to the CLI.
+//!   `mode=desktop`, its old name, still works.
+//! * `mode=cli`: a plain-text terminal and a Unix-like shell, the hosted
+//!   CLI's `nanochrono` among its commands (`crate::cli`). No colour.
+//!
+//! The classic instrument (`mode=classic`: the stopwatch, clock, timer and
+//! BENCH tabs full screen) is no longer a menu entry; it stays reachable from
+//! the command line, the GUI's start menu and the `classic` command, because
+//! the BENCH tab lives there.
 //!
 //! Other options: `kbd=us|es` (the keyboard layout), `wallpaper=<n>`.
 //! Off x86 the command line is the device tree's `/chosen/bootargs`.
@@ -32,26 +36,29 @@ use core::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 /// The interface a session runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
-    Classic,
-    Desktop,
+    /// The NanoChronometer GUI, the default.
+    Gui,
+    /// The plain-text CLI.
     Cli,
+    /// The classic full-screen instrument (no menu entry).
+    Classic,
 }
 
 impl Mode {
     pub fn from_name(name: &str) -> Option<Mode> {
         match name {
-            "classic" | "instrument" | "gui" => Some(Mode::Classic),
-            "desktop" | "de" => Some(Mode::Desktop),
+            "gui" | "desktop" | "de" => Some(Mode::Gui),
             "cli" | "shell" | "text" | "terminal" => Some(Mode::Cli),
+            "classic" | "instrument" => Some(Mode::Classic),
             _ => None,
         }
     }
 
     pub const fn name(self) -> &'static str {
         match self {
-            Mode::Classic => "classic",
-            Mode::Desktop => "desktop",
+            Mode::Gui => "gui",
             Mode::Cli => "cli",
+            Mode::Classic => "classic",
         }
     }
 }
@@ -87,9 +94,11 @@ pub fn command_line() -> &'static str {
     unsafe { (*core::ptr::addr_of!(COMMAND_LINE)).as_str() }
 }
 
-/// The value of `key=value` on the command line, if present.
+/// The value of `key=value` on the command line, if present. A later one
+/// overrides an earlier one, as on Linux and the BSD loaders: a menu entry's
+/// own `mode=gui` gives way to a `mode=` appended after it.
 pub fn option(key: &str) -> Option<&'static str> {
-    command_line().split_ascii_whitespace().find_map(|w| {
+    command_line().split_ascii_whitespace().rev().find_map(|w| {
         let (k, v) = w.split_once('=')?;
         (k == key).then_some(v)
     })
@@ -104,18 +113,18 @@ pub fn flag(key: &str) -> bool {
 
 pub fn mode() -> Mode {
     match MODE.load(Ordering::Relaxed) {
-        1 => Mode::Desktop,
-        2 => Mode::Cli,
-        _ => Mode::Classic,
+        1 => Mode::Cli,
+        2 => Mode::Classic,
+        _ => Mode::Gui,
     }
 }
 
 pub fn set_mode(mode: Mode) {
     MODE.store(
         match mode {
-            Mode::Classic => 0,
-            Mode::Desktop => 1,
-            Mode::Cli => 2,
+            Mode::Gui => 0,
+            Mode::Cli => 1,
+            Mode::Classic => 2,
         },
         Ordering::Relaxed,
     );

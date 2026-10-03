@@ -122,7 +122,7 @@ impl TerminalApp {
     fn requests(&mut self) -> Response {
         let request = core::mem::replace(&mut self.shell().request, Request::None);
         match request {
-            Request::None | Request::Desktop => Response::default(),
+            Request::None | Request::Gui => Response::default(),
             Request::Close => Response { close: true, ..Response::default() },
             Request::Classic => Response { session: Some(crate::boot::Mode::Classic), ..Response::default() },
         }
