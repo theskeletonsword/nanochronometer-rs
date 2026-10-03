@@ -331,6 +331,11 @@ under COPPA in the U.S.; check your own country's law. If you are below it:
 The rules are the same for everyone: the embargo, the closed list of
 channels and the limits on data apply to minors too.
 
+Why it works this way: since nobody is asked their age and nothing but a
+handle and a contact is kept, there is next to no data about minors to
+protect in the first place. Collecting less is the protection — data
+minimisation, as GDPR Article 5(1)(c) puts it.
+
 The rules:
 
 1. Test on systems you own or are explicitly allowed to test: your own
