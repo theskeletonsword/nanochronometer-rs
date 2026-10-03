@@ -6,22 +6,55 @@
 
 Nanosecond-resolution stopwatch, precision clock and ISA microbenchmark
 toolkit, built directly on the architectural counters — `RDTSC`/`RDTSCP` on
-x86-64, `CNTVCT_EL0` on AArch64 — with the calibration, dispatch and drift
-tracking that make those counters trustworthy.
+x86, `CNTVCT_EL0` on AArch64, the time base on PowerPC, `rdtime` on RISC-V —
+with the calibration, dispatch and drift tracking that make those counters
+trustworthy. And, around that instrument, a small operating system of its own.
 
 ```
 00:00:12:347:891:042
 hh:mm:ss:mmm:uuu:nnn
 ```
 
-Version 3.0 is a complete rewrite in Rust of the 2.x C/assembler codebase.
-The C ABI is preserved, so the existing language wrappers keep working.
+Version 4.0. One Rust codebase, three ways to run it:
+
+| | What | Where |
+|---|---|---|
+| **Hosted** | the library (C ABI, `include/nanochrono.h`), the `nanochrono` CLI, the desktop GUI (`iced`), the Android app, language wrappers | Linux, Windows, macOS, Android |
+| **Bare metal** | a freestanding kernel booted straight from GRUB, UEFI, OpenSBI or Open Firmware: the **NanoChronometer GUI** (the default session) or the **NanoChronometer CLI** (plain text), the instrument, apps and drivers | nine ISAs: x86-64, i386, AArch64, ARM32, PPC64, PPC64LE, PPC, RISC-V 64 and 32 |
+| **Optional ring 0 modules** | `nanochrono.ko` and `nanochrono.sys`, for counters a user process cannot reach | Linux, Windows |
+
+### The bare-metal system today
+
+| Piece | State | Documentation |
+|---|---|---|
+| Boot on nine ISAs, with a self-test on every boot | done | [docs/SYSTEM.md](docs/SYSTEM.md) |
+| Sessions: NanoChronometer GUI (windows, taskbar, apps) and CLI (Unix-like shell) | done | [docs/ECOSYSTEM.md](docs/ECOSYSTEM.md) §1 |
+| `nccall`, one system call for every ISA and language (C, C++, assembly, Rust), with one dispatcher behind every trap | done, proven at boot on all nine | [docs/NCCALL.md](docs/NCCALL.md) |
+| Ring 3 for apps, with the red zone kept intact across the boundary | done on x86-64 | [docs/NCCALL.md](docs/NCCALL.md) §3 |
+| Apps and packages (`.ncapp`, `.ncpkg`), signed ML-DSA-87 + P-521 | done | [docs/NCPKG.md](docs/NCPKG.md) |
+| NCFS, the copy-on-write filesystem, and the sealed `ncinitramdisk` | done | [docs/NCFS.md](docs/NCFS.md) |
+| Drivers as modules (`.ncdri`): a stable ABI with no kernel headers, loaded at boot behind a ring-0 trust gate | done on x86-64 | [docs/NCDRI.md](docs/NCDRI.md) |
+| Display: the firmware's framebuffer on any connector; the monitor's native mode from its EDID through a display driver; 4K composited | done (QEMU/Bochs VGA driver) | [docs/BAREMETAL_DRIVERS.md](docs/BAREMETAL_DRIVERS.md) |
+| Keyboards and pointers: PS/2, USB (xHCI), I2C-HID touchpads | done | [docs/BAREMETAL_DRIVERS.md](docs/BAREMETAL_DRIVERS.md) |
+| Crash dumps to serial and to the boot stick | done | [docs/CRASH_DUMPS.md](docs/CRASH_DUMPS.md) |
+| Toolchain, C library, OpenSSL and AWS-LC | specified | [docs/NCTOOLCHAIN.md](docs/NCTOOLCHAIN.md) |
+| Networking, the hypervisor, users, the installer | planned | [docs/SYSTEM.md](docs/SYSTEM.md) |
+
+What it is built from: FreeBSD, OpenBSD and NetBSD where the problem has
+already been solved well — register conventions, driver models, the
+system-call boundary — with their licences kept and every file named in
+[`NOTICE`](NOTICE). Never Linux: it is GPLv2, and this project is Apache-2.0.
+
+Found a security problem? See [`SECURITY.md`](SECURITY.md).
 
 ---
 
-## What changed from 2.x
+## From 2.x to the Rust codebase
 
-| Area | 2.x | 3.0 |
+The 3.0 rewrite replaced the 2.x C/assembler codebase; the C ABI was
+preserved, so the existing language wrappers keep working.
+
+| Area | 2.x | 3.0 and later |
 |---|---|---|
 | Language | C99 + NASM + GNU as | Rust, one workspace |
 | Assembly | 51 `.asm` / `.S` files, NASM required | `core::arch::asm!` inline; one `.S`, for the bare-metal boot stub |
@@ -344,20 +377,31 @@ walks through it.
 | Architecture | Rust target | Machine (QEMU) | Enters via | Console |
 |---|---|---|---|---|
 | x86-64 | `x86_64-nanochrono-none` | PC, **KVM** | multiboot 1/2 → `boot32.S` | 16550 (COM1), VGA |
+| i386 | `i686-nanochrono-none` | PC | multiboot 1/2 → `boot_i386.S` | 16550 (COM1), VGA |
 | AArch64 | `aarch64-unknown-none` | `virt` at EL1, EL2 or EL3 | ELF entry | PL011 |
+| ARM32 | `armv7a-none-eabihf` | `virt`, Cortex-A15 | ELF entry, or UEFI (`BOOTARM.EFI`) | PL011 |
 | ppc64 / ppc64le | `powerpc64{,le}-nanochrono-none` | `powernv8/9/10` (OpenPOWER) | skiboot, in place at `0x2000_0000` | OPAL |
 | ppc (e500) | `powerpc-nanochrono-none` | `ppce500 -cpu e500mc` | ePAPR (device tree in r3) | 16550 in CCSR |
 | ppc (G3/G4) | the same image | `mac99`, `g3beige`; real Macs | Open Firmware (client interface in r5) | OF `stdout` |
 | RISC-V 64 / 32 | `riscv64gc-` / `riscv32imac-unknown-none-elf` | `virt` + OpenSBI | SBI, S-mode (a0 = hart, a1 = tree) | 16550, else SBI console |
 
-Every architecture other than x86-64 runs under TCG: KVM only runs guests of
-the host's own architecture.
+KVM runs only guests of the host's own architecture (`build.sh` detects which
+one that is); every other guest runs under TCG.
 
-A freestanding build for these targets: no
-syscalls, no allocator, no runtime. It exists because the measurement floor a
-hosted process can reach is set by the kernel underneath it — scheduling,
-interrupts, the syscall boundary — and the only way to see past that floor is
-to remove the kernel.
+A freestanding build for these targets: no host operating system, no general
+heap, no runtime — everything the kernel needs lives in its image, and a page
+allocator (`src/palloc.rs`, on the loader's memory map) serves only what the
+image cannot size in advance: a 4K screen's back buffer, a driver module. It
+exists because the measurement floor a hosted process can reach is set by the
+kernel underneath it — scheduling, interrupts, the syscall boundary — and the
+only way to see past that floor is to own the kernel.
+
+The boot menu offers two sessions (`mode=` on the command line): the
+**NanoChronometer GUI**, the default — windows, a taskbar, the stopwatch,
+terminal, task manager, files, settings and apps — and the
+**NanoChronometer CLI**, a Unix-like shell that is plain text on purpose
+(it refuses `color on`). With no framebuffer the GUI falls back to the CLI over
+the serial line.
 
 **The counter layer is the same code.** `nanochrono-baremetal` depends on
 `nanochrono-core` with `default-features = false`, which keeps `arch`,
@@ -372,20 +416,23 @@ process rather than a copy that has drifted.
 | CPU features | HWCAP, sysctl, `IsProcessorFeaturePresent` | `CPUID`, or the `ID_AA64*` registers read at EL1 |
 | Output | `write(2)` | 16550 UART / PL011 |
 
-#### Only two loose files, and why
+#### The few loose files, and why
 
-`boot/boot32.S` and the linker scripts are the only assembly outside
-`core::arch::asm!` in this entire project. `boot32.S` has to exist: a
-multiboot loader enters in 32-bit protected mode with no stack and no paging,
-which is before any of Rust's ABI assumptions hold, and the multiboot header
-must land in the first 32 KiB of the image — which needs a named section a
-linker script places. It builds a stack, identity-maps the first gigabyte,
-enables SSE and AVX state, switches to long mode, and jumps to `kmain`.
-Everything after that is Rust.
+Almost every instruction sequence lives in `core::arch::asm!` or
+`global_asm!` next to the Rust that uses it. The files under
+`crates/nanochrono-baremetal/boot/` exist because something has to run
+before Rust's ABI assumptions hold, or outside the kernel image altogether:
 
-AArch64 needs no equivalent: the loader enters in 64-bit mode with the ABI
-already valid, so its entry stub — park the secondary cores, enable FP/SIMD in
-`CPACR_EL1`, set a stack, zero `.bss` — is `global_asm!` inside `main.rs`.
+| File | Why it is not Rust |
+|---|---|
+| `boot32.S` | x86_64 entry. A multiboot loader enters in 32-bit protected mode with no stack and no paging, and the multiboot header must land in the first 32 KiB of the image — a named section a linker script places. It builds a stack, identity-maps the first gigabyte, enables SSE and AVX state, switches to long mode, and jumps to `kmain`. |
+| `boot_i386.S` | i386 entry: the same minus long mode — saves the loader's registers, zeroes `.bss`, sets a stack, enables SSE, loads its own GDT/IDT, and calls `kmain` cdecl. |
+| `efi_loader.c` | The UEFI program the ARM32 and RISC-V ISOs boot (`BOOTARM.EFI`, `BOOTRISCV64.EFI`, `BOOTRISCV32.EFI`): copies the embedded kernel ELF to its link address, exits boot services and jumps. |
+| `efi_loader_aarch64.c` + `kernel_blob.S` | The same for AArch64; `kernel_blob.S` `.incbin`s the kernel ELF into the loader. |
+
+Plus the linker scripts. AArch64 and the other ISAs need no hand-written
+entry file of their own: their entry stubs — park the secondary cores, enable
+FP/SIMD, set a stack, zero `.bss` — are `global_asm!` inside the crate.
 
 #### What the boot stub has to enable first
 
@@ -1540,51 +1587,85 @@ calibration that silently went unpinned is worse than one known to be.
 ## Layout
 
 ```
-Cargo.toml                  workspace
+Cargo.toml                  workspace (version 4.0.0)
 crates/
   nanochrono-core/          counters, inline asm, dispatch, calibration, NTP, probes, NC_RNG,
-                            modules (.ncapp/.ncdyn/.ncplu/.ncdri), .ncpkg packages and the package manager
+                            modules (.ncapp/.ncdyn/.ncplu/.ncdri), .ncpkg and the package manager,
+                            NCFS, nccall's dispatcher, the page-range allocator, EDID — all no_std
+                            where the kernel uses them, and tested on the host
+  nanochrono-sys/           the ring-3 side of nccall: nccall!, POSIX-class calls, errno, NcAlloc
   nanochrono-crypto/        rustls provider primitives + TLS handshake timing
   nanochrono-bench/         the three benchmark modes and the three-pass harness
   nanochrono-cli/           command-line front end
   nanochrono-gui/           iced desktop application
   nanochrono-ffi/           C ABI for the language wrappers
-  nanochrono-baremetal/     freestanding kernel: direct PMU, no syscalls
-    boot/boot32.S             the only loose assembly file in the project
-    boot/*.ld                 linker scripts
-    src/ncplu.rs              the module loader (an .ncapp, or one out of an .ncpkg), signature tiers, containment
-    src/shell/ncpkg.rs        the kernel's read-only ncpkg (info, verify, list, files)
-    src/ring3.rs              ring 3 for community plugins: user mapping, nccall
-  nanochrono-plugins/       Apache-2.0 apps (Snake), packed as .ncapp and .ncpkg by build.sh
-sdk/                        C app SDK: ncplu.h (the module ABI), runtime, Makefile, examples
-include/nanochrono.h        C header
-packaging/linux/            .desktop entry and installer
-packaging/macos/            osxcross cross-build, lipo, .app bundle
-packaging/baremetal/        freestanding kernel build, QEMU boot, gdb/ scripts
-tools/nanodump.py           reads the bare-metal kernel's crash dumps
-tools/ncplu.py              packs a cdylib into a module (.ncapp, .ncdri, .ncdyn, .ncplu)
-tools/ncplu-sign/           module keys, ML-DSA-87 + P-521 signing and verifying (host tool)
-tools/ncpkg/                builds, signs, verifies, installs and removes .ncpkg packages (host tool)
-tools/nc_rng_kat.py         NC_RNG's known answers, from OpenSSL
-packaging/android/          NDK cross-build for the four ABIs
-kernel/linux/               optional ring 0 module, nanochrono.ko (Rust, Dual MIT/GPL)
+  nanochrono-android/       the Android app's native side
+  nanochrono-baremetal/     the freestanding kernel (outside the workspace; packaging/baremetal/build.sh)
+    boot/                     boot stubs (boot32.S, boot_i386.S), EFI loaders, linker scripts
+    src/arch/                 per-ISA vectors and trap entries
+    src/nccall/               nccall's frames, per-ISA glue and boot proof
+    src/ring3.rs              ring 3 for apps: user mapping, SYSCALL, containment
+    src/ncplu.rs              the app loader: packages, signature tiers, relocation
+    src/ncdri.rs              the driver loader and nckernel_api_t
+    src/palloc.rs             physical pages from the loader's memory map
+    src/desktop/, cli.rs      the GUI and CLI sessions
+    src/shell/                the CLI's shell and commands
+  nanochrono-plugins/       Apache-2.0 apps (Snake, ncsys-demo), packed as .ncapp and .ncpkg
+sdk/
+  include/                  ncplu.h (apps), nccall.h (system calls), ncdri_api.h (drivers)
+  examples/                 C apps, the hostile ones included (smash, faulter, peek, poke)
+  drivers/                  .ncdri drivers: hello_ncdri (QEMU edu), qemu_stdvga (display)
+  targets/                  ring-3 Rust targets, red zone on
+include/nanochrono.h        hosted C header
+kernel/linux/               optional ring 0 module, nanochrono.ko (Rust, MIT OR GPL-2.0-only)
 kernel/windows/             the same for Windows, nanochrono.sys (Rust, MIT), osslsigncode signing
-python/, wrappers/          language bindings (unchanged)
-docs/                       design notes carried over from 2.x
-assets/                     icon, logo, optional display font
+packaging/                  linux/, macos/, android/, baremetal/ (build.sh, QEMU, gdb), release/
+tools/
+  ncplu.py                  packs a cdylib into a module (.ncapp, .ncdri, .ncdyn, .ncplu)
+  ncplu-sign/               module keys, ML-DSA-87 + P-521 signing and verifying (host tool)
+  ncpkg/                    builds, signs, verifies, installs and removes .ncpkg packages (host tool)
+  ncfs/                     makes, checks and seals NCFS images (host tool)
+  check-redzone.py          reads machine code and fails on any access below the stack pointer
+  nanodump.py               reads the bare-metal kernel's crash dumps
+  nc_rng_kat.py             NC_RNG's known answers, from OpenSSL
+  gen-*.py, rasterise-*.py  icons, wallpapers and fonts, regenerated from their sources
+python/, wrappers/          language bindings
+docs/                       the specifications (below)
+assets/                     icons, logo, fonts, wallpapers
 ```
+
+## Documentation
+
+| Document | What |
+|---|---|
+| [SYSTEM.md](docs/SYSTEM.md) | the whole bare-metal system: boot, memory, drivers, network, status |
+| [ECOSYSTEM.md](docs/ECOSYSTEM.md) | sessions, file types, trust and badges, apps |
+| [NCCALL.md](docs/NCCALL.md) | the ring 3 ↔ ring 0 boundary on nine ISAs, the red zone |
+| [NCDRI.md](docs/NCDRI.md) | the driver ABI, the loader, display drivers |
+| [NCPKG.md](docs/NCPKG.md) | packages, manifests, signatures, the package manager |
+| [NCFS.md](docs/NCFS.md) | the filesystem and the sealed initramdisk |
+| [NCTOOLCHAIN.md](docs/NCTOOLCHAIN.md) | the toolchain package, the C library, OpenSSL and AWS-LC |
+| [BAREMETAL_DRIVERS.md](docs/BAREMETAL_DRIVERS.md) | display, keyboards and pointers, the PMU |
+| [BAREMETAL_LIBRARIES.md](docs/BAREMETAL_LIBRARIES.md) | using `libnanochrono.a` / `.so` in a kernel of your own |
+| [CRASH_DUMPS.md](docs/CRASH_DUMPS.md) | crash dumps and reading them |
+| [THIRD_PARTY_NOTICES.md](docs/THIRD_PARTY_NOTICES.md) | what third-party code a release carries |
 
 ---
 
 ## Tests
 
 ```sh
-cargo test --workspace
+cargo test --workspace                       # and --profile debug-og: the -Og build
 cargo clippy --workspace --all-targets
+packaging/baremetal/build.sh test            # the kernel's host-side tests (nanochrono-core)
+make -C sdk drivers                          # every driver, nine ISAs, red-zone checked
+(cd tools/ncpkg && cargo test)               # the package tool
 ```
 
-171 tests, all Rust — there is no C in this repository, test code included.
-Network-dependent TLS tests are opt-in:
+More than 500 tests, all Rust — there is no C in the test code. The kernel
+proves the rest at boot, on every architecture, before a session starts:
+`selftest complete; halting` on the serial log. Network-dependent TLS tests are
+opt-in:
 
 ```sh
 NANOCHRONO_NETWORK_TESTS=1 cargo test -p nanochrono-crypto
@@ -1605,6 +1686,13 @@ exists". That is not hypothetical: writing it found six entry points
 `nc_measure_kernel_timecall_overhead_cycles`,
 `nc_measure_api_call_overhead_cycles`) that the Node.js and Lua wrappers
 declare and the migration had dropped.
+
+---
+
+## Security
+
+Report vulnerabilities privately — see [`SECURITY.md`](SECURITY.md), which also
+sets out the safe harbour for good-faith research.
 
 ---
 
