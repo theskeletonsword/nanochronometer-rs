@@ -533,9 +533,10 @@ impl Input {
     /// loop never returns, so the `Input` it owns is such a home — this is
     /// called from there, once, and not from `init`, whose `Input` is still
     /// about to be moved to the caller.
-    /// Reads a plugin's `.ncplu` file from the boot medium's FAT partition
-    /// into the plugin loader's image buffer, returning how many bytes were
-    /// read. `name` is the long file name, e.g. `SNAKE.NCPLU`.
+    /// Reads an app (`.ncapp`), a package (`.ncpkg`) or a 4.0 `.ncplu` from
+    /// the boot medium's FAT partition into the loader's image buffer,
+    /// returning how many bytes were read. `name` is the long file name,
+    /// e.g. `SNAKE.NCAPP`.
     ///
     /// # Safety
     /// Drives the USB storage controller; requires ring 0.

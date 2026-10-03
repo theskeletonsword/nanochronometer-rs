@@ -314,7 +314,7 @@ pub unsafe fn command_line_v1(info: u64) -> Option<&'static str> {
 const TAG_MODULE: u32 = 3;
 
 /// One module: where its bytes are, and the string the loader gave it — the
-/// path the kernel files it under (`/usr/lib/libfoo.nsdyn`, `initrd.cpio`).
+/// path the kernel files it under (`/usr/lib/libfoo.ncdyn`, `initrd.cpio`).
 #[derive(Debug, Clone, Copy)]
 pub struct Module {
     pub start: u64,

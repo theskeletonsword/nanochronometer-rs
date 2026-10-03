@@ -3,10 +3,10 @@ name = "nanochrono-plugin-snake"
 version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
-description = "Snake, as a NanoChronometer .ncplu plugin. An original, not a port."
+description = "Snake, as a NanoChronometer app (.ncapp, and .ncpkg). An original, not a port."
 
 [lib]
-# A shared object (ET_DYN) is what tools/ncplu.py packs into a .ncplu: the
+# A shared object (ET_DYN) is what tools/ncplu.py packs into an .ncapp: the
 # loader wants position-independent code with only dynamic relocations.
 crate-type = ["cdylib"]
 

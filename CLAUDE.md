@@ -52,6 +52,12 @@ in `CLAUDE.local.md`.
   Windows = llvm-mingw (UCRT), macOS = osxcross. `tools/gen-header.sh`
   (cbindgen) generates both headers: hosted from `nanochrono-ffi`, bare metal
   from `crates/nanochrono-baremetal/src/abi.rs` (the whole bare-metal C ABI).
+- Packages (`.ncpkg`, docs/NCPKG.md): the format, manifest, database and
+  transaction engine are `nanochrono-core::ncpkg` (`no_std`; the manager
+  needs the `alloc` feature, which `std` implies and the kernel does not
+  enable). The host tool is `tools/ncpkg` (outside the workspace, like
+  `tools/ncplu-sign`): `cd tools/ncpkg && cargo test`. Modules are
+  `.ncapp`/`.ncdri`/`.ncdyn`/`.ncplu`, packed by `tools/ncplu.py`.
 - Bare-metal kernel (`crates/nanochrono-baremetal`, outside the workspace):
   `packaging/baremetal/build.sh [arch]`, `build.sh run <arch>`. Needs nightly
   plus `rust-src`; `RUST_TARGET_PATH` must point at the crate's `targets/`.

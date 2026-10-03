@@ -20,7 +20,12 @@ simd = []
 # `arch`, `backend`, `simd`, `redundancy`. That subset is what
 # `nanochrono-baremetal` builds on, so a freestanding kernel runs the same
 # inline assembly as a hosted process.
-std = []
+std = ["alloc"]
+# `no_std` with a heap: the package manager (`ncpkg::manager`, its database
+# and journal), the package builder and the owned JSON writer. Implied by
+# `std`; a freestanding build turns it on once it has an allocator. The
+# kernel today has none and reads packages with the allocation-free half.
+alloc = []
 
 [dependencies]
 

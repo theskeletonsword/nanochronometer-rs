@@ -4,9 +4,11 @@
 //!
 //! * `/etc`, `/usr/share/doc`: files built into the image.
 //! * Every boot module at the path its string names (`crate::boot`):
-//!   `/usr/lib/libfoo.nsdyn` is where a shared library of the ecosystem is
-//!   found by the loader, `/apps/X.NCPLU` a package, `/boot/drivers/X.NCDRI`
-//!   a driver. A module with no path goes under `/boot/`.
+//!   `/usr/lib/libfoo.ncdyn` is where a shared library of the ecosystem is
+//!   found by the loader, `/apps/X.NCPKG` a package, `/boot/drivers/X.NCDRI`
+//!   a driver. A module with no path goes under `/boot/`. An initrd built
+//!   with the host's `ncpkg --root` brings installed packages: `/apps/<id>/`,
+//!   `/usr/lib`, and the database in `/var/lib/ncpkg/db.json`.
 //! * A cpio archive (`newc`, what `cpio -o -H newc` and the Linux initramfs
 //!   tools write) passed as a module named `initrd` or `*.cpio`, or as the
 //!   device tree's initrd, unpacked into the same tree.
@@ -122,15 +124,22 @@ const OS_RELEASE: &str = concat!(
 const ECOSYSTEM: &str = "\
 The NanoChronometer ecosystem's file types
 
-  .ncplu   a package (like an XAPK): a manifest, one .ncapp per architecture,
-           .nsdyn libraries and shared assets. It installs as an app, as an
-           extension of a built-in app (a codec pack for the players), or as
-           terminal commands.
-  .ncapp   one app for one architecture.
-  .nsdyn   a shared library, loaded at run time; installed in /usr/lib or
-           carried inside a package.
-  .ncar    a static library archive, linked into an .ncapp by the SDK.
-  .ncdri   a driver module for what the kernel does not build in.
+  .ncpkg   a package: one compressed download for every architecture, like
+           an XAPK. ncpkg.meta (the signed manifest), ncapp/<arch>/ (the app),
+           lib/<arch>/ (.ncdyn), plugins/<arch>/ (.ncplu), res/ (shared
+           assets). Types: gui, cli, lib. `ncpkg info <file>` reads one.
+  .ncapp   one app for one architecture, in ring 3 (gui or cli).
+  .ncdyn   a shared library, loaded at run time: in /usr/lib, counted by
+           ncpkg (ref_count), or private to a package whose version differs.
+  .ncplu   a plugin of one app: a codec pack for the players, loaded by them.
+  .ncar    a static library archive (llvm-ar), linked into an .ncapp.
+  .ncdri   a driver module for what the kernel does not build in. No licence
+           header needed: none means proprietary, never \"tainted\".
+  NCFS     the system's own filesystem (planned); mountable from Linux (FUSE
+           or the nanochrono module) and Windows (the GUI or the .sys).
+
+  /dev/nchv  NCHV, the hypervisor (nchv.ncdri, after bhyve; planned): the
+           accelerator a QEMU port uses, and what NCVBS stands on.
 ";
 
 /// Builds the tree: the built-in files, `/proc`, `/dev`, and every module.
@@ -307,7 +316,7 @@ pub fn list(dir: &str, mut entry: impl FnMut(&str, Node)) {
 }
 
 /// Every file whose path ends with `suffix` (case-insensitive), for the
-/// launcher and the module loader: `.ncplu`, `.ncdri`, `.nsdyn`.
+/// launcher and the module loader: `.ncpkg`, `.ncapp`, `.ncdri`, `.ncdyn`.
 pub fn find_suffix(suffix: &str, mut found: impl FnMut(Node)) {
     for node in nodes().iter().flatten() {
         let p = node.path.as_bytes_lower_ends_with(suffix);

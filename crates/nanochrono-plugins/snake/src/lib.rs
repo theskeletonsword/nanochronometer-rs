@@ -1,12 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
-//! Snake, as a NanoChronometer `.ncplu` plugin.
+//! Snake, as a NanoChronometer app: `SNAKE.NCAPP`, and `SNAKE.NCPKG` — the
+//! same app as a package (its manifest is `ncpkg.toml` beside this crate).
 //!
 //! An original — not a port of anyone's Snake — so it is Apache-2.0 like the
-//! rest of the tree. It exists to prove the plugin pipeline end to end: it is
-//! loaded from a filesystem, its sections relocated, a kernel data symbol
-//! imported, and it draws and reads the keyboard through the [`NcApi`] table
-//! the kernel hands it. GPL programs (DOOM, a GPL decoder) ride the same
-//! `.ncplu` path but are never built into this repository.
+//! rest of the tree. It exists to prove the app pipeline end to end: it is
+//! loaded from a filesystem (or out of its package), its sections relocated,
+//! a kernel data symbol imported, and it draws and reads the keyboard through
+//! the [`NcApi`] table the kernel hands it. GPL programs (DOOM, a GPL
+//! decoder) ride the same path but are never built into this repository.
 
 #![no_std]
 

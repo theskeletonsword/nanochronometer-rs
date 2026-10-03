@@ -16,7 +16,8 @@ holds a directory per architecture, each laid out as an install prefix:
   nanochrono-kernel.elf       the NanoChronometer kernel, with its symbol table
                               (what tools/nanodump.py resolves a crash dump with)
   nanochrono-kernel.mb.elf    x86_64: the same kernel as ELF32, for QEMU -kernel
-plugins/                      the .ncplu plugins the x86_64 ISO carries
+plugins/                      the apps the x86_64 ISO carries: <NAME>.NCAPP, and
+                              <NAME>.NCPKG — the same app as a package (docs/NCPKG.md)
 iso/                          the bootable images (below)
 BAREMETAL_LIBRARIES.md        the libraries in depth
 BAREMETAL_DRIVERS.md          the drivers in the kernel

@@ -181,10 +181,15 @@ assets. docs/THIRD_PARTY_NOTICES.md describes the layout.
   ml-dsa, p521,         Apache-2.0 OR MIT (RustCrypto)
   sha2 0.11             Bare-metal kernel with the `plugin-verify` feature:
                         verifying the hybrid ML-DSA-87 + P-521 signature on
-                        .ncplu plugins against the embedded root public keys.
-                        tools/ncplu-sign (a host tool, not shipped) uses the
-                        same crates, plus signature, hybrid-array and getrandom
-                        (Apache-2.0 OR MIT), to make keys, sign and verify.
+                        modules (.ncapp, …) against the embedded root public
+                        keys. tools/ncplu-sign (a host tool, not shipped) uses
+                        the same crates, plus signature, hybrid-array and
+                        getrandom (Apache-2.0 OR MIT), to make keys, sign and
+                        verify. tools/ncpkg (a host tool, not shipped) adds
+                        p256, p384, ed25519-dalek and rsa (Apache-2.0 OR MIT,
+                        RustCrypto / dalek), miniz_oxide (MIT OR Zlib OR
+                        Apache-2.0), toml and clap (Apache-2.0 OR MIT), to
+                        build, sign, verify and install .ncpkg packages.
   cpufeatures 0.2.17    Apache-2.0 OR MIT (RustCrypto)
                         Vendored and modified in
                         crates/nanochrono-baremetal/vendor/cpufeatures/: it

@@ -20,6 +20,8 @@ struct Command {
     run: Run,
 }
 
+/// Kept in step with `nanochrono_core::ncpkg::RESERVED_COMMANDS`: a `cli`
+/// package may not install a command under one of these names.
 static COMMANDS: &[Command] = &[
     Command { name: "help", usage: "help [command]", summary: "list the commands, or explain one", run: help },
     Command { name: "nanochrono", usage: "nanochrono <command> [options]", summary: "the hosted CLI's commands (nanochrono --help)", run: super::nanochrono::run },
@@ -48,7 +50,9 @@ static COMMANDS: &[Command] = &[
     Command { name: "bench", usage: "bench [isa|crypto|raw] [row]", summary: "the benchmarks (no row: list them)", run: bench },
     Command { name: "loadkeys", usage: "loadkeys <us|es>", summary: "the keyboard layout", run: loadkeys },
     Command { name: "color", usage: "color [on|off]", summary: "colours in the output (off: plain text, the default)", run: color },
-    Command { name: "apps", usage: "apps", summary: "the packages (.ncplu) and drivers (.ncdri) on this system", run: apps },
+    Command { name: "apps", usage: "apps", summary: "packages (.ncpkg), apps, libraries, plugins and drivers on this system", run: apps },
+    Command { name: "ncpkg", usage: "ncpkg <info|verify|list|files|install|remove> ...", summary: "the package manager (read-only until NCFS is mounted)", run: super::ncpkg::run },
+    Command { name: "sudo", usage: "sudo <command> [args]", summary: "run a command as the administrator (this session already is)", run: sudo },
     Command { name: "history", usage: "history", summary: "the commands typed so far", run: history },
     Command { name: "sleep", usage: "sleep <seconds>", summary: "wait", run: sleep },
     Command { name: "desktop", usage: "desktop", summary: "switch to the Desktop Experience", run: desktop },
@@ -311,7 +315,7 @@ fn ls(shell: &mut Shell, out: &mut Out<'_>, argv: &[&str], _: u64) -> i32 {
         count += 1;
         let colour = if node.is_dir() {
             "1;34"
-        } else if [".ncplu", ".ncapp", ".nsdyn", ".ncar", ".ncdri"].iter().any(|ext| ends_with_ignore_case(name, ext)) {
+        } else if [".ncpkg", ".ncapp", ".ncdyn", ".ncplu", ".ncar", ".ncdri"].iter().any(|ext| ends_with_ignore_case(name, ext)) {
             "1;32"
         } else {
             "0"
@@ -622,16 +626,34 @@ fn loadkeys(shell: &mut Shell, out: &mut Out<'_>, argv: &[&str], _: u64) -> i32 
 
 fn apps(_: &mut Shell, out: &mut Out<'_>, _: &[&str], _: u64) -> i32 {
     let mut n = 0;
-    for suffix in [".ncplu", ".ncapp", ".nsdyn", ".ncdri"] {
+    for (suffix, what) in [
+        (".ncpkg", "package"),
+        (".ncapp", "app"),
+        (".ncdyn", "library"),
+        (".ncplu", "plugin"),
+        (".ncdri", "driver"),
+    ] {
         crate::vfs::find_suffix(suffix, |node| {
-            let _ = writeln!(out, "  {:<48} {:>9} bytes\r", node.path.as_str(), node.size().unwrap_or(0));
+            let _ = writeln!(out, "  {what:<8} {:<48} {:>9} bytes\r", node.path.as_str(), node.size().unwrap_or(0));
             n += 1;
         });
     }
     if n == 0 {
-        let _ = writeln!(out, "no packages or drivers on this system (GRUB `module2`, or the initrd)\r");
+        let _ = writeln!(out, "no packages, apps or drivers on this system (GRUB `module2`, or the initrd)\r");
+    } else {
+        let _ = writeln!(out, "`ncpkg info <file.ncpkg>` reads a package; `ncpkg list`, what is installed\r");
     }
     0
+}
+
+fn sudo(shell: &mut Shell, out: &mut Out<'_>, argv: &[&str], now_ns: u64) -> i32 {
+    if argv.len() < 2 {
+        let _ = writeln!(out, "usage: sudo <command> [args]\r");
+        return 2;
+    }
+    // One user so far, the administrator (users, hashed passwords and the
+    // installer's wizard are the next step): run the command as it stands.
+    dispatch(shell, &argv[1..], out.term, now_ns)
 }
 
 fn color(shell: &mut Shell, out: &mut Out<'_>, argv: &[&str], _: u64) -> i32 {

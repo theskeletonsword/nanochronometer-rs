@@ -21,7 +21,7 @@
 //!
 //! Files the loader placed in memory: GRUB's `module2 <file> <path>`, or the
 //! device tree's initrd. Each is filed under the path its string names —
-//! `/usr/lib/libfoo.nsdyn`, `/apps/SNAKE.NCPLU`, `/boot/drivers/X.NCDRI` —
+//! `/usr/lib/libfoo.ncdyn`, `/apps/SNAKE.NCPKG`, `/boot/drivers/X.NCDRI` —
 //! and a cpio archive (`initrd`, or a name ending in `.cpio`) is unpacked
 //! into the same tree. `crate::vfs` serves them.
 

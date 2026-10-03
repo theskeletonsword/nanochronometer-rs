@@ -1,0 +1,24 @@
+# The manifest's `signed` part for Snake as a .ncpkg package (docs/NCPKG.md).
+# packaging/baremetal/build.sh packs the module with exactly these
+# capabilities (tools/ncplu.py pack --caps) and builds the package with
+# tools/ncpkg; `files`, `abi` and `arch` come from the tree.
+id = "org.nanochronometer.snake"
+name = "Snake"
+version = "1.0.0"
+type = "gui"
+summary = "The classic, on bare metal: an original, not a port"
+license = "Apache-2.0"
+homepage = "https://github.com/nanochronometer/nanochronometer"
+
+[creator]
+name = "NanoChronometer"
+url = "https://github.com/nanochronometer/nanochronometer"
+
+[app]
+entry = "main.ncapp"
+ring = 3
+# clear/fill_rect/present, poll_event, log, ticks/timer_now, pmu_open/read
+# (cycles per frame), rng_fill. The kernel stops an app that calls past
+# these, so the list is the app's whole reach.
+capabilities = ["screen", "input", "log", "timer", "pmu", "rng"]
+categories = ["Games"]

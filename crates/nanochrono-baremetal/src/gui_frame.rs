@@ -1265,19 +1265,26 @@ pub unsafe fn run(fb: &Framebuffer, memory: Memory) -> ! {
         // SAFETY: CPL 0, the IDT is installed; faulting is the point.
         unsafe { crate::crashdump::fire_pending_crashtest() };
 
-        // `plugin=<name>` on the command line: load <NAME>.ncplu from the boot
+        // `plugin=<name>` on the command line: load <NAME>.NCAPP (or a
+        // package, <NAME>.NCPKG, or a 4.0 <NAME>.NCPLU) from the boot
         // medium's FAT partition and run it, then repaint the interface it
-        // drew over. The launch path used from the APPS panel (phase 3) is the
-        // same call.
-        if let Some((name, len)) = crate::ncplu::take_pending_plugin() {
-            let name = core::str::from_utf8(&name[..len]).unwrap_or("");
-            // SAFETY: ring 0; the controller enumerated a stick at boot.
-            match unsafe { input.load_plugin_image(name) } {
-                Some(n) => {
+        // drew over.
+        if let Some((base, base_len)) = crate::ncplu::take_pending_plugin() {
+            let mut found = false;
+            for ext in crate::ncplu::PENDING_EXTENSIONS {
+                let (name, len) = crate::ncplu::pending_file_name(&base[..base_len], ext);
+                let name = core::str::from_utf8(&name[..len]).unwrap_or("");
+                // SAFETY: ring 0; the controller enumerated a stick at boot.
+                if let Some(n) = unsafe { input.load_plugin_image(name) } {
                     // SAFETY: ring 0; `fb` and `input` outlive the call.
                     unsafe { crate::ncplu::run_loaded(name, n, fb, &mut input, &machine.pmu, clock.calibration.hz) };
+                    found = true;
+                    break;
                 }
-                None => crate::println!("plugin: {name} not found on the boot medium"),
+            }
+            if !found {
+                let base = core::str::from_utf8(&base[..base_len]).unwrap_or("");
+                crate::println!("plugin: {base}.NCAPP, .NCPKG or .NCPLU not found on the boot medium");
             }
             // Repaint the chrome the plugin cleared; the loop redraws content.
             fb.clear(p.background);

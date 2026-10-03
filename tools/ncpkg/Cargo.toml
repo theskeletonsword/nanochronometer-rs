@@ -1,0 +1,45 @@
+[package]
+name = "ncpkg"
+version = "4.0.0"
+edition = "2021"
+rust-version = "1.89"
+license = "Apache-2.0"
+description = "Builds, signs, verifies, installs and removes NanoChronometer .ncpkg packages (host tool)."
+
+# Outside the workspace, like tools/ncplu-sign: the signature crates stay out
+# of the libraries' dependency graph. The package format, the manifest, the
+# database and the transaction engine are nanochrono-core's — this is the
+# command line, the cryptography and the TOML front end around them.
+
+[[bin]]
+name = "ncpkg"
+path = "src/main.rs"
+
+[dependencies]
+nanochrono-core = { path = "../../crates/nanochrono-core" }
+clap = { version = "4.6", features = ["derive", "env"] }
+toml = "1.1"
+# Compression for `build`; decompression is nanochrono-core's own inflate.
+miniz_oxide = "0.9"
+getrandom = "0.4"
+# The roots' hybrid, and the algorithms a self-signature may use.
+ml-dsa = "0.1"
+# SLH-DSA (FIPS 205). Pinned: the FIPS 205 line is still a release
+# candidate on crates.io, in the same dependency family as ml-dsa 0.1.
+slh-dsa = "=0.2.0-rc.5"
+p521 = { version = "0.14", features = ["ecdsa", "arithmetic"] }
+p384 = { version = "0.14", features = ["ecdsa", "arithmetic"] }
+p256 = { version = "0.14", features = ["ecdsa", "arithmetic"] }
+ed25519-dalek = "3.0"
+signature = "3"
+hybrid-array = "0.4"
+sha2 = "0.11"
+# RSA-PSS self-signatures are verified (packages signed with OpenSSL or an
+# HSM), never made here: 0.9 is the stable line, and its private-key
+# arithmetic is not constant-time (RUSTSEC-2023-0071), which verification
+# never touches.
+rsa = { version = "0.9", default-features = false, features = ["std", "sha2"] }
+sha2-010 = { package = "sha2", version = "0.10" }
+
+[profile.release]
+strip = "none"

@@ -24,6 +24,7 @@ pub fn pools() -> impl Iterator<Item = (&'static str, u64)> {
     {
         add("app arena", crate::ncplu::ARENA_SPAN);
         add("app image", crate::ncplu::IMAGE_BUF_LEN);
+        add("app unpack", crate::ncplu::UNPACK_BUF_LEN);
         add("app stack", crate::ncplu::PLUGIN_STACK_LEN);
         add("verify stack", crate::ncplu::VERIFY_STACK_LEN);
         add("ring 3", 2 * 0x20_0000);

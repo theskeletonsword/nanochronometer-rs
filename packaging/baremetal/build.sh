@@ -29,11 +29,20 @@
 # mode's default (release -O2, debug -O0, debug-og -Og); see
 # packaging/opt-level.sh. The code must be correct at every one.
 #
-# NCPLU_EXTRA="a.NCPLU b.NCPLU" adds plugins built elsewhere (the C SDK's, in
-# sdk/) to the ISO's FAT partition beside the in-tree ones.
+# NCAPP_EXTRA="a.NCAPP b.NCAPP" (NCPLU_EXTRA, its old name, too) adds apps
+# built elsewhere (the C SDK's, in sdk/) to the ISO beside the in-tree ones.
 #
-# Plugin signing (ML-DSA-87 + P-521; keys from tools/ncplu-sign, kept OUTSIDE
-# the repository). Without a root every plugin is a community one, at ring 3:
+# Every in-tree app is packed as <NAME>.NCAPP (tools/ncplu.py, with the
+# capabilities its ncpkg.toml declares) and, when it has an ncpkg.toml,
+# packaged as <NAME>.NCPKG too (tools/ncpkg build; docs/NCPKG.md).
+#
+# Package signing (tools/ncpkg; keys OUTSIDE the repository):
+#   NCPKG_SIGN_KEYS=KEYDIR                       sign every .NCPKG (an ncplu-sign
+#                                                key directory) ...
+#   NCPKG_SIGN_ROLE=creator-ring3                ... in this role (the default)
+#
+# Module signing (ML-DSA-87 + P-521; keys from tools/ncplu-sign, kept OUTSIDE
+# the repository). Without a root every app is a community one, at ring 3:
 #   NCPLU_ROOT_CREATOR=KEYDIR/root_pubkeys.bin   the creator's root (the green
 #                                                check tier; runs in the kernel)
 #   NCPLU_ROOT_TREE=KEYDIR/root_pubkeys.bin      a root the owner trusts (the
@@ -667,11 +676,11 @@ build_iso_ppc_of() {
 # on real hardware. grub-mkrescue produces a hybrid ISO: an MBR with a boot
 # signature plus El Torito images for both BIOS and UEFI, which is what makes
 # it work with dd, Rufus, Ventoy, YUMI and UNetbootin alike.
-# Builds every plugin under crates/nanochrono-plugins/ at -O0 and packs each
-# into build/.../plugins/<NAME>.NCPLU, ready to drop onto the crash partition.
-# A plugin is a shared object on the -dylib target; tools/ncplu.py flattens it
-# into the loader's format. GPL plugins (DOOM, a GPL decoder) are built the
-# same way but live outside this repository.
+# Builds every app under crates/nanochrono-plugins/ and packs each into
+# build/.../plugins/<NAME>.NCAPP, then packages the ones with an ncpkg.toml as
+# <NAME>.NCPKG. An app is a shared object on the -dylib target; tools/ncplu.py
+# flattens it into the loader's format. GPL apps (DOOM, a GPL decoder) are
+# built the same way but live outside this repository.
 build_plugins() {
     local plugins_dir="${repo_root}/crates/nanochrono-plugins"
     [[ -d "${plugins_dir}" ]] || return 0
@@ -718,21 +727,76 @@ build_plugins() {
             echo "note: no shared object for plugin ${name}; skipping"
             continue
         fi
-        out="${out_dir}/plugins/${name^^}.NCPLU"
-        "${repo_root}/tools/ncplu.py" pack "${so}" -o "${out}" >/dev/null
-        echo "    packed ${out##*/} ($(stat -c%s "${out}") bytes)"
+        # The module header grants what the package's manifest declares —
+        # the installer refuses a module that asks for more.
+        local caps="all"
+        if [[ -f "${crate}ncpkg.toml" ]]; then
+            caps="$(python3 -c 'import sys, tomllib
+caps = tomllib.load(open(sys.argv[1], "rb")).get("app", {}).get("capabilities", [])
+print(",".join(caps) or "none")' "${crate}ncpkg.toml")"
+        fi
+        out="${out_dir}/plugins/${name^^}.NCAPP"
+        python3 "${repo_root}/tools/ncplu.py" pack "${so}" -o "${out}" --caps "${caps}" >/dev/null
+        echo "    packed ${out##*/} ($(stat -c%s "${out}") bytes, capabilities ${caps})"
     done
-    # Plugins built outside the tree (sdk/: C plugins), already packed.
+    # Apps built outside the tree (sdk/: C apps), already packed.
     local extra
-    for extra in ${NCPLU_EXTRA:-}; do
+    for extra in ${NCAPP_EXTRA:-} ${NCPLU_EXTRA:-}; do
         if [[ -f "${extra}" ]]; then
             command cp -f "${extra}" "${out_dir}/plugins/"
-            echo "=== plugin ${extra##*/} (NCPLU_EXTRA)"
+            echo "=== app ${extra##*/} (NCAPP_EXTRA)"
         else
-            echo "note: NCPLU_EXTRA: ${extra} not found; skipping"
+            echo "note: NCAPP_EXTRA: ${extra} not found; skipping"
         fi
     done
+    # Modules are signed before they are packaged: the package's manifest
+    # lists each module's SHA-512, signature block included.
     sign_plugins
+    package_plugins
+}
+
+# Every in-tree app with an ncpkg.toml also ships as a package: its manifest,
+# the module under ncapp/x86_64/ and its res/ (if any), built by tools/ncpkg
+# into plugins/<NAME>.NCPKG and signed with NCPKG_SIGN_KEYS when given. A host
+# tool that will not build (no network to fetch its crates) skips the
+# packages, not the build.
+package_plugins() {
+    local plugins_dir="${repo_root}/crates/nanochrono-plugins"
+    local tool_dir="${HOME}/.cache/nanochrono/ncpkg-tool"
+    local crate name manifest staging app any=""
+    for crate in "${plugins_dir}"/*/; do
+        [[ -f "${crate}ncpkg.toml" ]] && any=1
+    done
+    [[ -n "${any}" ]] || return 0
+    if ! (cd "${repo_root}/tools/ncpkg" && CARGO_INCREMENTAL=0 CARGO_TARGET_DIR="${tool_dir}" \
+        cargo build --release --quiet); then
+        echo "note: tools/ncpkg did not build; no .NCPKG packages this time"
+        return 0
+    fi
+    local ncpkg="${tool_dir}/release/ncpkg"
+    for crate in "${plugins_dir}"/*/; do
+        manifest="${crate}ncpkg.toml"
+        [[ -f "${manifest}" ]] || continue
+        name="$(basename "${crate}")"
+        app="${out_dir}/plugins/${name^^}.NCAPP"
+        [[ -f "${app}" ]] || continue
+        staging="$(mktemp -d)"
+        mkdir -p "${staging}/ncapp/x86_64"
+        command cp "${manifest}" "${staging}/ncpkg.toml"
+        command cp "${app}" "${staging}/ncapp/x86_64/main.ncapp"
+        [[ -d "${crate}res" ]] && command cp -r "${crate}res" "${staging}/res"
+        if ! "${ncpkg}" build "${staging}" -o "${out_dir}/plugins/${name^^}.NCPKG" >/dev/null; then
+            echo "error: could not package ${name}" >&2
+            rm -rf "${staging}"
+            return 1
+        fi
+        rm -rf "${staging}"
+        if [[ -n "${NCPKG_SIGN_KEYS:-}" ]]; then
+            "${ncpkg}" sign "${out_dir}/plugins/${name^^}.NCPKG" --role "${NCPKG_SIGN_ROLE:-creator-ring3}" \
+                --keys "${NCPKG_SIGN_KEYS}" >/dev/null || return 1
+        fi
+        echo "    packaged ${name^^}.NCPKG ($(stat -c%s "${out_dir}/plugins/${name^^}.NCPKG") bytes)"
+    done
 }
 
 # With NCPLU_SIGN_KEYS pointing at a key directory from `ncplu-sign keygen`
@@ -750,7 +814,7 @@ sign_plugins() {
     (cd "${repo_root}/tools/ncplu-sign" && CARGO_INCREMENTAL=0 CARGO_TARGET_DIR="${tool_dir}" \
         cargo build --quiet) || return 1
     local plug
-    for plug in "${out_dir}/plugins/"*.NCPLU; do
+    for plug in "${out_dir}/plugins/"*.NCAPP "${out_dir}/plugins/"*.NCPLU; do
         [[ -f "${plug}" ]] || continue
         "${tool_dir}/debug/ncplu-sign" sign "${plug}" --keys "${NCPLU_SIGN_KEYS}" >/dev/null || return 1
         echo "    signed ${plug##*/} (ML-DSA-87 + P-521)"
@@ -794,10 +858,10 @@ never allocates space for it. All zeros means nothing has crashed since.
 Read it with:  tools/nanodump.py show CRASH.DMP --elf nanochrono-kernel.elf
 TXT
     MTOOLS_SKIP_CHECK=1 mcopy -i "${img}" "${files}/CRASH.DMP" "${files}/README.TXT" ::/
-    # Every packed plugin, if any were built. mtools writes a proper VFAT long
-    # name for the five-character .NCPLU extension.
+    # Every packed app and package, if any were built (and a 4.0 .NCPLU).
+    # mtools writes a proper VFAT long name for the five-character extensions.
     local plug
-    for plug in "${out_dir}/plugins/"*.NCPLU; do
+    for plug in "${out_dir}/plugins/"*.NCAPP "${out_dir}/plugins/"*.NCPKG "${out_dir}/plugins/"*.NCPLU; do
         [[ -e "${plug}" ]] || continue
         MTOOLS_SKIP_CHECK=1 mcopy -i "${img}" "${plug}" "::/${plug##*/}"
     done
@@ -837,13 +901,14 @@ build_iso_x86() {
     if [[ "${arch}" == "x86_64" ]]; then
         build_plugins
         local plug
-        for plug in "${out_dir}/plugins/"*.NCPLU "${out_dir}/plugins/"*.ncplu "${out_dir}/plugins/"*.NCDRI \
-                    "${out_dir}/plugins/"*.ncdri "${out_dir}/plugins/"*.nsdyn; do
+        for plug in "${out_dir}/plugins/"*.NCPKG "${out_dir}/plugins/"*.ncpkg "${out_dir}/plugins/"*.NCAPP \
+                    "${out_dir}/plugins/"*.ncapp "${out_dir}/plugins/"*.NCPLU "${out_dir}/plugins/"*.NCDRI \
+                    "${out_dir}/plugins/"*.ncdri "${out_dir}/plugins/"*.ncdyn; do
             [[ -f "${plug}" ]] || continue
             local dest="/apps/${plug##*/}"
             case "${plug,,}" in
                 *.ncdri) dest="/boot/drivers/${plug##*/}" ;;
-                *.nsdyn) dest="/usr/lib/${plug##*/}" ;;
+                *.ncdyn) dest="/usr/lib/${plug##*/}" ;;
             esac
             mkdir -p "${staging}$(dirname "${dest}")"
             command cp -f "${plug}" "${staging}${dest}"

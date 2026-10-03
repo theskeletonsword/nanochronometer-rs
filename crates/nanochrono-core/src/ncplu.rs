@@ -1,10 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
-//! The `.ncplu` plugin format, and a parser that checks all of it before
-//! anything is loaded.
+//! The flat module format — `.ncapp` apps, `.ncdri` drivers, `.ncdyn`
+//! shared libraries and `.ncplu` app plugins — and a parser that checks all
+//! of it before anything is loaded.
+//!
+//! The magic still reads `NCPLU`: the format began as the plugin format,
+//! and every module packed since still loads. What a module *is* lives in
+//! its header ([`Kind`]); a package of them for every architecture is a
+//! `.ncpkg` ([`crate::ncpkg`]).
 //!
 //! # Why the parser lives here
 //!
-//! A `.ncplu` arrives on a USB stick: untrusted input, possibly crafted to
+//! A module arrives on a USB stick: untrusted input, possibly crafted to
 //! break the loader. The kernel copies it into a fixed arena and patches
 //! pointers inside it, and for **any** byte sequence it must never write
 //! outside that arena, read outside the file, or panic — a panic halts a
@@ -87,8 +93,9 @@ pub const DIGEST_LEN: usize = 64;
 /// little-endian `u16`. Zero is x86-64, so every module packed before this
 /// field existed already reads correctly.
 pub const H_ARCH: usize = 152;
-/// What the module is ([`Kind`]), as a little-endian `u16`: an app, a
-/// driver (`.ncdri`) or a shared library (`.nsdyn`).
+/// What the module is ([`Kind`]), as a little-endian `u16`: an app
+/// (`.ncapp`), a driver (`.ncdri`), a shared library (`.ncdyn`) or an app
+/// plugin (`.ncplu`).
 pub const H_KIND: usize = 154;
 // 156..160: reserved, zero.
 
@@ -176,6 +183,32 @@ impl Arch {
         }
     }
 
+    /// The architecture this code was compiled for, if it is one of the
+    /// nine — what a package must carry an app for to run here.
+    pub const fn native() -> Option<Arch> {
+        if cfg!(target_arch = "x86_64") {
+            Some(Arch::X86_64)
+        } else if cfg!(target_arch = "x86") {
+            Some(Arch::I386)
+        } else if cfg!(target_arch = "aarch64") {
+            Some(Arch::Aarch64)
+        } else if cfg!(target_arch = "arm") {
+            Some(Arch::Arm32)
+        } else if cfg!(target_arch = "riscv64") {
+            Some(Arch::Riscv64)
+        } else if cfg!(target_arch = "riscv32") {
+            Some(Arch::Riscv32)
+        } else if cfg!(all(target_arch = "powerpc64", target_endian = "big")) {
+            Some(Arch::Ppc64)
+        } else if cfg!(all(target_arch = "powerpc64", target_endian = "little")) {
+            Some(Arch::Ppc64Le)
+        } else if cfg!(target_arch = "powerpc") {
+            Some(Arch::Ppc)
+        } else {
+            None
+        }
+    }
+
     pub const fn from_name(name: &[u8]) -> Option<Arch> {
         match name {
             b"x86_64" | b"x64" => Some(Arch::X86_64),
@@ -197,14 +230,19 @@ impl Arch {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u16)]
 pub enum Kind {
-    /// A runnable app or plugin (`.ncapp`): has an entry point.
+    /// A runnable app (`.ncapp`), `gui` or `cli`: has an entry point.
     App = 0,
     /// A driver for hardware the kernel does not build in (`.ncdri`):
-    /// essential drivers stay in the kernel. No licence header is required.
+    /// essential drivers stay in the kernel. No licence header is required;
+    /// none given means proprietary, and nothing is marked "tainted".
     Driver = 1,
-    /// A shared library loaded at run time (`.nsdyn`): installed in
-    /// `/usr/lib` or carried inside a package.
+    /// A shared library loaded at run time (`.ncdyn`): installed in
+    /// `/usr/lib` (reference-counted by `ncpkg`) or kept private to a
+    /// package.
     Library = 2,
+    /// An extension of one app (`.ncplu`) — a codec pack for the players —
+    /// loaded by its host app, never run on its own.
+    Plugin = 3,
 }
 
 impl Kind {
@@ -213,6 +251,7 @@ impl Kind {
             0 => Some(Kind::App),
             1 => Some(Kind::Driver),
             2 => Some(Kind::Library),
+            3 => Some(Kind::Plugin),
             _ => None,
         }
     }
@@ -222,7 +261,8 @@ impl Kind {
         match self {
             Kind::App => ".ncapp",
             Kind::Driver => ".ncdri",
-            Kind::Library => ".nsdyn",
+            Kind::Library => ".ncdyn",
+            Kind::Plugin => ".ncplu",
         }
     }
 
@@ -230,10 +270,18 @@ impl Kind {
         match name {
             b".ncapp" => Some(Kind::App),
             b".ncdri" => Some(Kind::Driver),
-            b".nsdyn" => Some(Kind::Library),
-            // The single-module package from before kinds existed.
-            b".ncplu" => Some(Kind::App),
+            b".ncdyn" => Some(Kind::Library),
+            b".ncplu" => Some(Kind::Plugin),
             _ => None,
+        }
+    }
+
+    pub const fn name(self) -> &'static str {
+        match self {
+            Kind::App => "app",
+            Kind::Driver => "driver",
+            Kind::Library => "library",
+            Kind::Plugin => "plugin",
         }
     }
 }
@@ -311,8 +359,8 @@ impl FormatError {
     pub const fn message(self) -> &'static str {
         match self {
             FormatError::TooSmall => "file shorter than a header",
-            FormatError::BadMagic => "not an .ncplu (bad magic)",
-            FormatError::BadVersion => "unsupported .ncplu format version",
+            FormatError::BadMagic => "not a NanoChronometer module (bad magic)",
+            FormatError::BadVersion => "unsupported module format version",
             FormatError::AbiMismatch => "built against a different kernel ABI",
             FormatError::TooBig => "image larger than the plugin buffer or arena",
             FormatError::Truncated => "a field points past the end of the file",
@@ -749,9 +797,20 @@ impl<'a> Image<'a> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::vec::Vec;
+
+    /// A minimal valid module for `arch` and `kind` declaring `caps`: what
+    /// the package tests put inside their packages.
+    pub(crate) fn module(arch: Arch, kind: Kind, caps: u32) -> Vec<u8> {
+        let mut b = build();
+        b[H_ARCH..H_ARCH + 2].copy_from_slice(&(arch as u16).to_le_bytes());
+        b[H_KIND..H_KIND + 2].copy_from_slice(&(kind as u16).to_le_bytes());
+        b[H_FLAGS..H_FLAGS + 4].copy_from_slice(&FLAG_HAS_CAPS.to_le_bytes());
+        b[H_CAPABILITIES..H_CAPABILITIES + 4].copy_from_slice(&caps.to_le_bytes());
+        b
+    }
 
     /// A minimal valid image, laid out the way tools/ncplu.py lays one out:
     /// header, sections, imports, exports, relocations, strings, section
@@ -864,7 +923,7 @@ mod tests {
 
     #[test]
     fn arch_and_kind_travel_in_the_header() {
-        for (arch, kind) in [(Arch::Aarch64, Kind::App), (Arch::X86_64, Kind::Driver), (Arch::Riscv64, Kind::Library)] {
+        for (arch, kind) in [(Arch::Aarch64, Kind::App), (Arch::X86_64, Kind::Driver), (Arch::Riscv64, Kind::Library), (Arch::Ppc, Kind::Plugin)] {
             let mut b = build();
             b[H_ARCH..H_ARCH + 2].copy_from_slice(&(arch as u16).to_le_bytes());
             b[H_KIND..H_KIND + 2].copy_from_slice(&(kind as u16).to_le_bytes());
@@ -875,8 +934,11 @@ mod tests {
         assert_eq!(Arch::from_name(b"arm64"), Some(Arch::Aarch64));
         assert_eq!(Arch::from_name(b"nope"), None);
         assert_eq!(Kind::from_extension(b".ncdri"), Some(Kind::Driver));
-        assert_eq!(Kind::from_extension(b".nsdyn"), Some(Kind::Library));
+        assert_eq!(Kind::from_extension(b".ncdyn"), Some(Kind::Library));
+        assert_eq!(Kind::from_extension(b".ncplu"), Some(Kind::Plugin));
+        assert_eq!(Kind::from_extension(b".nsdyn"), None);
         assert_eq!(Kind::App.extension(), ".ncapp");
+        assert_eq!(Kind::Plugin.extension(), ".ncplu");
     }
 
     #[test]

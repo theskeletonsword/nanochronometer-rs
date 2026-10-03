@@ -31,15 +31,16 @@ The **stopwatch is essential**: built in, never an app to install; a CLI
 command and a desktop app that cannot be removed. The desktop's taskbar
 clock reads `hh:mm:ss:mmm:uuu:nnn` — a NanoChronometer, not a phone clock.
 
-## 2. File types — planned (the format work is next)
+## 2. File types — done (formats and the package manager: docs/NCPKG.md)
 
-| Type | What it is |
+| Type | What |
 |---|---|
-| `.ncplu` | A **package**, like an XAPK: a manifest, one `.ncapp` per architecture, `.nsdyn` libraries, shared assets (icon, data). One download for every architecture: assets are stored once, code per architecture. Installs as an **app** (a VM manager, a browser), an **extension** of a built-in app (a codec pack for the players: "ffmpeg plugin for NanoChronometer players", vgmstream for console formats), or **terminal commands** (NanoSSL, a BoringSSL fork). |
-| `.ncapp` | One app for one architecture: the flat module format the loader maps (today's `.ncplu` single module, with an architecture and a kind added). |
-| `.nsdyn` | A shared library loaded at run time; installed in `/usr/lib` or carried inside a package. Libraries such as forks of BoringSSL, FFmpeg, libvirt, liboqs or wolfSSL are the intended kind. |
+| `.ncpkg` | A **package**, like an XAPK: one compressed download for every architecture — `ncpkg.meta` (the signed manifest), `ncapp/<arch>/` (the app), `lib/<arch>/` (`.ncdyn`), `plugins/<arch>/` (`.ncplu`), `res/` (assets, stored once). Types `gui`, `cli`, `lib`. Built, signed, verified, installed and removed by `ncpkg` (`tools/ncpkg` on a host; read-only `ncpkg` in the kernel's shell until NCFS). |
+| `.ncapp` | One app for one architecture, ring 3 (`gui` or `cli`): the flat module format the loader maps. |
+| `.ncdyn` | A shared library loaded at run time: in `/usr/lib`, counted by `ncpkg` (`ref_count`, `required_by` in `/var/lib/ncpkg/db.json`) and deleted only at zero; a package that needs a version the global copy is not keeps its own, private. Forks of BoringSSL, FFmpeg, libvirt, liboqs or wolfSSL are the intended kind. |
+| `.ncplu` | A **plugin of one app**: a codec pack for the players ("FFmpeg for NanoChronometer players", vgmstream for console formats), registered with its host app by `ncpkg`, loaded by the app, never run alone. |
 | `.ncar` | A static library archive (LLVM `llvm-ar`), linked into an `.ncapp` by the SDK. |
-| `.ncdri` | A driver module for hardware the kernel does not build in (Intel ME/HECI, Android MTP, …). Essential drivers stay in the kernel. No licence header is required (no `MODULE_LICENSE`). |
+| `.ncdri` | A driver module for hardware the kernel does not build in (Intel ME/HECI, Android MTP, NCHV, …). Essential drivers stay in the kernel. No licence header is required (no `MODULE_LICENSE`): none means proprietary, and nothing is ever marked "tainted". (Loading at boot: planned.) |
 
 ### Package metadata
 
@@ -47,6 +48,7 @@ clock reads `hh:mm:ss:mmm:uuu:nnn` — a NanoChronometer, not a phone clock.
   `BSD-2-Clause`, `BSD-3-Clause`, `GPL-2.0`/`GPL-3.0`, `AGPL-3.0`,
   `LGPL-2.1`/`LGPL-3.0`, `Proprietary` — and dual licences (`MIT OR
   Apache-2.0`), each shown with a plain-language explanation for newcomers.
+  None given reads as `Proprietary`: all rights reserved, not "tainted".
 * **Icon**, title, description, version.
 * **Creator**. None given: anonymous, which the launch card flags as
   suspicious for a ring-0 plugin or an `.ncdri`; it still runs.
@@ -55,11 +57,13 @@ clock reads `hh:mm:ss:mmm:uuu:nnn` — a NanoChronometer, not a phone clock.
 ### The SDK — partial
 
 LLVM throughout: clang, ld.lld, llvm-ar, llvm-objcopy, for every
-architecture from one toolchain (`sdk/`). C plugins build today
-(`sdk/Makefile`); packages, libraries, static archives and drivers are the
-format work above.
+architecture from one toolchain (`sdk/`). C apps build today
+(`sdk/Makefile`, as `.ncapp`), any module kind packs with `tools/ncplu.py
+pack --kind app|driver|library|plugin`, and packages build from a directory
+with `ncpkg build` (an `ncpkg.toml` and the tree). Static archives and
+driver loading are next.
 
-## 3. Trust — planned (today: two roots, creator ✅ and tree 🌳)
+## 3. Trust — partial (packages: the four roots, checked by `ncpkg` at install; the module loader: two roots, creator ✅ and tree 🌳)
 
 Four creator-held roots, each a hybrid **ML-DSA-87 + P-521** key pair, and
 a signature from one grants only its own ring:
@@ -73,6 +77,14 @@ a signature from one grants only its own ring:
 
 A ring-3 signature never grants ring 0: a music plugin signed for ring 3
 cannot become kernel code, however it is signed.
+
+Packages implement this today (docs/NCPKG.md §4): every signature signs
+`"NCPKG-SIG-2" ‖ role ‖ SHA-512(the manifest's signed bytes)`, so it covers
+every file and cannot move between roles; a signature present and failing
+refuses the package; `ncpkg install` refuses ring 0 without `creator-ring0`
+or `verify-ring0` unless the community switch is on. The module loader still
+decides a running module's privilege from the module's own signature, with
+the two roots it embeds; moving it to the four roles is the next step.
 
 **Owner keys (MOK)**: the machine owner's own keys, enrolled in UEFI NVRAM
 the way shim's MOK list is (a file on the state partition without UEFI).
@@ -95,6 +107,33 @@ and executable, data never executable) with CR0.WP, SMEP and SMAP; a
 measured image checked against its boot-time hash; and with VT-x, the same
 permissions enforced from a hypervisor's EPT, so even ring 0 cannot write
 kernel code.
+
+### NCHV, the hypervisor — planned
+
+`nchv.ncdri`, exposing `/dev/nchv`: the accelerator a QEMU port runs guests
+with (as `/dev/kvm` is on Linux, NVMM on NetBSD), and the layer NCVBS
+stands on. Based on bhyve — FreeBSD's `sys/amd64/vmm` (BSD-2-Clause,
+NetApp and Joyent; about 28 000 lines of C, adapted with its notices kept and
+listed in NOTICE) and `sys/dev/vmm`, its machine-independent half — rather
+than written from nothing:
+
+1. **Prerequisites**: loading `.ncdri` drivers at boot (signed, ring 0) and a
+   physical page allocator (VMCS regions, EPT tables, guest memory) — the
+   kernel has neither yet.
+2. **VT-x core**: VMXON, a VMCS per vCPU, EPT, the VM-exit loop for HLT,
+   port I/O, CPUID, MSRs and EPT faults (`vmx.c`, `vmcs.c`, `ept.c`,
+   `vmx_msr.c`, `x86.c`, `vmm.c`).
+3. **`/dev/nchv`**: bhyve's `vmm_dev` surface as `nccall`s — create a VM,
+   map memory, set and get registers, run, inject interrupts — and the
+   `libvmmapi` counterpart in the SDK. Packages ask for it with the `nchv`
+   device permission (docs/NCPKG.md §3).
+4. **Devices and emulation**: vLAPIC, vIOAPIC, vATPIC, vATPIT, vHPET, vRTC
+   (`io/`), and the instruction emulator for MMIO
+   (`vmm_instruction_emul.c`).
+5. **AMD SVM** (`amd/svm.c`, `vmcb.c`); IOMMU passthrough later.
+6. **NCVBS on NCHV**: the kernel itself run as NCHV's first guest, its text
+   write-protected by EPT, which needs NCHV loaded at boot as an essential
+   driver rather than an optional module.
 
 ## 5. Processor controls — done
 
@@ -129,6 +168,11 @@ method is chosen under the wizard's advanced options.
 
 * Root filesystem: **NCFS** (NanoChronometer's own filesystem) by default,
   for speed; exFAT or FAT32 on request. The ESP is always FAT32.
+* Packages go into a root with the host's `ncpkg --root <dir> install …`
+  (an NCFS volume through FUSE, or the staging tree an image is built from);
+  on the system itself, `sudo ncpkg install` once NCFS is writable. Paths
+  inside packages use an alphabet every one of these volumes accepts, and no
+  two of them differ only by case.
 * NCFS elsewhere, to read the crash dumps it holds: on Linux through FUSE
   (ring 3, from the GUI — the **recommended** way) or the `nanochrono`
   kernel module (ring 0, `mount -t ncfs`); on Windows through the `.sys` or,

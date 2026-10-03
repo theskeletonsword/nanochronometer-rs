@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-# NanoChronometer SDK: C plugins (.ncplu), the kernel, a bootable ISO, QEMU.
+# NanoChronometer SDK: C apps (.ncapp), the kernel, a bootable ISO, QEMU.
+# (include/ncplu.h is the module ABI every kind shares; packages of apps for
+# every architecture are built with tools/ncpkg — docs/NCPKG.md.)
 #
-#   make                           C plugins in examples/ -> build/<MODE>/<NAME>.NCPLU
+#   make                           C apps in examples/ -> build/<MODE>/<NAME>.NCAPP
 #   make MODE=debug-og             the same at -Og: optimised enough to show what -O0 hides
 #   make MODE=release [OPT=-O3]    the same optimised: -O2 by default, no debug info
 #   make OPT=-Os                   any level in any mode: -O0 -O1 -O2 -O3 -Os -Oz -Og,
@@ -102,7 +104,7 @@ LDFLAGS += -e ncplu_main
 # ---------------------------------------------------------------------------
 EXAMPLES := $(basename $(notdir $(wildcard $(SDK)/examples/*.c)))
 upper     = $(shell echo '$(1)' | tr a-z A-Z)
-PLUGINS  := $(foreach e,$(EXAMPLES),$(BUILD)/$(call upper,$(e)).NCPLU)
+PLUGINS  := $(foreach e,$(EXAMPLES),$(BUILD)/$(call upper,$(e)).NCAPP)
 
 .PHONY: all sign kernel iso run gdb clean
 all: $(PLUGINS)
@@ -119,9 +121,9 @@ $(BUILD)/ncplu_rt.o: $(SDK)/runtime/ncplu_rt.c $(SDK)/include/ncplu.h | $(BUILD)
 $(BUILD)/%.so: $(BUILD)/%.o $(BUILD)/ncplu_rt.o
 	$(LD) $(strip $(LDFLAGS)) $^ -o $@
 
-# <name>.so -> <NAME>.NCPLU: the name the kernel's plugin=<name> looks for.
+# <name>.so -> <NAME>.NCAPP: the name the kernel's plugin=<name> looks for.
 define pack_rule
-$(BUILD)/$(call upper,$(1)).NCPLU: $(BUILD)/$(1).so
+$(BUILD)/$(call upper,$(1)).NCAPP: $(BUILD)/$(1).so
 	$(PYTHON) $(REPO)/tools/ncplu.py pack $$< -o $$@
 endef
 $(foreach e,$(EXAMPLES),$(eval $(call pack_rule,$(e))))
@@ -137,7 +139,7 @@ sign: $(PLUGINS)
 
 # What iso/run/gdb hand build.sh: these plugins, the Rust plugins' profile,
 # and with KEYS the signing keys plus the root the kernel will trust.
-BUILD_ENV = NCPLU_EXTRA="$(PLUGINS)" PLUGIN_PROFILE=$(MODE) \
+BUILD_ENV = NCAPP_EXTRA="$(PLUGINS)" PLUGIN_PROFILE=$(MODE) \
             DEBUG_OPT=$(if $(filter debug-og,$(MODE)),Og,O0) \
             $(if $(KEYS),NCPLU_SIGN_KEYS=$(KEYS) NCPLU_ROOT_PUBKEYS=$(KEYS)/root_pubkeys.bin)
 
@@ -149,7 +151,7 @@ kernel:
 	    --config 'target.x86_64-nanochrono-none.rustflags=["-C","force-frame-pointers=yes"]'
 
 # ISO: GRUB (BIOS + UEFI) with the multiboot kernel, plus the FAT partition
-# (NANOCRASH) that holds CRASH.DMP and every .NCPLU — in-tree and these.
+# (NANOCRASH) that holds CRASH.DMP and every .NCAPP and .NCPKG — in-tree and these.
 iso: $(PLUGINS)
 	$(BUILD_ENV) $(REPO)/packaging/baremetal/build.sh debug x86_64
 

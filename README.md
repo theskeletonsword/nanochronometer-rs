@@ -572,15 +572,38 @@ fault on purpose, to check a machine end to end. `build.sh gdb` boots the
 `gdb -x packaging/baremetal/gdb/x86_64.gdb`. See
 [docs/CRASH_DUMPS.md](docs/CRASH_DUMPS.md).
 
-#### Plugins (`.ncplu`)
+#### Apps, packages and plugins (`.ncapp`, `.ncpkg`, `.ncplu`)
 
-The x86-64 kernel loads plugins — games, tools, anything that draws on the
-screen — from the boot stick's FAT partition at run time. A plugin is a
-`.ncplu` file: a position-independent `cdylib` packed by `tools/ncplu.py`
-into sections, relocations and a symbol table, loaded into a fixed 1 MiB
-arena with no allocator and no dynamic linker. It reaches the kernel through
-a table of function pointers (`NcApi`) handed to its entry point, and can
-import kernel data symbols by name (`nc_resolve_symbol`).
+The ecosystem's file types: an **`.ncapp`** is one app for one architecture;
+an **`.ncdyn`** a shared library; an **`.ncplu`** a plugin of one app (a codec
+pack for the players); an **`.ncdri`** a driver; and an **`.ncpkg`** a
+package — one compressed download for every architecture, with a signed JSON
+manifest (`ncpkg.meta`), the app per architecture, libraries, plugins and
+assets. `tools/ncpkg` builds, signs (ML-DSA-87 + P-521 for the creator's four
+roots, any of Ed25519, ECDSA, RSA-PSS or ML-DSA for self-signatures),
+verifies, installs and removes packages, with the shared libraries in
+`/usr/lib` reference-counted in `/var/lib/ncpkg/db.json` and every install
+and removal one crash-safe transaction. The specification is
+[docs/NCPKG.md](docs/NCPKG.md).
+
+```sh
+ncpkg build mypkg/ -o mypkg.ncpkg          # ncpkg.toml + ncapp/<arch>/ + lib/ + plugins/ + res/
+ncpkg sign mypkg.ncpkg --role self --key ~/keys/me.ncpkg-key
+sudo ncpkg install mypkg.ncpkg --root /mnt/ncfs --roots ~/keys/roots
+sudo ncpkg remove org.example.app --root /mnt/ncfs
+```
+
+The x86-64 kernel loads apps — games, tools, anything that draws on the
+screen — from the file tree or the boot stick's FAT partition at run time,
+straight from a package too (the app for this architecture, checked against
+the manifest's SHA-512). An app is an `.ncapp` file (modules packed as
+`.ncplu` before the split still load): a position-independent `cdylib`
+packed by `tools/ncplu.py` into sections, relocations and a symbol table,
+loaded into a fixed 1 MiB arena with no allocator and no dynamic linker. It
+reaches the kernel through a table of function pointers (`NcApi`) handed to
+its entry point, and can import kernel data symbols by name
+(`nc_resolve_symbol`). The loader still calls what it runs a "plugin"; the
+rest of this section does too.
 
 | Services | What |
 |---|---|
@@ -1511,7 +1534,8 @@ calibration that silently went unpinned is worse than one known to be.
 ```
 Cargo.toml                  workspace
 crates/
-  nanochrono-core/          counters, inline asm, dispatch, calibration, NTP, probes, NC_RNG, .ncplu parser
+  nanochrono-core/          counters, inline asm, dispatch, calibration, NTP, probes, NC_RNG,
+                            modules (.ncapp/.ncdyn/.ncplu/.ncdri), .ncpkg packages and the package manager
   nanochrono-crypto/        rustls provider primitives + TLS handshake timing
   nanochrono-bench/         the three benchmark modes and the three-pass harness
   nanochrono-cli/           command-line front end
@@ -1520,17 +1544,19 @@ crates/
   nanochrono-baremetal/     freestanding kernel: direct PMU, no syscalls
     boot/boot32.S             the only loose assembly file in the project
     boot/*.ld                 linker scripts
-    src/ncplu.rs              the .ncplu loader, signature tiers and containment
+    src/ncplu.rs              the module loader (an .ncapp, or one out of an .ncpkg), signature tiers, containment
+    src/shell/ncpkg.rs        the kernel's read-only ncpkg (info, verify, list, files)
     src/ring3.rs              ring 3 for community plugins: user mapping, nccall
-  nanochrono-plugins/       Apache-2.0 .ncplu plugins (Snake), built by build.sh
-sdk/                        C plugin SDK: ncplu.h, runtime, Makefile, examples
+  nanochrono-plugins/       Apache-2.0 apps (Snake), packed as .ncapp and .ncpkg by build.sh
+sdk/                        C app SDK: ncplu.h (the module ABI), runtime, Makefile, examples
 include/nanochrono.h        C header
 packaging/linux/            .desktop entry and installer
 packaging/macos/            osxcross cross-build, lipo, .app bundle
 packaging/baremetal/        freestanding kernel build, QEMU boot, gdb/ scripts
 tools/nanodump.py           reads the bare-metal kernel's crash dumps
-tools/ncplu.py              packs a plugin cdylib into a .ncplu
-tools/ncplu-sign/           plugin keys, ML-DSA-87 + P-521 signing and verifying (host tool)
+tools/ncplu.py              packs a cdylib into a module (.ncapp, .ncdri, .ncdyn, .ncplu)
+tools/ncplu-sign/           module keys, ML-DSA-87 + P-521 signing and verifying (host tool)
+tools/ncpkg/                builds, signs, verifies, installs and removes .ncpkg packages (host tool)
 tools/nc_rng_kat.py         NC_RNG's known answers, from OpenSSL
 packaging/android/          NDK cross-build for the four ABIs
 kernel/linux/               optional ring 0 module, nanochrono.ko (Rust, Dual MIT/GPL)

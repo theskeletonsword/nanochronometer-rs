@@ -261,13 +261,14 @@ pub fn refused(fb: &Framebuffer, input: &mut Input, name: &str, error: LoadError
     draw::text(fb, &HEADING, tx, y + 26 + TITLE.line_height as u32, "Plugin refused", p.danger);
     draw::text(fb, &BODY, x + 28, y + 120, error.message(), p.text);
     let note = match error {
-        LoadError::Format(_) => "It breaks the .ncplu format. Nothing from it was loaded.",
+        LoadError::Format(_) => "It breaks the module format. Nothing from it was loaded.",
         LoadError::Corrupt => "Its digest does not match: damaged, or edited after packing.",
         LoadError::Privileged => "Privileged services need a creator or trusted-root signature.",
         LoadError::UnresolvedImport => "It needs a kernel symbol this kernel does not export.",
         LoadError::WrongArch => "Install the package for this machine's architecture.",
-        LoadError::NotRunnable => "Drivers load at boot; libraries live in /usr/lib.",
-        LoadError::BadPackage(_) => "It breaks the .ncplu package format. Nothing from it was loaded.",
+        LoadError::NotRunnable => "Drivers load at boot, libraries live in /usr/lib, plugins run inside their app.",
+        LoadError::BadPackage(_) => "It breaks the .ncpkg package format. Nothing from it was loaded.",
+        LoadError::BadManifest(_) => "Its ncpkg.meta is malformed or does not match its files.",
     };
     draw::text(fb, &BODY, x + 28, y + 120 + BODY.line_height as u32 + 6, note, p.muted);
     fb.present(0, 0, fb.width, fb.height);

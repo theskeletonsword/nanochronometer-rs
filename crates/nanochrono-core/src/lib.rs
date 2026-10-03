@@ -58,6 +58,10 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 #![warn(missing_debug_implementations)]
 
+// The heap, for the package manager and the writers. `std` implies it.
+#[cfg(feature = "alloc")]
+extern crate alloc;
+
 // Available with or without an OS: pure instruction sequences and the types
 // that describe them.
 /// Reading the firmware's ACPI Machine Language.
@@ -81,6 +85,16 @@ pub mod crosscheck;
 /// fixture rather than a hardware dependency.
 pub mod hid_report;
 pub mod hypercall_hal;
+/// DEFLATE decoding (RFC 1951) for compressed package files: `no_std`,
+/// allocation-free, bounded output, fuzzed on the host.
+pub mod inflate;
+/// Strict JSON (RFC 8259): the package manifest and the package database.
+///
+/// `no_std` and allocation-free to read — validated once, then navigated
+/// over the text with no token table — so the freestanding kernel reads a
+/// package's manifest with the code the hosted tools use. The owned value
+/// and its writer need `alloc`.
+pub mod json;
 /// The microbenchmark kernels per ISA family. `no_std`; shared by the
 /// hosted dispatcher and the freestanding benchmark tab.
 pub mod kernels;
@@ -96,6 +110,9 @@ pub mod ncplu;
 /// freestanding kernel runs.
 pub mod ncpkg;
 pub mod pmu_leaf;
+/// PNG decoding (package icons, the Gallery): `no_std`, allocation-free,
+/// rows streamed as RGBA8, every chunk checked.
+pub mod png;
 /// The typed code a restart or power-off waits for (BadUSB defence).
 ///
 /// `no_std` and pure, like [`reprobe`]: the caller supplies time and entropy.
@@ -103,6 +120,9 @@ pub mod power_confirm;
 pub mod qoi;
 pub mod redundancy;
 pub mod reprobe;
+/// SHA-512 (FIPS 180-4): what ties every file of a package to its signed
+/// manifest. `no_std`, allocation-free, endian-neutral.
+pub mod sha512;
 /// NC_RNG: the entropy pool — timing jitter, `RDSEED`/`RDRAND`, event
 /// timings and a PMU side counter, conditioned into XDRBG-256.
 ///

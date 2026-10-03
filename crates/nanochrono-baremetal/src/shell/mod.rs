@@ -15,10 +15,12 @@
 //! stopping the job. A line wider than the terminal scrolls sideways.
 //!
 //! The commands are in [`builtins`]; `nanochrono`, the hosted CLI's command
-//! set, is in [`nanochrono`]; `top` in [`top`].
+//! set, is in [`nanochrono`]; `top` in [`top`]; `ncpkg`, the package
+//! manager's read-only half, in [`ncpkg`].
 
 pub mod builtins;
 pub mod nanochrono;
+pub mod ncpkg;
 pub mod top;
 
 use crate::kbd::{KeyInput, Keyboard};

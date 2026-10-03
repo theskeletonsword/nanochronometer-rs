@@ -126,7 +126,7 @@ impl Files {
             }
             let icon = if e.dir {
                 "files"
-            } else if ends_with(e.name.as_str(), ".ncplu") || ends_with(e.name.as_str(), ".ncdri") {
+            } else if [".ncpkg", ".ncapp", ".ncplu", ".ncdyn", ".ncdri"].iter().any(|x| ends_with(e.name.as_str(), x)) {
                 "apps"
             } else {
                 "about"

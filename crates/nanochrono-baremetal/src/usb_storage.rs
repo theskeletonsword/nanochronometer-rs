@@ -152,7 +152,8 @@ pub unsafe fn find_crash_file(xhci: &mut Xhci) -> Option<CrashFile> {
 /// Returns how many bytes were read (the smaller of the file's size and
 /// `out.len()`), or `None` if the file is not there.
 ///
-/// Used to load a `.ncplu` plugin from the boot medium's FAT partition.
+/// Used to load an app (`.ncapp`, or a `.ncpkg` holding one) from the boot
+/// medium's FAT partition.
 ///
 /// # Safety
 /// Drives the controller; requires ring 0.
@@ -396,7 +397,7 @@ const MAX_DIR_CLUSTERS: usize = 32;
 
 /// What to match a directory entry against: a raw 8.3 name, or a long name
 /// (case-insensitive) reassembled from its VFAT entries. `CRASH.DMP` is 8.3;
-/// a plugin's `SNAKE.NCPLU` has a five-character extension and so exists only
+/// an app's `SNAKE.NCAPP` (or `.NCPKG`) has a five-character extension and so exists only
 /// as a long name.
 #[derive(Clone, Copy)]
 enum Target<'a> {

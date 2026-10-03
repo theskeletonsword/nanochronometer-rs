@@ -55,6 +55,8 @@ desktop.ini
 mldsa.seed
 p521.scalar
 *.ncplu-key
+# Self-signing keys from `ncpkg keygen` (tools/ncpkg): private, JSON.
+*.ncpkg-key
 /keys/
 # The same for every key the ecosystem uses (docs/ECOSYSTEM.md, section 3):
 # the four creator roots (creator and verification, ring 3 and ring 0) and
