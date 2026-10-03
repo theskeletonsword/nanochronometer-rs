@@ -20,36 +20,48 @@ to hear about it, and I will not treat you as an adversary for looking.
 **Please do not open a public issue, pull request or discussion for a
 security problem.**
 
-Report it privately to the maintainer through either channel:
+Report it privately to the maintainer on **Signal**, and only there:
 
-| Channel | Where |
-|---|---|
-| **Signal** | **`@theskeletonsword.46`** |
-| **GitHub private advisory** | <https://github.com/theskeletonsword/nanochronometer-rs/security/advisories/new> (Repository → *Security* → *Report a vulnerability*) |
+> **Signal: `@theskeletonsword.46`**
 
-Both are private; only the maintainer sees the report. Signal is end-to-end
-encrypted, so use it for anything sensitive — a working exploit, a signing
-key, a crash dump with memory contents.
+Signal is end-to-end encrypted, which is what a working exploit, a signing
+key or a crash dump with memory contents deserve.
 
-**These are the only channels for vulnerabilities.** Social-media accounts
-(Instagram, TikTok and the like) are not, even where the maintainer has
-one: reports sent there will not be handled, and their messages are not
-end-to-end encrypted. Do not put vulnerability details in a public issue
-either; if neither channel above works for you, open an issue that says only
-"security contact requested", with no details.
+### Signal, and nothing else, for vulnerabilities
 
-Any vulnerability is welcome, however small or theoretical it looks. A useful
-report includes:
+I talk to friends and other contributors on Telegram, Instagram and TikTok —
+to send memes and have fun, not to receive vulnerability reports. Those are
+personal spaces, and a report does not belong in them: Telegram's ordinary
+chats are not end-to-end encrypted, and neither are Instagram's or TikTok's
+messages. A vulnerability sent through any of them **will not be handled**;
+you will be asked to send it again on Signal. Memes are still welcome there.
 
-- the component and version or commit (`git rev-parse HEAD`);
-- the architecture and how it was run (hosted OS, QEMU machine and command
-  line, real hardware);
-- what an attacker controls and what they gain (code in ring 0, escaping
-  ring 3, bypassing a signature, reading another module's memory, a crash);
-- steps or a proof of concept to reproduce it — a kernel command line, a
-  crafted `.ncapp` / `.ncdri` / `.ncpkg` / NCFS image, a serial log or a
-  crash dump (`tools/nanodump.py` reads them);
+Do not put vulnerability details in a public issue, pull request or
+discussion either. If you cannot use Signal, open an issue that says only
+"security contact requested", with no details, and we will work it out.
+
+### What a report must include
+
+A report is handled when it comes with:
+
+1. **A reproducible proof of concept** — the exact steps, input or code that
+   triggers the problem: a kernel command line, a crafted `.ncapp` /
+   `.ncdri` / `.ncpkg` / NCFS image, a program, a script.
+2. **Demonstrable impact** — what an attacker controls and what they
+   actually gain, shown rather than asserted: code running in ring 0, an
+   escape from ring 3, a signature check bypassed, another module's memory
+   read, a crash with the dump that proves it.
+
+Also tell me:
+
+- the component and the version or commit (`git rev-parse HEAD`);
+- the architecture and how it ran (hosted OS, QEMU machine and command line,
+  real hardware);
 - a suggested fix, if you have one (optional).
+
+Attachments are welcome to complement the report: **`.zip`** (a PoC project,
+images, logs), **`.pdf`**, **`.md`** and **images** (screenshots of the stop
+screen, the serial log). Crash dumps can be read with `tools/nanodump.py`.
 
 ## What happens next
 
@@ -92,8 +104,10 @@ Out of scope:
 - findings that need an already-compromised ring 0, or physical access beyond
   what the threat model of the affected component assumes (say which you
   think applies — when in doubt, report it);
-- denial of service by flooding someone else's infrastructure, social
-  engineering, and phishing.
+- denial of service (DoS or DDoS) against anyone's systems or networks;
+- social engineering or phishing against the maintainer, the maintainer's
+  friends, or the project's contributors — these are not findings, they are
+  forbidden (see the rules below).
 
 ## Safe harbor
 
@@ -126,9 +140,17 @@ The rules:
    we agree on.
 5. Do not use a vulnerability for anything beyond what you need to
    demonstrate it.
+6. **No DoS or DDoS** against other people: their machines, networks or
+   services. Denial-of-service bugs in NanoChronometer itself are in scope —
+   demonstrate them on your own machine or VM.
+7. **No social engineering** — no phishing, pretexting, impersonation or
+   pressure — against the maintainer, the maintainer's personal friends, or
+   the project's contributors.
+8. **Report on Signal only.** Not on Instagram, Telegram or TikTok (see
+   above).
 
 This safe harbor covers only the NanoChronometer project and what the
 maintainer controls. It cannot bind third parties — the owners of hardware,
 networks or services you test on, or the authors of dependencies — and it
 does not override the law where you are. If you are unsure whether something
-you plan to do is covered, ask first through the private channel above.
+you plan to do is covered, ask first on Signal.
