@@ -107,6 +107,7 @@ pub fn proc_file(p: Proc, out: &mut dyn Write) {
         Proc::Cmdline => {
             let _ = writeln!(out, "{}", crate::boot::command_line());
         }
+        Proc::Initramdisk => crate::initramdisk::report(out),
         Proc::Uptime => {
             let ns = system.map_or(0, |s| s.uptime_ns());
             let _ = writeln!(out, "{}.{:09}", ns / 1_000_000_000, ns % 1_000_000_000);

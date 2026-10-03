@@ -776,6 +776,33 @@ pub fn root_fingerprint(which: Tier) -> Option<[u8; 8]> {
     }
 }
 
+/// Whether `sig` (ML-DSA-87 then P-521, as `ncpkg` and `ncfs seal` write
+/// a root's hybrid) verifies over `msg` under the embedded root `which`;
+/// on the verification stack, as every ML-DSA check is.
+#[cfg(feature = "plugin-verify")]
+pub fn verify_root_message(which: Tier, msg: &[u8], sig: &[u8]) -> bool {
+    struct Job {
+        which: Tier,
+        msg: *const u8,
+        msg_len: usize,
+        sig: *const u8,
+        sig_len: usize,
+        ok: bool,
+    }
+    extern "C" fn run(arg: *mut u8) {
+        // SAFETY: `arg` is the `Job` below, alive for the call.
+        let job = unsafe { &mut *(arg as *mut Job) };
+        // SAFETY: both slices outlive the call; the switched stack does not
+        // move them.
+        let (msg, sig) = unsafe { (core::slice::from_raw_parts(job.msg, job.msg_len), core::slice::from_raw_parts(job.sig, job.sig_len)) };
+        job.ok = verify_impl::verify_message(job.which, msg, sig);
+    }
+    let mut job = Job { which, msg: msg.as_ptr(), msg_len: msg.len(), sig: sig.as_ptr(), sig_len: sig.len(), ok: false };
+    // SAFETY: ring 0, single core; `run` uses `arg` as the `Job` it is given.
+    unsafe { on_verify_stack(run, &mut job as *mut Job as *mut u8) };
+    job.ok
+}
+
 /// The verifier proper. Its own module so the heavy crypto crates are pulled
 /// in only with the feature.
 #[cfg(feature = "plugin-verify")]
@@ -837,6 +864,16 @@ mod verify_impl {
             && block
                 .get(SIG_P521_OFF..SIG_P521_OFF + SIG_P521_LEN)
                 .is_some_and(|sig| verify_p521(p521, digest, sig))
+    }
+
+    /// Both halves of a root's hybrid over `msg`.
+    pub fn verify_message(which: Tier, msg: &[u8], sig: &[u8]) -> bool {
+        let (Some(mldsa), Some(p521)) = root(which) else { return false };
+        if sig.len() != SIG_MLDSA_LEN + SIG_P521_LEN {
+            return false;
+        }
+        let (a, b) = sig.split_at(SIG_MLDSA_LEN);
+        verify_mldsa(mldsa, msg, a) && verify_p521(p521, msg, b)
     }
 
     pub fn verify(digest: &[u8; 64], block: Option<&[u8]>) -> Signature {

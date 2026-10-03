@@ -1068,5 +1068,23 @@ fn report_integrity() {
     );
     println!();
 
+    report_initramdisk();
     println!("selftest complete; halting");
+}
+
+/// The ncinitramdisk the loader handed over, if any: mounted (and its seal
+/// as judged), or refused and why.
+fn report_initramdisk() {
+    println!("== ncinitramdisk ==");
+    // The tree is built here at the latest, whatever session follows: the
+    // image's seal is judged at boot, not when a shell first lists a file.
+    // SAFETY: at boot, after the loader's modules were recorded; building
+    // the tree is idempotent.
+    unsafe { crate::vfs::init() };
+    let mut out = crate::text::Text::<1024>::new();
+    crate::initramdisk::report(&mut out);
+    for line in out.as_str().lines() {
+        println!("  {line}");
+    }
+    println!();
 }

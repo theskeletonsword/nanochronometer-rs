@@ -29,6 +29,14 @@
 # mode's default (release -O2, debug -O0, debug-og -Og); see
 # packaging/opt-level.sh. The code must be correct at every one.
 #
+# The ncinitramdisk (an NCFS image, src/initramdisk.rs) rides on every x86
+# ISO as a multiboot2 module: packaging/baremetal/ncinitramdisk/ plus the
+# specifications in docs/, built with tools/ncfs (ZSTD, shrunk to fit).
+#   NCINITRAMDISK=FILE                           use this image instead
+#   NCINITRAMDISK_SEAL_KEYS=KEYDIR               seal and sign it (an
+#                                                ncplu-sign key directory) ...
+#   NCINITRAMDISK_SEAL_ROLE=creator-ring0        ... in this role (the default)
+#
 # NCAPP_EXTRA="a.NCAPP b.NCAPP" (NCPLU_EXTRA, its old name, too) adds apps
 # built elsewhere (the C SDK's, in sdk/) to the ISO beside the in-tree ones.
 #
@@ -868,6 +876,49 @@ TXT
     rm -rf "${files}"
 }
 
+# Builds the ncinitramdisk once per run into ${out_dir}/ncinitramdisk.ncfs;
+# fails (quietly, with a note) when tools/ncfs cannot be built here.
+initramdisk_state=""
+build_initramdisk() {
+    local img="${out_dir}/ncinitramdisk.ncfs"
+    case "${initramdisk_state}" in
+        ok) return 0 ;;
+        failed) return 1 ;;
+    esac
+    initramdisk_state="failed"
+    if [[ -n "${NCINITRAMDISK:-}" ]]; then
+        command cp -f "${NCINITRAMDISK}" "${img}" || return 1
+        initramdisk_state="ok"
+        return 0
+    fi
+    local target="${build_root}/tools-target"
+    echo "=== ncinitramdisk (tools/ncfs)"
+    if ! cargo build --release --quiet --no-default-features \
+        --manifest-path "${repo_root}/tools/ncfs/Cargo.toml" --target-dir "${target}"; then
+        echo "note: tools/ncfs did not build; the ISO carries no ncinitramdisk"
+        return 1
+    fi
+    local stage="${out_dir}/.initramdisk"
+    rm -rf "${stage}"
+    command cp -a "${repo_root}/packaging/baremetal/ncinitramdisk" "${stage}"
+    mkdir -p "${stage}/usr/share/doc"
+    local doc
+    for doc in SYSTEM NCFS NCPKG ECOSYSTEM; do
+        [[ -f "${repo_root}/docs/${doc}.md" ]] && command cp "${repo_root}/docs/${doc}.md" "${stage}/usr/share/doc/${doc}.md"
+    done
+    local seal=()
+    if [[ -n "${NCINITRAMDISK_SEAL_KEYS:-}" ]]; then
+        seal=(--seal-role "${NCINITRAMDISK_SEAL_ROLE:-creator-ring0}" --seal-keys "${NCINITRAMDISK_SEAL_KEYS}")
+    fi
+    if ! "${target}/release/ncfs" build "${stage}" -o "${img}" --label ncinitramdisk "${seal[@]}"; then
+        echo "note: the ncinitramdisk did not build"
+        rm -rf "${stage}"
+        return 1
+    fi
+    rm -rf "${stage}"
+    initramdisk_state="ok"
+}
+
 # Builds a GRUB hybrid ISO for x86_64 or i386.
 #
 # $1: arch; $2: the ISO to write (default: the release name in out_dir);
@@ -914,6 +965,12 @@ build_iso_x86() {
             command cp -f "${plug}" "${staging}${dest}"
             modules+="    module2 ${dest} ${dest}"$'\n'
         done
+    fi
+    # The ncinitramdisk: an NCFS image the kernel merges into its tree,
+    # its seal judged (src/initramdisk.rs). Any x86 kernel reads it.
+    if build_initramdisk; then
+        command cp -f "${out_dir}/ncinitramdisk.ncfs" "${staging}/boot/ncinitramdisk.ncfs"
+        modules+="    module2 /boot/ncinitramdisk.ncfs ncinitramdisk"$'\n'
     fi
     sed -e "s/@ARCH@/${arch}/g" -e "s/@ARGS@/${kernel_args}/g" > "${staging}/boot/grub/grub.cfg" <<'CFG'
 set timeout=5

@@ -476,6 +476,35 @@ impl<D: BlockDev> Volume<D> {
         Ok(len)
     }
 
+    /// Where a file's bytes lie on the device when they need no decoding:
+    /// one raw extent holding the whole file. Checked against its BLAKE3
+    /// before it is returned, so a caller with the device in memory can
+    /// use the bytes in place: (first block, length).
+    pub fn contiguous(&mut self, ino: u64, inode: &Inode, s: &mut Scratch) -> Result<Option<(u64, usize)>, Error> {
+        if inode.size == 0 || inode.size > WINDOW as u64 {
+            return Ok(None);
+        }
+        let (sb, root, owner) = (self.sb, self.subvol.root, self.subvol_id);
+        let key = Key::new(ino, KIND_EXTENT, 0);
+        let c = seek(&mut self.dev, &sb, &root, owner, &key, &mut s.node)?;
+        if c.index == c.count || leaf_item(&s.node, c.index).0 != key {
+            return Ok(None);
+        }
+        let r = match Extent::decode(leaf_item(&s.node, c.index).1).ok_or(Error::Corrupt(root.block))? {
+            Extent::Regular(r) if r.compression == Compression::None && u64::from(r.len) == inode.size => r,
+            _ => return Ok(None),
+        };
+        if r.block < FIRST_FREE || r.block.checked_add(u64::from(r.blocks)).is_none_or(|e| e > sb.total_blocks) {
+            return Err(Error::Corrupt(r.block));
+        }
+        let n = r.blocks as usize * BLOCK;
+        self.dev.read(r.block, &mut s.stored[..n])?;
+        if !blake3::ct_eq(&blake3::hash(&s.stored[..r.stored as usize]), &r.hash) {
+            return Err(Error::Checksum(r.block));
+        }
+        Ok(Some((r.block, r.len as usize)))
+    }
+
     /// A symbolic link's target.
     pub fn read_link(&mut self, ino: u64, inode: &Inode, out: &mut [u8], s: &mut Scratch) -> Result<usize, Error> {
         if !inode.is_symlink() {

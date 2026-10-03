@@ -74,6 +74,9 @@ pub mod system;
 pub mod term;
 /// The read-only file tree: built-in files, boot modules, /proc, /dev.
 pub mod vfs;
+/// The `ncinitramdisk`: a sealed NCFS image merged into the file tree at
+/// boot, its seal judged and every file checked.
+pub mod initramdisk;
 /// x86 and AArch64: ACPI on one, PSCI on the other. PowerPC boards describe
 /// themselves with a device tree ([`fdt`]) and power off through firmware.
 pub mod acpi;

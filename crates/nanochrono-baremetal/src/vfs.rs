@@ -12,6 +12,9 @@
 //! * A cpio archive (`newc`, what `cpio -o -H newc` and the Linux initramfs
 //!   tools write) passed as a module named `initrd` or `*.cpio`, or as the
 //!   device tree's initrd, unpacked into the same tree.
+//! * An NCFS image — the `ncinitramdisk`, sealed or not — merged into the
+//!   tree by `crate::initramdisk`, its seal judged and every file checked
+//!   against its BLAKE3.
 //! * `/proc`: files generated when read — `version`, `cmdline`, `uptime`,
 //!   `meminfo`, `cpuinfo`, `cpuctl`, `modules`, `kmsg`.
 //! * `/dev`: `null`, `zero` and `random` (NC_RNG).
@@ -46,6 +49,7 @@ pub enum Proc {
     Cpuctl,
     Modules,
     Kmsg,
+    Initramdisk,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -75,7 +79,7 @@ impl Node {
     }
 }
 
-const MAX_NODES: usize = 384;
+const MAX_NODES: usize = 1024;
 static mut NODES: [Option<Node>; MAX_NODES] = [None; MAX_NODES];
 static COUNT: AtomicUsize = AtomicUsize::new(0);
 
@@ -90,6 +94,16 @@ fn add(path: &str, content: Content) {
     // slots below the published count never change.
     unsafe { (*core::ptr::addr_of_mut!(NODES))[n] = Some(Node { path: p, content }) };
     COUNT.store(n + 1, Ordering::Relaxed);
+}
+
+/// A directory, for code that builds the tree at boot (`initramdisk`).
+pub(crate) fn add_dir(path: &str) {
+    add(path, Content::Dir);
+}
+
+/// A file whose bytes live for the whole session.
+pub(crate) fn add_file(path: &str, bytes: &'static [u8]) {
+    add(path, Content::Bytes(bytes));
 }
 
 fn nodes() -> &'static [Option<Node>] {
@@ -166,6 +180,7 @@ pub unsafe fn init() {
         ("cpuctl", Proc::Cpuctl),
         ("modules", Proc::Modules),
         ("kmsg", Proc::Kmsg),
+        ("ncinitramdisk", Proc::Initramdisk),
     ] {
         let mut path = Text::<32>::new();
         path.str("/proc/").str(name);
@@ -181,6 +196,11 @@ pub unsafe fn init() {
         let name = module.name.split_ascii_whitespace().next().unwrap_or("");
         if name == "initrd" || name.ends_with(".cpio") || bytes.starts_with(b"070701") {
             unpack_cpio(bytes);
+            continue;
+        }
+        if crate::initramdisk::is_image(name, bytes) {
+            // SAFETY: at boot, once per image, while the tree is built.
+            unsafe { crate::initramdisk::mount(bytes, add_dir, add_file) };
             continue;
         }
         let mut path = Text::<128>::new();
