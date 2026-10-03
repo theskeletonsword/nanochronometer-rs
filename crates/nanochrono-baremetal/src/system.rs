@@ -153,9 +153,10 @@ pub fn meminfo(out: &mut dyn Write, system: Option<&System>) {
     let total = system.map_or(0, |s| s.memory.total);
     let image = crate::multiboot::kernel_footprint();
     let kib = |b: u64| b / 1024;
+    let pages = crate::palloc::stats();
     if total > 0 {
         let _ = writeln!(out, "MemTotal:      {:>10} kB", kib(total));
-        let _ = writeln!(out, "MemFree:       {:>10} kB", kib(total.saturating_sub(image)));
+        let _ = writeln!(out, "MemFree:       {:>10} kB", kib(total.saturating_sub(image).saturating_sub(pages.in_use)));
     } else {
         let _ = writeln!(out, "MemTotal:      {:>10}    (the loader did not say)", "?");
     }
@@ -163,7 +164,23 @@ pub fn meminfo(out: &mut dyn Write, system: Option<&System>) {
     for (name, bytes) in crate::memstat::pools() {
         let _ = writeln!(out, "  {:<12}{:>10} kB", name, kib(bytes));
     }
-    let _ = writeln!(out, "Heap:          {:>10} kB   (none: there is no allocator)", 0);
+    if crate::palloc::ready() {
+        let _ = writeln!(out, "Pages:         {:>10} kB   handed out by the page allocator", kib(pages.in_use));
+        let back = crate::framebuffer::dynamic_back_buffer_bytes() as u64;
+        if back > 0 {
+            let _ = writeln!(out, "  {:<12}{:>10} kB", "back buffer", kib(back));
+        }
+        let _ = writeln!(
+            out,
+            "PagesFree:     {:>10} kB   below {} MiB, in {} runs",
+            kib(pages.free),
+            crate::palloc::CEILING >> 20,
+            pages.runs
+        );
+    } else {
+        let _ = writeln!(out, "Pages:         {:>10} kB   (no page allocator: the loader gave no memory map)", 0);
+    }
+    let _ = writeln!(out, "Heap:          {:>10} kB   (none: pages only, no general allocator)", 0);
 }
 
 fn cpuinfo(out: &mut dyn Write, system: Option<&System>) {

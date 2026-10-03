@@ -998,10 +998,55 @@ pub struct Inspected<'a> {
     pub file_size: u32,
 }
 
+impl<'a> Inspected<'a> {
+    /// The validated image, for a loader other than the app launcher's (a
+    /// driver module, `crate::ncdri`), which places it in memory of its own.
+    pub fn image(&self) -> &Image<'a> {
+        &self.image
+    }
+}
+
 /// The arena's base address (2 MiB-aligned, its own page), for the ring-3
 /// mapper.
 pub fn arena_ptr() -> usize {
     core::ptr::addr_of!(ARENA) as usize
+}
+
+/// Copies `image`'s sections into `arena` — zeroed first, so `.bss` is — and
+/// applies its relocations for the image running at `base`, resolving each
+/// import by name through `resolve`. The app launcher ([`place`]) and the
+/// driver loader (`crate::ncdri`) both place modules with it.
+///
+/// Every write goes through `get_mut` on `arena`: no byte of the file can
+/// make it write outside, or panic.
+pub fn copy_and_relocate(
+    image: &Image<'_>,
+    arena: &mut [u8],
+    base: u64,
+    resolve: &mut dyn FnMut(&[u8]) -> Result<u64, LoadError>,
+) -> Result<(), LoadError> {
+    let bad = LoadError::Format(FormatError::BadSection);
+    let arena = arena.get_mut(..image.arena_size).ok_or(bad)?;
+    arena.fill(0);
+    for i in 0..image.section_count() {
+        let section = image.section(i).map_err(LoadError::Format)?;
+        let bytes = image.section_bytes(&section).map_err(LoadError::Format)?;
+        let end = section.mem_off.checked_add(bytes.len()).ok_or(bad)?;
+        arena.get_mut(section.mem_off..end).ok_or(bad)?.copy_from_slice(bytes);
+    }
+    for i in 0..image.reloc_count() {
+        let (offset, value) = match image.reloc(i).map_err(LoadError::Format)? {
+            Reloc::Relative { offset, target } => (offset, base + target as u64),
+            Reloc::Import { offset, import } => {
+                let name = image.import_name(import).map_err(LoadError::Format)?;
+                (offset, resolve(name)?)
+            }
+        };
+        let end = offset.checked_add(8).ok_or(bad)?;
+        let slot = arena.get_mut(offset..end).ok_or(LoadError::Format(FormatError::BadRelocation))?;
+        slot.copy_from_slice(&value.to_le_bytes());
+    }
+    Ok(())
 }
 
 /// Copies the inspected plugin into the arena and applies its relocations.
@@ -1021,43 +1066,22 @@ pub unsafe fn place(insp: &Inspected<'_>, abi_user: Option<usize>) -> Result<Loa
     let whole = unsafe { &mut (*core::ptr::addr_of_mut!(ARENA)).bytes };
     let bad = LoadError::Format(FormatError::BadSection);
     let arena = whole.get_mut(..image.arena_size).ok_or(bad)?;
-    arena.fill(0);
-
-    for i in 0..image.section_count() {
-        let section = image.section(i).map_err(LoadError::Format)?;
-        let bytes = image.section_bytes(&section).map_err(LoadError::Format)?;
-        let end = section.mem_off.checked_add(bytes.len()).ok_or(bad)?;
-        arena.get_mut(section.mem_off..end).ok_or(bad)?.copy_from_slice(bytes);
-    }
-
     let base = arena.as_ptr() as u64;
-    for i in 0..image.reloc_count() {
-        let (offset, value) = match image.reloc(i).map_err(LoadError::Format)? {
-            Reloc::Relative { offset, target } => (offset, base + target as u64),
-            Reloc::Import { offset, import } => {
-                let name = image.import_name(import).map_err(LoadError::Format)?;
-                let addr = match abi_user {
-                    // Ring 3: only what is laid out in user memory.
-                    Some(abi) => {
-                        crate::ring3::user_symbol(name, abi).ok_or(LoadError::UnresolvedImport)?
-                    }
-                    // Kernel tier: the kernel's own symbols, tier-gated.
-                    None => {
-                        let (addr, min_tier) =
-                            nc_resolve_symbol(name).ok_or(LoadError::UnresolvedImport)?;
-                        if !tier.may_use(min_tier) {
-                            return Err(LoadError::UnresolvedImport);
-                        }
-                        addr
-                    }
-                };
-                (offset, addr as u64)
+    copy_and_relocate(image, arena, base, &mut |name| {
+        let addr = match abi_user {
+            // Ring 3: only what is laid out in user memory.
+            Some(abi) => crate::ring3::user_symbol(name, abi).ok_or(LoadError::UnresolvedImport)?,
+            // Kernel tier: the kernel's own symbols, tier-gated.
+            None => {
+                let (addr, min_tier) = nc_resolve_symbol(name).ok_or(LoadError::UnresolvedImport)?;
+                if !tier.may_use(min_tier) {
+                    return Err(LoadError::UnresolvedImport);
+                }
+                addr
             }
         };
-        let end = offset.checked_add(8).ok_or(bad)?;
-        let slot = arena.get_mut(offset..end).ok_or(LoadError::Format(FormatError::BadRelocation))?;
-        slot.copy_from_slice(&value.to_le_bytes());
-    }
+        Ok(addr as u64)
+    })?;
 
     Ok(Loaded {
         entry: base as usize + image.entry,

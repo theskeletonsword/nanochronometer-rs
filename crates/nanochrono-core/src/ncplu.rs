@@ -735,6 +735,11 @@ impl<'a> Image<'a> {
         self.name_at(self.imports.off + i * IMPORT_SIZE)
     }
 
+    /// How many exports the image declares.
+    pub fn export_count(&self) -> usize {
+        self.exports.n
+    }
+
     /// Export `i`: its name and arena offset.
     pub fn export(&self, i: usize) -> Result<(&'a [u8], usize), FormatError> {
         if i >= self.exports.n {

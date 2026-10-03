@@ -58,7 +58,7 @@ extern "C" {
 #define NCDRI_API_MAJOR 1
 /* Bumped when services are appended. Informational: what a driver may use
  * is decided by the size the kernel reports (NCDRI_HAS), not by this. */
-#define NCDRI_API_MINOR 0
+#define NCDRI_API_MINOR 1
 
 /* The one symbol a driver exports. */
 #define NCDRI_EXPORT __attribute__((visibility("default")))
@@ -170,6 +170,26 @@ typedef struct ncdri_driver {
 #define NCDRI_MTX_SPIN  1u      /* may be taken in interrupt context; never sleeps */
 #define NCDRI_MTX_SLEEP 2u      /* may sleep while waiting; never in interrupt context */
 
+/* ---- Display (minor 1) ---------------------------------------------------
+ * A display driver that has set a mode tells the kernel where the picture
+ * is: which of the device's memory windows (resource_map's
+ * NCDRI_RES_MEMORY index, a BAR) holds it, where in it, and its geometry.
+ * The kernel maps the window itself — no raw device pointer crosses — checks
+ * that the surface lies inside it, and draws the session there from then on.
+ * All fields fixed-width: the same layout on every architecture. */
+#define NCDRI_FORMAT_XRGB8888 0x34325258u /* DRM fourcc 'XR24': 32-bit 0x00RRGGBB, little-endian */
+
+typedef struct ncdri_scanout {
+    uint32_t size;       /* sizeof(ncdri_scanout_t) the driver was built with */
+    uint32_t res_index;  /* the memory window (BAR) holding the surface */
+    uint64_t offset;     /* where in that window the first pixel is */
+    uint32_t width;
+    uint32_t height;
+    uint32_t pitch;      /* bytes from one row to the next */
+    uint32_t format;     /* NCDRI_FORMAT_* */
+    uint32_t reserved[6];
+} ncdri_scanout_t;
+
 /* fpu_begin flags (FreeBSD FPU_KERN_*) */
 #define NCDRI_FPU_NORMAL 0x0u
 #define NCDRI_FPU_NOCTX  0x4u   /* no saved context: preemption off, short sections only */
@@ -262,10 +282,22 @@ typedef struct nckernel_api {
     /* Entropy (any): NC_RNG, the kernel's pool. */
     int (*rng_fill)(void *buf, size_t len, uint32_t flags);
 
+    /* ---- Minor 1 ---- */
+
+    /* Display (sleep: attach). Hands the kernel the scanout of a mode the
+     * driver has set (ncdri_scanout_t, above); `edid` (or NULL) is the
+     * monitor's EDID, which the kernel names the monitor from. Only the
+     * XRGB8888 format today. */
+    int (*display_scanout)(ncdri_device_t dev, const ncdri_scanout_t *s, const uint8_t *edid, size_t edid_len);
+    /* The native mode an EDID declares — its first detailed timing — through
+     * the kernel's parser, which checks the header, the checksum and the
+     * version. NCDRI_ENOENT when the EDID names no preferred mode. (any) */
+    int (*edid_preferred)(const uint8_t *edid, size_t len, uint32_t *width, uint32_t *height, uint32_t *refresh_mhz);
+
     /* Growth: new services are appended here within a major version,
-     * taking slots from the end of this array's place in the layout. A
-     * kernel always zeroes what it does not implement. */
-    void *reserved[32];
+     * taking slots from the start of this array, so the table keeps its
+     * size. A kernel always zeroes what it does not implement. */
+    void *reserved[30];
 } nckernel_api_t;
 
 /* Whether the kernel's table `k` reaches field `f`: what a driver checks
@@ -329,6 +361,14 @@ _Static_assert(offsetof(ncdri_driver_t, size) == 0, "ncdri_driver_t.size moved")
 _Static_assert(offsetof(ncdri_driver_t, api_major) == 4, "ncdri_driver_t.api_major moved");
 _Static_assert(offsetof(ncdri_devinfo_t, size) == 0, "ncdri_devinfo_t.size moved");
 _Static_assert(sizeof(ncdri_devinfo_t) == 84, "ncdri_devinfo_t is 84 bytes on every architecture");
+/* The table keeps its size within a major: new services take reserved[]
+ * slots (8 bytes of size and versions, then 77 pointer-sized slots). */
+_Static_assert(sizeof(nckernel_api_t) == 8 + 77 * sizeof(void *), "nckernel_api_t changed size within a major");
+_Static_assert(offsetof(nckernel_api_t, rng_fill) == 8 + 44 * sizeof(void *), "nckernel_api_t.rng_fill moved");
+_Static_assert(offsetof(nckernel_api_t, display_scanout) == 8 + 45 * sizeof(void *), "nckernel_api_t.display_scanout moved");
+_Static_assert(sizeof(ncdri_scanout_t) == 56, "ncdri_scanout_t is 56 bytes on every architecture");
+_Static_assert(offsetof(ncdri_scanout_t, offset) == 8 && offsetof(ncdri_scanout_t, format) == 28,
+               "ncdri_scanout_t's fields moved");
 
 #ifdef __cplusplus
 }

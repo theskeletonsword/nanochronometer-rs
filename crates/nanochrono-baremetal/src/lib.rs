@@ -144,6 +144,9 @@ pub mod input;
 #[path = "input_serial.rs"]
 pub mod input;
 pub mod multiboot;
+/// Physical pages over the loader's memory map, for what the image cannot
+/// size in advance: a back buffer past the static one, a driver's memory.
+pub mod palloc;
 pub mod panic;
 /// x86 only: the 8042 controller and the multiboot framebuffer are PC
 /// firmware. An AArch64 board reports its console over the serial port.
@@ -187,6 +190,11 @@ pub mod usb_storage;
 /// kernel symbol table exported to plugins.
 #[cfg(target_arch = "x86_64")]
 pub mod ncplu;
+/// x86_64 only (the module packer's relocations are x86-64's): `.ncdri`
+/// driver modules from `/boot/drivers/`, their trust gate, and the kernel's
+/// service table `nckernel_api_t` (docs/NCDRI.md).
+#[cfg(target_arch = "x86_64")]
+pub mod ncdri;
 /// x86_64 only: the launch card a plugin passes before it gets the screen —
 /// its signature tier (✅ Official / 🌳 Community), or why it was refused.
 #[cfg(target_arch = "x86_64")]

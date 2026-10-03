@@ -81,6 +81,13 @@ pub mod cpu_control;
 ///
 /// `no_std` and pure: the caller reads both clocks and passes the pair.
 pub mod crosscheck;
+/// EDID, a monitor's description of itself: maker, name, native mode.
+/// `no_std` and pure, written for untrusted bytes; host-tested.
+pub mod edid;
+/// Physical memory as free ranges: the kernel's page allocator, fed the
+/// loader's memory map. `no_std`, allocation-free and pure; host-tested
+/// against a page-by-page model.
+pub mod frames;
 /// Reading a HID report descriptor to find a pointer.
 ///
 /// `no_std` and pure: the freestanding kernel and a hosted test run it over

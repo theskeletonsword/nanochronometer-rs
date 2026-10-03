@@ -30,7 +30,7 @@
 //! code: `iced` renders through `wgpu` onto a surface `winit` gets from a
 //! window server, none of which exists here.
 
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
 /// Where the loader put the framebuffer, and how it is laid out.
 #[derive(Debug, Clone, Copy)]
@@ -57,12 +57,14 @@ pub struct Framebuffer {
 /// A colour, as the framebuffer wants it.
 pub type Colour = u32;
 
-/// How large a mode the back buffer covers.
+/// How large a mode the static back buffer covers.
 ///
 /// 1920x1200 is the largest panel this is likely to meet on a laptop, and the
 /// buffer costs four bytes a pixel of `.bss` — about nine megabytes, zeroed
-/// once by the boot stub. A larger mode is not an error: the interface falls
-/// back to drawing straight onto the device, which works and merely flickers.
+/// once by the boot stub. A larger mode — a 4K monitor on a tower — gets a
+/// back buffer of its own size from the page allocator (`crate::palloc`);
+/// only when that has no run large enough does the interface draw straight
+/// onto the device, which works and merely flickers.
 const SHADOW_W: usize = 1920;
 const SHADOW_H: usize = 1200;
 /// The back buffer's size, for the memory report.
@@ -74,6 +76,18 @@ pub const SHADOW_BYTES: usize = SHADOW_W * SHADOW_H * 4;
 /// `.bss` rather than `.data` so the nine megabytes are zeroes in the ELF
 /// rather than nine megabytes of file.
 static mut SHADOW: [u32; SHADOW_W * SHADOW_H] = [0; SHADOW_W * SHADOW_H];
+
+/// The back buffer a mode larger than the static one took from the page
+/// allocator: its address and length, or zero. One screen at a time, so one
+/// of these; a screen that replaces it gives it back.
+static DYNAMIC_ADDR: AtomicUsize = AtomicUsize::new(0);
+static DYNAMIC_LEN: AtomicUsize = AtomicUsize::new(0);
+
+/// Bytes of back buffer taken from the page allocator (zero while the static
+/// one serves), for the memory report.
+pub fn dynamic_back_buffer_bytes() -> usize {
+    DYNAMIC_LEN.load(Ordering::Relaxed)
+}
 
 /// The rectangle drawn into since the last present.
 ///
@@ -157,24 +171,45 @@ impl Framebuffer {
         }
     }
 
-    /// Attaches the back buffer, if this mode fits in it.
+    /// Attaches a back buffer: the static one when the mode fits in it,
+    /// else one of the mode's own size from the page allocator.
     ///
-    /// Called once, before anything is drawn. Returns whether compositing is
-    /// on, which the interface reports rather than hides: a mode with no back
-    /// buffer redraws visibly, and that is worth being able to explain.
+    /// Called before anything is drawn on this screen. Returns whether
+    /// compositing is on, which the interface reports rather than hides: a
+    /// mode with no back buffer redraws visibly, and that is worth being
+    /// able to explain.
     ///
     /// # Safety
-    /// Must be called at most once, and before any other reference to the
-    /// back buffer exists. There is one caller, in `kmain`.
+    /// Before any other reference to the back buffer exists, once per
+    /// screen: at boot (`kmain`), and again only for a screen that replaces
+    /// the previous one (a display driver's mode, `crate::ncdri`), which is
+    /// never drawn on again — its page-allocated buffer, if it had one, is
+    /// given back here.
     pub unsafe fn attach_back_buffer(&mut self) -> bool {
-        if self.width as usize > SHADOW_W || self.height as usize > SHADOW_H {
-            return false;
+        let previous = DYNAMIC_ADDR.swap(0, Ordering::Relaxed);
+        let previous_len = DYNAMIC_LEN.swap(0, Ordering::Relaxed);
+        if previous != 0 {
+            crate::palloc::free(previous, previous_len);
         }
-        // `addr_of_mut!` rather than `&mut SHADOW`: taking a reference to a
-        // `static mut` is unsound the moment a second one exists, and this
-        // pointer outlives the call. Only the address is wanted.
-        self.shadow = core::ptr::addr_of_mut!(SHADOW).cast::<u32>();
-        true
+        if self.width as usize <= SHADOW_W && self.height as usize <= SHADOW_H {
+            // `addr_of_mut!` rather than `&mut SHADOW`: taking a reference to
+            // a `static mut` is unsound the moment a second one exists, and
+            // this pointer outlives the call. Only the address is wanted.
+            self.shadow = core::ptr::addr_of_mut!(SHADOW).cast::<u32>();
+            return true;
+        }
+        let Some(bytes) = (self.width as usize).checked_mul(self.height as usize).and_then(|p| p.checked_mul(4)) else {
+            return false;
+        };
+        match crate::palloc::alloc_zeroed(bytes, 4096) {
+            Some(addr) => {
+                DYNAMIC_ADDR.store(addr, Ordering::Relaxed);
+                DYNAMIC_LEN.store(bytes, Ordering::Relaxed);
+                self.shadow = addr as *mut u32;
+                true
+            }
+            None => false,
+        }
     }
 
     /// Whether drawing goes through the back buffer.

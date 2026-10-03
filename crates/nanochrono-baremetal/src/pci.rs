@@ -75,6 +75,18 @@ pub struct Device {
     pub bar0: u64,
 }
 
+/// One base address register, sized.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Bar {
+    /// Where the window starts: a physical address, or an I/O port.
+    pub base: u64,
+    /// How many bytes (or ports) it decodes.
+    pub size: u64,
+    /// An I/O-port window rather than memory.
+    pub io: bool,
+    pub prefetchable: bool,
+}
+
 impl Device {
     /// The USB interface this device implements, if it is a host controller.
     pub fn usb_kind(&self) -> Option<UsbKind> {
@@ -161,38 +173,127 @@ impl Device {
     /// Writes PCI configuration space; requires ring 0 and nothing else using
     /// the device while it runs.
     pub unsafe fn bar0_size(&self) -> u64 {
-        let (b, s, f) = (self.bus, self.slot, self.function);
-        // SAFETY: forwarded from this function's own contract. Every register
-        // written is restored before returning.
-        unsafe {
-            let lo = read32(b, s, f, 0x10);
-            if lo & 1 != 0 {
-                return 0;
-            }
-            let wide = (lo >> 1) & 0x3 == 0x2;
-            let command = read32(b, s, f, 0x04);
-            write32(b, s, f, 0x04, command & !0b11);
-
-            write32(b, s, f, 0x10, u32::MAX);
-            let lo_mask = read32(b, s, f, 0x10) & 0xFFFF_FFF0;
-            write32(b, s, f, 0x10, lo);
-            let hi_mask = if wide {
-                let hi = read32(b, s, f, 0x14);
-                write32(b, s, f, 0x14, u32::MAX);
-                let mask = read32(b, s, f, 0x14);
-                write32(b, s, f, 0x14, hi);
-                mask
-            } else {
-                u32::MAX
-            };
-            write32(b, s, f, 0x04, command);
-
-            let mask = (hi_mask as u64) << 32 | lo_mask as u64;
-            if lo_mask == 0 {
-                return 0;
-            }
-            (!mask).wrapping_add(1)
+        // SAFETY: forwarded from this function's own contract.
+        match unsafe { self.bar(0) } {
+            Some(bar) if !bar.io => bar.size,
+            _ => 0,
         }
+    }
+
+    /// BAR `index`, sized by the standard handshake (see [`bar0_size`](Self::bar0_size)
+    /// for why the size matters, and why only for a device about to be
+    /// driven). `None` past the header's BARs (six for a device, two for a
+    /// bridge), for the upper half of a 64-bit BAR, and for one the device
+    /// does not implement.
+    ///
+    /// # Safety
+    /// As [`bar0_size`](Self::bar0_size).
+    pub unsafe fn bar(&self, index: u8) -> Option<Bar> {
+        let (b, s, f) = (self.bus, self.slot, self.function);
+        let count = match self.header_type {
+            0 => 6,
+            HEADER_TYPE_BRIDGE => 2,
+            _ => 0,
+        };
+        let mut i = 0u8;
+        while i < count {
+            let reg = 0x10 + 4 * i;
+            // SAFETY: forwarded from this function's own contract.
+            let lo = unsafe { read32(b, s, f, reg) };
+            let io = lo & 1 != 0;
+            let wide = !io && (lo >> 1) & 0x3 == 0x2;
+            if i != index {
+                i += if wide { 2 } else { 1 };
+                continue;
+            }
+            if wide && i + 1 >= count {
+                return None;
+            }
+            // SAFETY: as above. Every register written is restored before
+            // returning, and decoding is off while a probe value is in place.
+            unsafe {
+                let command = read32(b, s, f, 0x04);
+                write32(b, s, f, 0x04, command & !0b11);
+                write32(b, s, f, reg, u32::MAX);
+                let lo_mask = read32(b, s, f, reg);
+                write32(b, s, f, reg, lo);
+                let (hi, hi_mask) = if wide {
+                    let hi = read32(b, s, f, reg + 4);
+                    write32(b, s, f, reg + 4, u32::MAX);
+                    let mask = read32(b, s, f, reg + 4);
+                    write32(b, s, f, reg + 4, hi);
+                    (hi, mask)
+                } else {
+                    (0, u32::MAX)
+                };
+                write32(b, s, f, 0x04, command);
+                return if io {
+                    let mask = lo_mask & 0xFFFF_FFFC;
+                    let size = (!mask).wrapping_add(1) & 0xFFFF;
+                    (mask != 0 && size != 0).then_some(Bar {
+                        base: (lo & 0xFFFF_FFFC) as u64,
+                        size: size as u64,
+                        io: true,
+                        prefetchable: false,
+                    })
+                } else {
+                    let mask = (hi_mask as u64) << 32 | (lo_mask & 0xFFFF_FFF0) as u64;
+                    (lo_mask & 0xFFFF_FFF0 != 0).then_some(Bar {
+                        base: (hi as u64) << 32 | (lo & 0xFFFF_FFF0) as u64,
+                        size: (!mask).wrapping_add(1),
+                        io: false,
+                        prefetchable: lo & 0x8 != 0,
+                    })
+                };
+            }
+        }
+        None
+    }
+
+    /// Configuration register `offset` (below 256), `width` bytes wide (1, 2
+    /// or 4) and aligned to it. `None` for anything else.
+    ///
+    /// # Safety
+    /// Reads PCI configuration space; requires ring 0.
+    pub unsafe fn config_read(&self, offset: u16, width: u8) -> Option<u32> {
+        if !matches!(width, 1 | 2 | 4) || offset >= 256 || offset % width as u16 != 0 {
+            return None;
+        }
+        // SAFETY: forwarded from this function's own contract.
+        let word = unsafe { read32(self.bus, self.slot, self.function, (offset & !3) as u8) };
+        let shifted = word >> ((offset & 3) * 8);
+        Some(match width {
+            1 => shifted & 0xFF,
+            2 => shifted & 0xFFFF,
+            _ => shifted,
+        })
+    }
+
+    /// Writes configuration register `offset`, as [`config_read`](Self::config_read)
+    /// reads it: only the `width` bytes named change. `false` for a bad
+    /// offset or width.
+    ///
+    /// # Safety
+    /// Writes PCI configuration space; requires ring 0.
+    pub unsafe fn config_write(&self, offset: u16, width: u8, value: u32) -> bool {
+        if !matches!(width, 1 | 2 | 4) || offset >= 256 || offset % width as u16 != 0 {
+            return false;
+        }
+        // SAFETY: forwarded from this function's own contract. The data port
+        // at 0xCFC + (offset & 3) writes just those bytes of the dword the
+        // address port selected.
+        unsafe {
+            select(self.bus, self.slot, self.function, (offset & !3) as u8);
+            let port = CONFIG_DATA + (offset & 3);
+            match width {
+                1 => core::arch::asm!("out dx, al", in("dx") port, in("al") value as u8,
+                                      options(nomem, nostack, preserves_flags)),
+                2 => core::arch::asm!("out dx, ax", in("dx") port, in("ax") value as u16,
+                                      options(nomem, nostack, preserves_flags)),
+                _ => out32(CONFIG_DATA, value),
+            }
+        }
+        true
     }
 }
 

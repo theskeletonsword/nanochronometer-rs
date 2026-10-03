@@ -210,6 +210,174 @@ pub unsafe fn memory(info: u64) -> Memory {
     out
 }
 
+/// Calls `found(base, len)` for every range of usable RAM the loader
+/// reported: the multiboot2 memory map; on multiboot1, its map (flags bit 6)
+/// or, failing that, the coarse upper-memory figure counted from 1 MiB.
+///
+/// # Safety
+/// `info` must be the information pointer the loader passed with
+/// `multiboot2` saying which structure it is, or zero.
+pub unsafe fn usable_ram(info: u64, multiboot2: bool, mut found: impl FnMut(u64, u64)) {
+    if info == 0 {
+        return;
+    }
+    let base = info as usize;
+    if multiboot2 {
+        if info % 8 != 0 {
+            return;
+        }
+        // SAFETY: forwarded from this function's own contract.
+        let total = unsafe { core::ptr::read_volatile(base as *const u32) } as usize;
+        if !(16..0x10_0000).contains(&total) {
+            return;
+        }
+        let mut offset = 8;
+        while offset + 8 <= total {
+            // SAFETY: bounded by the size the header declares.
+            let (kind, size) = unsafe {
+                (
+                    core::ptr::read_volatile((base + offset) as *const u32),
+                    core::ptr::read_volatile((base + offset + 4) as *const u32) as usize,
+                )
+            };
+            if kind == TAG_END || size < 8 || offset + size > total {
+                return;
+            }
+            if kind == TAG_MEMORY_MAP && size >= 16 {
+                // SAFETY: the tag's declared size covers its header.
+                let entry_size = unsafe { core::ptr::read_unaligned((base + offset + 8) as *const u32) } as usize;
+                if entry_size >= 24 {
+                    let mut at = offset + 16;
+                    while at + entry_size <= offset + size {
+                        // SAFETY: bounded by the tag's own declared size.
+                        let (addr, length, region) = unsafe {
+                            (
+                                core::ptr::read_unaligned((base + at) as *const u64),
+                                core::ptr::read_unaligned((base + at + 8) as *const u64),
+                                core::ptr::read_unaligned((base + at + 16) as *const u32),
+                            )
+                        };
+                        if region == MEMORY_AVAILABLE && length > 0 {
+                            found(addr, length);
+                        }
+                        at += entry_size;
+                    }
+                }
+                return;
+            }
+            offset += size.div_ceil(8) * 8;
+        }
+        return;
+    }
+    if info % 4 != 0 {
+        return;
+    }
+    // SAFETY: the caller guarantees a multiboot1 structure.
+    let (flags, upper, map_len, map_addr) = unsafe {
+        (
+            core::ptr::read_volatile(base as *const u32),
+            core::ptr::read_volatile((base + 8) as *const u32) as u64,
+            core::ptr::read_volatile((base + 44) as *const u32) as usize,
+            core::ptr::read_volatile((base + 48) as *const u32) as usize,
+        )
+    };
+    if flags & (1 << 6) != 0 && map_addr != 0 && map_len < 0x10_0000 {
+        // Each entry: its own size (not counting this field), base, length,
+        // type. The size strides, as with the multiboot2 map.
+        let mut at = 0;
+        let mut any = false;
+        while at + 24 <= map_len {
+            let entry = map_addr + at;
+            // SAFETY: inside the map the loader described.
+            let (size, addr, length, region) = unsafe {
+                (
+                    core::ptr::read_unaligned(entry as *const u32) as usize,
+                    core::ptr::read_unaligned((entry + 4) as *const u64),
+                    core::ptr::read_unaligned((entry + 12) as *const u64),
+                    core::ptr::read_unaligned((entry + 20) as *const u32),
+                )
+            };
+            if size < 20 {
+                break;
+            }
+            if region == MEMORY_AVAILABLE && length > 0 {
+                found(addr, length);
+                any = true;
+            }
+            at += size + 4;
+        }
+        if any {
+            return;
+        }
+    }
+    if flags & 1 != 0 && upper > 0 {
+        found(0x10_0000, upper * 1024);
+    }
+}
+
+/// Calls `used(base, len)` for every range the loader's own structures
+/// occupy: the information structure, and on multiboot1 the tables and
+/// strings it points to. Nothing may reuse them — the command line and the
+/// module names are borrowed from there for the whole run. The modules'
+/// own bytes are [`modules`]'.
+///
+/// # Safety
+/// As [`usable_ram`].
+pub unsafe fn loader_ranges(info: u64, multiboot2: bool, mut used: impl FnMut(u64, u64)) {
+    if info == 0 {
+        return;
+    }
+    let base = info as usize;
+    if multiboot2 {
+        // SAFETY: forwarded from this function's own contract.
+        let total = unsafe { core::ptr::read_volatile(base as *const u32) } as u64;
+        used(info, total.clamp(8, 0x10_0000));
+        return;
+    }
+    // The multiboot1 structure is 116 bytes in its last revision; its
+    // pointers go wherever the loader put things.
+    used(info, 116);
+    // SAFETY: the caller guarantees a multiboot1 structure.
+    let read = |off: usize| unsafe { core::ptr::read_volatile((base + off) as *const u32) } as u64;
+    let flags = read(0);
+    // A string: its bytes and the NUL, bounded.
+    let mut string = |addr: u64| {
+        if addr != 0 {
+            // SAFETY: the loader's string, below 4 GiB.
+            let len = unsafe { c_str(addr as usize, COMMAND_LINE_MAX) }.map_or(COMMAND_LINE_MAX, str::len);
+            used(addr, len as u64 + 1);
+        }
+    };
+    if flags & (1 << 2) != 0 {
+        string(read(16));
+    }
+    if flags & (1 << 9) != 0 {
+        string(read(64));
+    }
+    if flags & (1 << 3) != 0 && read(24) != 0 {
+        let (count, table) = (read(20).min(256), read(24));
+        for i in 0..count {
+            // SAFETY: the loader's module table, `count` entries long.
+            let name = unsafe { core::ptr::read_volatile((table + i * 16 + 8) as usize as *const u32) } as u64;
+            string(name);
+        }
+        used(table, count * 16);
+    }
+    if flags & (1 << 6) != 0 {
+        used(read(48), read(44));
+    }
+    if flags & (1 << 7) != 0 {
+        used(read(56), read(52));
+    }
+    if flags & (1 << 10) != 0 {
+        used(read(68), 20);
+    }
+    if flags & (1 << 11) != 0 {
+        used(read(72), 512);
+        used(read(76), 256);
+    }
+}
+
 /// Memory size from a *multiboot1* information structure (QEMU's `-kernel`
 /// loader): `mem_lower`/`mem_upper` in KiB, valid when `flags` bit 0 is set.
 ///

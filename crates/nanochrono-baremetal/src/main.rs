@@ -125,6 +125,23 @@ pub unsafe extern "C" fn kmain(magic: usize, multiboot_info: usize) -> ! {
         _ => multiboot::Memory::default(),
     };
 
+    // Physical pages, from the loader's memory map: for what the image cannot
+    // size in advance — a back buffer larger than the static one (a 4K
+    // screen), a driver module's memory (palloc).
+    if magic == MULTIBOOT2_BOOTLOADER_MAGIC || magic == MULTIBOOT1_BOOTLOADER_MAGIC {
+        // SAFETY: once, before anything is allocated; the magic says which
+        // structure `multiboot_info` is.
+        let pages = unsafe {
+            nanochrono_baremetal::palloc::init_multiboot(multiboot_info, magic == MULTIBOOT2_BOOTLOADER_MAGIC)
+        };
+        println!(
+            "memory: {} MiB in {} runs free for pages, below {} MiB",
+            pages.free >> 20,
+            pages.runs,
+            nanochrono_baremetal::palloc::CEILING >> 20
+        );
+    }
+
     // The back buffer, before anything is drawn. Everything after this point
     // draws into RAM and copies out only what changed — see
     // `framebuffer` for why an uncached firmware framebuffer cannot be
@@ -195,6 +212,47 @@ pub unsafe extern "C" fn kmain(magic: usize, multiboot_info: usize) -> ! {
     };
     for m in nanochrono_baremetal::boot::modules() {
         println!("module: {} ({} bytes at {:#x})", m.name, m.end - m.start, m.start);
+    }
+
+    // Driver modules (`/boot/drivers/*.ncdri`): what the kernel does not
+    // build in. A display driver that sets the monitor's native mode hands
+    // its screen over here, and the session draws there instead of on the
+    // firmware's framebuffer (docs/NCDRI.md).
+    #[cfg(target_arch = "x86_64")]
+    {
+        // SAFETY: once, at CPL 0, after the modules are recorded and the page
+        // allocator is up, before anything draws the session.
+        let drivers = unsafe { nanochrono_baremetal::ncdri::load_boot_drivers() };
+        if drivers.found > 0 {
+            println!(
+                "ncdri: {} module(s): {} loaded, {} refused; {} device(s) attached",
+                drivers.found, drivers.loaded, drivers.refused, drivers.attached
+            );
+        }
+        if let Some(mut screen) = drivers.screen {
+            if let Some(m) = drivers.monitor {
+                match m.native {
+                    Some((w, h, mhz)) => println!(
+                        "display: monitor {} ({}), native {w}x{h} at {}.{:03} Hz",
+                        m.name(), m.maker(), mhz / 1000, mhz % 1000
+                    ),
+                    None => println!("display: monitor {} ({}), no native mode stated", m.name(), m.maker()),
+                }
+            }
+            // SAFETY: the old screen is never drawn on again: the panic
+            // handler and the progress marker are handed the new one below.
+            let composited = unsafe { screen.attach_back_buffer() };
+            println!(
+                "display: {}x{} from {}, {}",
+                screen.width,
+                screen.height,
+                drivers.screen_device(),
+                if composited { "composited" } else { "drawn directly (no memory for a back buffer)" }
+            );
+            fb = Some(screen);
+            panic::set_framebuffer(fb);
+            progress::attach(fb);
+        }
     }
 
     match fb {

@@ -39,6 +39,11 @@
 #
 # NCAPP_EXTRA="a.NCAPP b.NCAPP" (NCPLU_EXTRA, its old name, too) adds apps
 # built elsewhere (the C SDK's, in sdk/) to the ISO beside the in-tree ones.
+# NCDRI_EXTRA="sdk/build/release/drivers/QEMU_STDVGA.NCDRI" adds driver
+# modules (`make -C sdk drivers`): they land in /boot/drivers/ and the
+# kernel loads them at boot (src/ncdri.rs) — signed for ring 0, or unsigned
+# with `ncdri.community=on` on the command line (`build.sh boot x86_64
+# ncdri.community=on` passes it), the owner's switch, off by default.
 #
 # Every in-tree app is packed as <NAME>.NCAPP (tools/ncplu.py, with the
 # capabilities its ncpkg.toml declares) and, when it has an ncpkg.toml,
@@ -775,6 +780,16 @@ print(",".join(caps) or "none")' "${crate}ncpkg.toml")"
             echo "note: NCAPP_EXTRA: ${extra} not found; skipping"
         fi
     done
+    # Drivers built elsewhere (the C SDK's): copied beside the apps, they
+    # go to /boot/drivers/ on the ISO by their extension.
+    for extra in ${NCDRI_EXTRA:-}; do
+        if [[ -f "${extra}" ]]; then
+            command cp -f "${extra}" "${out_dir}/plugins/"
+            echo "=== driver ${extra##*/} (NCDRI_EXTRA)"
+        else
+            echo "note: NCDRI_EXTRA: ${extra} not found; skipping"
+        fi
+    done
     # Modules are signed before they are packaged: the package's manifest
     # lists each module's SHA-512, signature block included.
     sign_plugins
@@ -826,10 +841,13 @@ package_plugins() {
 }
 
 # With NCPLU_SIGN_KEYS pointing at a key directory from `ncplu-sign keygen`
-# (outside the repository), every plugin on the ISO is signed with ML-DSA-87
-# and P-521. A kernel built with the matching NCPLU_ROOT_PUBKEYS then loads
-# them as Official. Without it the plugins keep an empty signature block and
-# load as Community. The private keys are only ever read by the host tool.
+# (outside the repository), every module on the ISO — apps, plugins and
+# drivers — is signed with ML-DSA-87 and P-521. A kernel built with the
+# matching NCPLU_ROOT_PUBKEYS then loads them as Official; a signed driver
+# loads into ring 0 without the owner's community switch (src/ncdri.rs).
+# Without it the modules keep an empty signature block: apps load as
+# Community, drivers are refused unless ncdri.community=on. The private keys
+# are only ever read by the host tool.
 sign_plugins() {
     [[ -n "${NCPLU_SIGN_KEYS:-}" ]] || return 0
     if [[ ! -f "${NCPLU_SIGN_KEYS}/mldsa.seed" || ! -f "${NCPLU_SIGN_KEYS}/p521.scalar" ]]; then
@@ -840,7 +858,7 @@ sign_plugins() {
     (cd "${repo_root}/tools/ncplu-sign" && CARGO_INCREMENTAL=0 CARGO_TARGET_DIR="${tool_dir}" \
         cargo build --quiet) || return 1
     local plug
-    for plug in "${out_dir}/plugins/"*.NCAPP "${out_dir}/plugins/"*.NCPLU; do
+    for plug in "${out_dir}/plugins/"*.NCAPP "${out_dir}/plugins/"*.NCPLU "${out_dir}/plugins/"*.NCDRI; do
         [[ -f "${plug}" ]] || continue
         "${tool_dir}/debug/ncplu-sign" sign "${plug}" --keys "${NCPLU_SIGN_KEYS}" >/dev/null || return 1
         echo "    signed ${plug##*/} (ML-DSA-87 + P-521)"
