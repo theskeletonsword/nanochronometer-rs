@@ -61,8 +61,10 @@ or through GitHub.
 
 **If you keep talking about a vulnerability on one of those apps, I will
 block you there until the patch is released.** I don't like blocking
-people, and this is not about personal boundaries. It is about where the
-vulnerability ends up: a message that is not end-to-end encrypted is stored
+people. It is partly about personal boundaries — those apps are where I
+talk with close friends, classmates and the people around me, and that is
+not the place for vulnerability reports — but not only that. It is also
+about where the vulnerability ends up: a message that is not end-to-end encrypted is stored
 on the servers of whoever runs the app — Meta, Snap, Google, ByteDance,
 Telegram — where their staff, a breach of their systems or a legal request
 can reach it. An unpatched vulnerability in their backend is exactly what
