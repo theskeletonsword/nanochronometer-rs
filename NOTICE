@@ -127,6 +127,117 @@ those, and they are not consulted on the same terms.
                          covered in its own section above.
 
 --------------------------------------------------------------------------
+Reference sources for the system-call boundary and the driver ABI
+--------------------------------------------------------------------------
+
+The ring 3 <-> ring 0 boundary (docs/NCCALL.md) and the .ncdri driver
+interface (docs/NCDRI.md) take the BSDs' solutions instead of inventing
+new ones. Register assignments, call numbers, errno values and flag
+constants are reproduced; the code that uses them is written here.
+
+  FreeBSD                BSD-2-Clause and BSD-3-Clause
+                           lib/libsys/amd64/SYS.h, i386/SYS.h, arm/SYS.h
+                                                           BSD-3-Clause
+                             The Regents of the University of California.
+                           lib/libsys/powerpc/SYS.h, powerpc64/SYS.h
+                                                           BSD-3-Clause
+                             Benno Rice.
+                           lib/libsys/aarch64/SYS.h, riscv/SYS.h
+                                                           BSD-2-Clause
+                             Andrew Turner.
+                             The system-call register convention of each
+                             ISA — the number register, the argument
+                             registers, the carry / CR0[SO] / t0 error flag:
+                             crates/nanochrono-sys/src/abi.rs and raw.rs,
+                             sdk/include/nccall.h
+                           sys/amd64/amd64/exception.S     BSD-3-Clause
+                             William F. Jolitz; The Regents of the
+                             University of California; The FreeBSD
+                             Foundation. The shape of the SYSCALL entry and
+                             exit (fast_syscall): the user stack pointer set
+                             aside before anything is pushed, the frame of
+                             argument registers, the caller-saved registers
+                             cleared before SYSRET:
+                             crates/nanochrono-baremetal/src/ring3.rs
+                           sys/arm64/arm64/exception.S     BSD-2-Clause
+                             Andrew Turner.
+                           sys/riscv/riscv/exception.S     BSD-2-Clause
+                             Ruslan Bukin.
+                             The entry sequences of docs/NCCALL.md §11.2 and
+                             §11.4 (documentation; no code yet).
+                           sys/kern/syscalls.master
+                             The POSIX-class call numbers:
+                             crates/nanochrono-sys/src/nr.rs, nccall.h
+                           sys/sys/errno.h, sys/sys/mman.h BSD-3-Clause
+                             The Regents of the University of California.
+                           sys/sys/_clock_id.h             BSD-2-Clause
+                             Netflix, Inc.
+                           sys/sys/random.h                BSD-2-Clause
+                             Mark R. V. Murray.
+                             errno values and the mmap, clock and getrandom
+                             constants: crates/nanochrono-sys/src/errno.rs
+                             and nr.rs, sdk/include/nccall.h
+                           sys/sys/bus.h, sys/kern/device_if.m
+                                                           BSD-2-Clause
+                             Doug Rabson. The device methods of
+                             ncdri_driver_t and the probe priorities
+                             (NCDRI_PROBE_* are BUS_PROBE_*'s values):
+                             sdk/include/ncdri_api.h
+                           sys/amd64/include/fpu.h         BSD-3-Clause
+                             The Regents of the University of California.
+                           sys/crypto/openssl/ossl.c       BSD-2-Clause
+                             Netflix, Inc.
+                             The kernel FPU bracket, fpu_kern_enter /
+                             fpu_kern_leave and its NOCTX flag, behind
+                             fpu_begin / fpu_end: sdk/include/ncdri_api.h
+
+                         Consulted, not reproduced: the files below carry
+                         the BSD-4-Clause advertising clause, so facts and
+                         design were taken from them and no code,
+                         expression or comment — sys/amd64/amd64/machdep.c,
+                         trap.c, vm_machdep.c, exec_machdep.c (the IST
+                         assignment, SFMASK, the non-canonical SYSRET guard,
+                         the carry-flag error convention, the red-zone skip
+                         of sendsig); sys/amd64/include/param.h;
+                         sys/powerpc/aim/trap_subr64.S,
+                         sys/powerpc/powerpc/trap.c and exec_machdep.c (the
+                         288-byte skip, the 512-byte signal-frame gap);
+                         sys/arm/arm/exception.S, syscall.c, vm_machdep.c.
+
+  OpenBSD                ISC and BSD-3-Clause
+                           lib/libc/arch/DEFS.h            ISC
+                             Philip Guenther. PINSYSCALL, the model of the
+                             call-site records (the nccall_pins section) in
+                             crates/nanochrono-sys/src/raw.rs and nccall.h
+                           sys/sys/syscall_mi.h            BSD-3-Clause
+                             The Regents of the University of California.
+                             pin_check and the stack-pointer check at entry:
+                             crates/nanochrono-baremetal/src/ring3.rs
+                           lib/libc/arch/arm/SYS.h         BSD-3-Clause
+                             The Regents of the University of California.
+                             ARM32's call number in r12.
+
+  NetBSD                 BSD-2-Clause
+                           sys/rump/include/rump/rumpuser.h  BSD-2-Clause
+                             Antti Kantee. The version handshake, the table
+                             of services with reserved slots, opaque locks,
+                             sizes passed on free: nckernel_api_t in
+                             sdk/include/ncdri_api.h
+
+                         Consulted, not reproduced: sys/kern/kern_exec.c,
+                         for posix_spawn, the model nccall's SPAWN number
+                         is reserved for.
+
+  The processor-specific ABIs (System V x86-64 and i386, AAPCS64 and
+  AAPCS32, ELFv2, the RISC-V psABI) are the authority behind every red-zone
+  size; they were read, and none of their text is reproduced.
+
+  Attribution is the condition these licenses attach, and this section is
+  it. The BSD-3-Clause files add a no-endorsement clause: neither the
+  FreeBSD Project, OpenBSD, NetBSD, the University of California, nor any
+  of the authors above endorse this software.
+
+--------------------------------------------------------------------------
 Third-party components
 --------------------------------------------------------------------------
 

@@ -92,6 +92,36 @@ fault. `build.sh debug` builds `-O0 -g` with frame pointers into
 kernel, which GDB then loads via `NC_GDB_ELF`, as the script prints). `tools/nanodump.py` reads the
 dumps. See `docs/CRASH_DUMPS.md`. A PC with no 8042 is `-machine q35,i8042=off`.
 
+## Ring 3, ring 0 and the red zone
+
+`docs/NCCALL.md` (the system-call boundary), `docs/NCDRI.md` (the driver
+ABI), `docs/NCTOOLCHAIN.md` (toolchain, C library, OpenSSL/AWS-LC). The
+rules the code relies on:
+
+- The red zone is allowed in ring-3 artifacts (`.ncapp`, `.ncplu`, `.ncdyn`,
+  `.ncar`; Rust targets in `sdk/targets/`, `disable-redzone: false`) and
+  forbidden in `.ncdri` and the kernel. The x86-64 `SYSCALL` entry
+  (`ring3.rs`) must not push before it has left the user stack; the selftest
+  proves it (`red zone: ok`). `kstack.rs` puts #DF, #PF, NMI, #MC and #DB on
+  IST stacks and checks the plan at boot.
+- On PowerPC clang ignores `-mno-red-zone` (argument unused): use
+  `-Xclang -disable-red-zone`. Even then LLVM saves callee-saved registers
+  below r1 within ELFv2's 288 bytes, so a PPC64 kernel entry skips 512 bytes.
+- `tools/check-redzone.py FILE…` reads the machine code (via
+  `llvm-objdump`; `LLVM_OBJDUMP` overrides) and fails on any access below
+  the stack pointer; `make -C sdk drivers` runs it on every `.ncdri` object
+  for all nine ISAs, at the `MODE`'s level.
+- `crates/nanochrono-sys` (workspace member, `no_std`) is the ring-3 side:
+  `nccall!`, the POSIX-class calls with FreeBSD's numbers and errno,
+  `NcAlloc`; `cargo test -p nanochrono-sys --all-features`. A ring-3 Rust
+  module builds for `sdk/targets/<arch>-unknown-nanochronometer.json` with
+  `-Z build-std` and `RUSTFLAGS=-Zunstable-options` (see
+  `crates/nanochrono-plugins/ncsys-demo/.cargo/config.toml`);
+  `build.sh boot x86_64 plugin=ncsys-demo` runs its checks at boot.
+- Every inline `nccall` asm block is `options(nostack)`, so the compiler
+  keeps using the red zone around it, except i386's, which pushes its
+  arguments onto the stack.
+
 ## Logo and icons
 
 `tools/gen-icons.py` (fontTools, cairosvg, Pillow) regenerates every logo and

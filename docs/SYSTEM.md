@@ -8,7 +8,10 @@ the code grows into; each section says what is **done** (built and booted
 under QEMU), **partial**, or **planned**, and the companion documents go
 deeper: the filesystem is [NCFS.md](NCFS.md), the packages
 [NCPKG.md](NCPKG.md), the broader ecosystem [ECOSYSTEM.md](ECOSYSTEM.md),
-the drivers that exist today [BAREMETAL_DRIVERS.md](BAREMETAL_DRIVERS.md).
+the drivers that exist today [BAREMETAL_DRIVERS.md](BAREMETAL_DRIVERS.md),
+the ring 3 ↔ ring 0 boundary [NCCALL.md](NCCALL.md), the driver ABI
+[NCDRI.md](NCDRI.md), and the toolchain, C library and crypto stack
+[NCTOOLCHAIN.md](NCTOOLCHAIN.md).
 
 ## 1. Not reinventing the wheel
 
@@ -54,6 +57,9 @@ Why those two, and how adaptation stays honest:
 | Driver model | FreeBSD newbus (`subr_bus.c`, `*_if.m`) | BSD-2-Clause | `device_if.m`, `bus_if.m` |
 | Hypervisor | FreeBSD bhyve `sys/amd64/vmm`, `sys/dev/vmm` | BSD-2-Clause | `vmx.c`, `vmcs.c`, `ept.c` |
 | Sandboxing | OpenBSD `pledge`/`unveil` (as a model) | ISC | `kern_pledge.c`, `kern_unveil.c` |
+| System-call convention, entry and exit | FreeBSD `lib/libsys/<arch>/SYS.h`, `sys/amd64/amd64/exception.S`; OpenBSD `PINSYSCALL`, `pin_check` | BSD-3-Clause, BSD-2-Clause, ISC | NCCALL.md §1 |
+| Driver ABI | NetBSD `rumpuser.h`; FreeBSD newbus, `bus_space`/`bus_dma`, `fpu_kern_enter` | BSD-2-Clause | NCDRI.md §2 |
+| C library (planned) | FreeBSD `lib/libc`, `lib/libsys`, `lib/csu`, `lib/msun`; jemalloc | BSD-2/3-Clause | NCTOOLCHAIN.md §3 |
 
 ## 2. The kernel and the boot sequence — partial
 
@@ -128,9 +134,12 @@ particular machine may want but need not boot with: Intel ME/HECI, Android
 MTP, Wiimotes, Blu-ray, and read/write drivers for foreign filesystems
 (ext4, btrfs, NTFS). An `.ncdri` is the flat module format (NCPKG.md §1):
 no `MODULE_LICENSE` header is required, and a module without one is
-proprietary, never "tainted". Loading an `.ncdri` at boot is signed, ring-0
-work (trust, below); it is **planned**, waiting on the physical page
-allocator the hypervisor also needs.
+proprietary, never "tainted". Its binary interface is **done**:
+[`sdk/include/ncdri_api.h`](../sdk/include/ncdri_api.h) — one versioned
+table of kernel services and opaque handles, no kernel header and no kernel
+symbol, built for all nine ISAs without a red zone (NCDRI.md). Loading an
+`.ncdri` at boot is signed, ring-0 work (trust, below); it is **planned**,
+waiting on the physical page allocator the hypervisor also needs.
 
 ### The driver model — planned, after FreeBSD newbus
 
@@ -140,12 +149,14 @@ Rather than invent a device framework, NanoChronometer adapts FreeBSD's
 `detach`, `suspend`, `resume`; buses that enumerate children and hand out
 resources (memory, I/O, interrupts, DMA tags). The `.ncdri` loader is the
 Rust counterpart of `kern_linker.c`/`link_elf_obj.c` — it relocates a
-module and resolves its imports against the kernel's export table
-(`ncplu.rs` already does exactly this for Ring 3 plugins; a ring-0 driver
-is the same loader with the kernel-tier symbols resolved). A driver written
-for NanoChronometer implements the newbus methods in Rust; a driver adapted
-from BSD keeps its C and is driven through a shim that presents `device_t`
-and `bus_space`.
+module (`ncplu.rs` already does this for Ring 3 plugins), resolves nothing
+but the two stack-canary symbols, and calls `ncdri_main` with the kernel's
+`nckernel_api_t`: newbus's methods, `bus_space` and `bus_dma` are reached
+through that table, never by symbol, so a driver built today loads on every
+kernel of the same major version (NCDRI.md §3). A driver written for
+NanoChronometer implements the methods of `ncdri_driver_t`; a driver adapted
+from BSD keeps its C and links a shim that presents `device_t` and
+`bus_space` on top of the table.
 
 ## 5. The network stack — planned (adapted)
 
@@ -188,14 +199,23 @@ defences, at the boundaries BSD already draws them:
   enforces it — the capability set a package already declares (NCPKG.md §3)
   is the same idea, extended to syscalls.
 
-### System calls — planned (adapted surface)
+### System calls — partial (adapted surface)
 
-The Ring 3 ABI is `nccall` (`ring3.rs`, SYSCALL/SYSRET on x86-64), today a
-handful of calls for the plugin API. The full surface is modelled on the
-POSIX subset FreeBSD (569 calls) and OpenBSD (349) expose — `open`, `read`,
+The Ring 3 ABI is `nccall`, specified in [NCCALL.md](NCCALL.md): one
+register convention per ISA, fixed for all nine and taken from FreeBSD's
+libsys (OpenBSD's for ARM32's number register), with FreeBSD's call numbers
+and errno values. **Done** on x86-64 (`ring3.rs`, `kstack.rs`): the
+`SYSCALL` entry leaves the user stack before it pushes anything, so a
+program's red zone survives every call — proven at boot, in the selftest —
+the exceptions run on their own IST stacks, and the POSIX-class subset
+(`write`, `mmap`, `munmap`, `clock_gettime`, `getrandom`, …) is served
+beside the plugin API's calls. Rust reaches it through `nanochrono-sys`, C
+through `sdk/include/nccall.h`. The full surface is modelled on the POSIX
+subset FreeBSD (569 calls) and OpenBSD (349) expose — `open`, `read`,
 `write`, `mmap`, `socket`, … — so adapted BSD code and ported Unix programs
 find what they expect, with `pledge`-style restriction over the top. The
-VFS behind the file calls is §8.
+VFS behind the file calls is §8; the C library above the calls is
+NCTOOLCHAIN.md §3.
 
 ## 6. Processor control — done
 
@@ -302,6 +322,11 @@ stays small.
 | Packages: `.ncpkg`, `ncpkg`, trust, install into NCFS | done |
 | `ncinitramdisk`: sealed image, kernel mount, verify | done |
 | Ring 3 for community plugins (x86-64) | done |
+| `nccall` convention (nine ISAs), `nanochrono-sys`, `nccall.h` | done |
+| x86-64 entry: IST plan, red zone proven at boot, POSIX-class subset | done |
+| Ring 3 on the other ISAs (sequences in NCCALL.md §11) | planned |
+| `.ncdri` binary interface (`ncdri_api.h`), red-zone checker | done |
+| `nclibc`, `std` port, `nctoolchain.ncpkg`, OpenSSL/AWS-LC crypto plugins | planned (NCTOOLCHAIN.md) |
 | Codecs: BLAKE3, LZ4, ZSTD, QOI, PNG, DEFLATE | done |
 | Driver loading (`.ncdri` at boot), newbus model | planned |
 | Network (TCP/IP, 802.11, pf), zero-click hardening | planned |

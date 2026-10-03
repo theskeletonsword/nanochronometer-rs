@@ -40,7 +40,7 @@ clock reads `hh:mm:ss:mmm:uuu:nnn` — a NanoChronometer, not a phone clock.
 | `.ncdyn` | A shared library loaded at run time: in `/usr/lib`, counted by `ncpkg` (`ref_count`, `required_by` in `/var/lib/ncpkg/db.json`) and deleted only at zero; a package that needs a version the global copy is not keeps its own, private. Forks of BoringSSL, FFmpeg, libvirt, liboqs or wolfSSL are the intended kind. |
 | `.ncplu` | A **plugin of one app**: a codec pack for the players ("FFmpeg for NanoChronometer players", vgmstream for console formats), registered with its host app by `ncpkg`, loaded by the app, never run alone. |
 | `.ncar` | A static library archive (LLVM `llvm-ar`), linked into an `.ncapp` by the SDK. |
-| `.ncdri` | A driver module for hardware the kernel does not build in (Intel ME/HECI, Android MTP, NCHV, …). Essential drivers stay in the kernel. No licence header is required (no `MODULE_LICENSE`): none means proprietary, and nothing is ever marked "tainted". (Loading at boot: planned.) |
+| `.ncdri` | A driver module for hardware the kernel does not build in (Intel ME/HECI, Android MTP, NCHV, …). Essential drivers stay in the kernel. No licence header is required (no `MODULE_LICENSE`): none means proprietary, and nothing is ever marked "tainted". It includes no kernel header and links no kernel symbol: everything goes through the versioned table of `sdk/include/ncdri_api.h` (docs/NCDRI.md), built without a red zone. (Loading at boot: planned.) |
 
 ### Package metadata
 
@@ -61,10 +61,16 @@ clock reads `hh:mm:ss:mmm:uuu:nnn` — a NanoChronometer, not a phone clock.
 
 LLVM throughout: clang, ld.lld, llvm-ar, llvm-objcopy, for every
 architecture from one toolchain (`sdk/`). C apps build today
-(`sdk/Makefile`, as `.ncapp`), any module kind packs with `tools/ncplu.py
+(`sdk/Makefile`, as `.ncapp`), and so do `.ncdri` drivers for all nine
+architectures (`make -C sdk drivers`, each object checked for red-zone use
+by `tools/check-redzone.py`); any module kind packs with `tools/ncplu.py
 pack --kind app|driver|library|plugin`, and packages build from a directory
-with `ncpkg build` (an `ncpkg.toml` and the tree). Static archives and
-driver loading are next.
+with `ncpkg build` (an `ncpkg.toml` and the tree). Ring-3 code reaches the
+kernel through `nccall` — `sdk/include/nccall.h` for C, the
+`nanochrono-sys` crate and the ring-3 target specs in `sdk/targets/` for
+Rust (docs/NCCALL.md). Static archives and driver loading are next; the
+native toolchain (`nctoolchain.ncpkg`), the C library and the
+OpenSSL/AWS-LC benchmark plugins are specified in docs/NCTOOLCHAIN.md.
 
 ## 3. Trust — partial (packages: the four roots, checked by `ncpkg` at install; the module loader: two roots, creator ✅ and tree 🌳)
 
