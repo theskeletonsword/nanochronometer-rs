@@ -57,7 +57,23 @@ encrypted, but I do not trust it with this either. A vulnerability sent
 through any channel other than the two above **will not be handled** and
 does not count as reported — not for the disclosure clock, not for credit,
 not for the safe harbor. You will at most be asked to send it again on Signal
-or through GitHub. Memes are still welcome on the others.
+or through GitHub.
+
+**If you keep talking about a vulnerability on one of those apps, I will
+block you there until the patch is released.** I don't like blocking
+people, and this is not about personal boundaries. It is about where the
+vulnerability ends up: a message that is not end-to-end encrypted is stored
+on the servers of whoever runs the app — Meta, Snap, Google, ByteDance,
+Telegram — where their staff, a breach of their systems or a legal request
+can reach it. An unpatched vulnerability in their backend is exactly what
+attackers look for, and it would put everyone who uses NanoChronometer at
+risk. Once the patch is out you are unblocked, and memes are welcome again.
+
+**On Signal and GitHub, on the other hand, insist.** If I have not answered,
+follow up, and keep following up until it is fixed: that is expected and
+welcome, never a nuisance. Leaving a reported vulnerability unanswered
+would fail the people who use this project; your persistence there helps
+protect them from attackers.
 
 Do not put vulnerability details in a public issue, pull request or
 discussion either. If you can use neither channel, open an issue that says only
