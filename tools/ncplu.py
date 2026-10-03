@@ -299,11 +299,12 @@ def pack(elf: Elf, entry: str, caps: int = CAP_ALL, arch: str = "x86_64", kind: 
         else:
             raise ValueError(f"unhandled relocation type {r_type} at {r_offset:#x}")
 
-    # The entry export, plus any other ncplu_* globals, as (name, mem_off).
+    # The entry export, plus any other ncplu_* (or, for a driver, ncdri_*:
+    # ncdri_main, ncdri_fini) globals, as (name, mem_off).
     exports = []
     entry_index = None
     for sym in syms:
-        if sym.shndx != 0 and sym.name.startswith("ncplu_"):
+        if sym.shndx != 0 and sym.name.startswith(("ncplu_", "ncdri_")):
             if sym.name == entry:
                 entry_index = len(exports)
             exports.append((sym.name, sym.value))

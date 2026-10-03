@@ -13,6 +13,9 @@
 #   make iso                       kernel + hybrid ISO; the C plugins go on its FAT partition
 #   make run [PLUGIN=rng_demo]     boot the ISO as a USB stick (KVM on an x86-64 host, else TCG)
 #   make gdb [PLUGIN=rng_demo]     the same, stopped for: gdb -x packaging/baremetal/gdb/x86_64.gdb
+#   make drivers                   .ncdri drivers in drivers/ (ncdri_api.h) for all nine
+#                                  architectures, each object checked for red-zone use;
+#                                  x86-64 also packed: build/<MODE>/drivers/<NAME>.NCDRI
 #   make clean
 #
 # Plugins: MODE=debug is -O0 -g3 (step through under GDB), MODE=debug-og is
@@ -106,7 +109,7 @@ EXAMPLES := $(basename $(notdir $(wildcard $(SDK)/examples/*.c)))
 upper     = $(shell echo '$(1)' | tr a-z A-Z)
 PLUGINS  := $(foreach e,$(EXAMPLES),$(BUILD)/$(call upper,$(e)).NCAPP)
 
-.PHONY: all sign kernel iso run gdb clean
+.PHONY: all sign kernel iso run gdb drivers clean
 all: $(PLUGINS)
 
 $(BUILD):
@@ -160,6 +163,55 @@ run: $(PLUGINS)
 
 gdb: $(PLUGINS)
 	$(BUILD_ENV) $(REPO)/packaging/baremetal/build.sh gdb x86_64 $(if $(PLUGIN),plugin=$(PLUGIN))
+
+# ---------------------------------------------------------------------------
+# Drivers (.ncdri, docs/NCDRI.md): ring 0, reaching the kernel only through
+# the nckernel_api_t table of include/ncdri_api.h. So: no red zone, no
+# floating point or SIMD outside ncdri_fpu_begin/end, no C library. Built
+# for all nine architectures; every object goes through
+# tools/check-redzone.py, which reads the machine code rather than trusting
+# the flags (clang drops -mno-red-zone on PowerPC: -Xclang -disable-red-zone
+# is what reaches the code generator there). x86-64 is also linked and
+# packed into the module format (the packer's relocations are x86-64's).
+# ---------------------------------------------------------------------------
+DRIVER_SRCS := $(wildcard $(SDK)/drivers/*.c)
+DRIVERS     := $(basename $(notdir $(DRIVER_SRCS)))
+DRV_ARCHS   := x86_64 i386 aarch64 arm32 ppc ppc64 ppc64le riscv32 riscv64
+DRV_x86_64  := --target=x86_64-unknown-none-elf -mno-red-zone -mgeneral-regs-only -mstack-protector-guard=global
+DRV_i386    := --target=i386-unknown-none-elf -mgeneral-regs-only -mstack-protector-guard=global
+DRV_aarch64 := --target=aarch64-unknown-none-elf -mgeneral-regs-only -mstack-protector-guard=global
+DRV_arm32   := --target=armv7a-unknown-none-eabi -mfloat-abi=soft -mstack-protector-guard=global
+DRV_ppc     := --target=powerpc-unknown-none-elf -msoft-float -mno-altivec
+DRV_ppc64   := --target=powerpc64-unknown-none-elf -mabi=elfv2 -msoft-float -mno-altivec -mno-vsx -Xclang -disable-red-zone
+DRV_ppc64le := --target=powerpc64le-unknown-none-elf -mabi=elfv2 -msoft-float -mno-altivec -mno-vsx -Xclang -disable-red-zone
+DRV_riscv32 := --target=riscv32-unknown-none-elf -march=rv32imac -mabi=ilp32
+DRV_riscv64 := --target=riscv64-unknown-none-elf -march=rv64imac -mabi=lp64 -mcmodel=medany
+DRVFLAGS    := -std=c11 -ffreestanding -fno-builtin -nostdinc -isystem $(shell $(CC) -print-resource-dir)/include
+DRVFLAGS    += -fPIC -fvisibility=hidden -fstack-protector-strong -fno-stack-check
+DRVFLAGS    += -fno-exceptions -fno-unwind-tables -fno-asynchronous-unwind-tables
+DRVFLAGS    += -ffunction-sections -fdata-sections $(OPTFLAGS)
+DRVFLAGS    += -Wall -Wextra -Werror -I $(SDK)/include
+DRV_OBJS    := $(foreach a,$(DRV_ARCHS),$(foreach d,$(DRIVERS),$(BUILD)/drivers/$(a)/$(d).o))
+DRV_PACKED  := $(foreach d,$(DRIVERS),$(BUILD)/drivers/$(call upper,$(d)).NCDRI)
+
+define drv_rule
+$(BUILD)/drivers/$(1)/%.o: $(SDK)/drivers/%.c $(SDK)/include/ncdri_api.h
+	@mkdir -p $$(dir $$@)
+	$(CC) $(DRV_$(1)) $(strip $(DRVFLAGS)) -c $$< -o $$@
+	$(PYTHON) $(REPO)/tools/check-redzone.py $$@
+endef
+$(foreach a,$(DRV_ARCHS),$(eval $(call drv_rule,$(a))))
+
+$(BUILD)/drivers/%.so: $(BUILD)/drivers/x86_64/%.o
+	$(LD) -shared -Bsymbolic --gc-sections -z max-page-size=4096 --build-id=none -e ncdri_main $< -o $@
+
+define drv_pack_rule
+$(BUILD)/drivers/$(call upper,$(1)).NCDRI: $(BUILD)/drivers/$(1).so
+	$(PYTHON) $(REPO)/tools/ncplu.py pack $$< -o $$@ --kind driver --entry ncdri_main --caps none
+endef
+$(foreach d,$(DRIVERS),$(eval $(call drv_pack_rule,$(d))))
+
+drivers: $(DRV_OBJS) $(DRV_PACKED)
 
 clean:
 	rm -rf $(SDK)/build
