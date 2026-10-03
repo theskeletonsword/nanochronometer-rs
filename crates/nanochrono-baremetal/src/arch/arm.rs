@@ -61,8 +61,10 @@ pub fn vector_lengths() -> (Option<u64>, Option<u64>) {
 // aligned with sixteen 128-byte slots, as the architecture lays them out.
 // Every slot but one is fatal: it reports the syndrome over the UART and
 // stops. The exception is the synchronous slot for "current EL, SPx", which
-// first checks for the one fault this kernel *expects* — an `HVC` that
-// nothing answers — and turns it into the SMCCC "not supported" return.
+// first checks for an `SVC` — `nccall`, answered by the dispatcher through
+// `nanochrono_nccall_aarch64` (src/nccall/hal.rs) and resumed — and then for
+// the one fault this kernel *expects* — an `HVC` that nothing answers — and
+// turns it into the SMCCC "not supported" return.
 //
 // Why that one is expected: `HVC` from EL1 is UNDEFINED when EL2 is absent
 // or disabled, and there is no way to ask beforehand. The old guard was a
@@ -108,6 +110,9 @@ nc_sync_el\el:
     stp x0, x1, [sp, #-16]!
     mrs x0, esr_el\el
     lsr x0, x0, #26
+    // EC 0x15: SVC from AArch64 — a nccall.
+    cmp x0, #0x15
+    b.eq 5f
     // EC 0 is "unknown reason", which is what an UNDEFINED HVC raises.
     cbnz x0, 1f
     mrs x0, elr_el\el
@@ -124,6 +129,55 @@ nc_sync_el\el:
 1:  ldp x0, x1, [sp], #16
     mov x3, #4
     b nc_fatal_el\el
+
+    // nccall: 128 bytes below the caller's stack pointer are left alone
+    // (NCCALL.md §2.3), then x0..x30, ELR and SPSR go into the frame the glue
+    // reads; it writes x0, x1 and PSTATE.C (SPSR bit 29) back. Every other
+    // register comes back as it went in, and ELR already points past the SVC.
+5:  ldp x0, x1, [sp], #16
+    sub sp, sp, #(128 + 272)
+    stp x0, x1, [sp, #0]
+    stp x2, x3, [sp, #16]
+    stp x4, x5, [sp, #32]
+    stp x6, x7, [sp, #48]
+    stp x8, x9, [sp, #64]
+    stp x10, x11, [sp, #80]
+    stp x12, x13, [sp, #96]
+    stp x14, x15, [sp, #112]
+    stp x16, x17, [sp, #128]
+    stp x18, x19, [sp, #144]
+    stp x20, x21, [sp, #160]
+    stp x22, x23, [sp, #176]
+    stp x24, x25, [sp, #192]
+    stp x26, x27, [sp, #208]
+    stp x28, x29, [sp, #224]
+    mrs x0, elr_el\el
+    mrs x1, spsr_el\el
+    stp x30, x0, [sp, #240]
+    str x1, [sp, #256]
+    mov x0, sp
+    bl nanochrono_nccall_aarch64
+    ldp x30, x0, [sp, #240]
+    ldr x1, [sp, #256]
+    msr elr_el\el, x0
+    msr spsr_el\el, x1
+    ldp x0, x1, [sp, #0]
+    ldp x2, x3, [sp, #16]
+    ldp x4, x5, [sp, #32]
+    ldp x6, x7, [sp, #48]
+    ldp x8, x9, [sp, #64]
+    ldp x10, x11, [sp, #80]
+    ldp x12, x13, [sp, #96]
+    ldp x14, x15, [sp, #112]
+    ldp x16, x17, [sp, #128]
+    ldp x18, x19, [sp, #144]
+    ldp x20, x21, [sp, #160]
+    ldp x22, x23, [sp, #176]
+    ldp x24, x25, [sp, #192]
+    ldp x26, x27, [sp, #208]
+    ldp x28, x29, [sp, #224]
+    add sp, sp, #(128 + 272)
+    eret
 
 nc_fatal_el\el:
     mrs x0, esr_el\el

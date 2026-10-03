@@ -120,6 +120,10 @@ pub mod ncplu;
 /// per-architecture selection, fuzzed on the host with the same code the
 /// freestanding kernel runs.
 pub mod ncpkg;
+/// `nccall`'s dispatcher and per-ISA register maps: what every system call
+/// means, whichever trap brought it. `no_std` and pure: the kernel's glue
+/// passes the call and a caller, and the host tests drive the same code.
+pub mod nccall;
 pub mod pmu_leaf;
 /// PNG decoding (package icons, the Gallery): `no_std`, allocation-free,
 /// rows streamed as RGBA8, every chunk checked.

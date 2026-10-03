@@ -82,6 +82,13 @@ QEMU has no KVM path for those machines.
 A kernel that reaches `selftest complete; halting` on the serial log has passed
 its boot self-test; it then idles until the QEMU timeout, which is expected.
 
+Sessions (`mode=`): `gui` (the default; `desktop` is its old name) and `cli`
+(plain text, always — its shell refuses `color on`) are the boot menu's. The
+classic full-screen instrument (`mode=classic`) is off the menu but kept: it
+holds the BENCH tab and it is the test harness — `crashtest=` and `plugin=`
+are served there, so the crash-test entries and `build.sh gdb|boot` add
+`mode=classic` (a later `mode=` overrides an earlier one).
+
 Faults (x86_64): `crashtest=<de|pf|gp|ud|so|df|panic>` on the kernel command
 line raises one on purpose; passing means a crash dump on COM1 and the stop
 screen, with QEMU still running — QEMU exiting under `-no-reboot` is a triple
@@ -118,6 +125,14 @@ rules the code relies on:
   `-Z build-std` and `RUSTFLAGS=-Zunstable-options` (see
   `crates/nanochrono-plugins/ncsys-demo/.cargo/config.toml`);
   `build.sh boot x86_64 plugin=ncsys-demo` runs its checks at boot.
+- One dispatcher for every ISA: `nanochrono-core::nccall` (what a call
+  means, the per-ISA register maps; `cargo test -p nanochrono-core --lib
+  nccall`) and the kernel's `src/nccall/` (the frames each trap entry saves,
+  the glue, the boot proof). A new call is added there once, never per
+  architecture; the selftest's `nccall HAL : ok` must hold on all nine.
+  RISC-V proves it from U-mode (`nc_rv_user_run`, `satp` Bare for the run);
+  QEMU's RV32 OpenSBI is not in every distribution — build one
+  (`make LLVM=1 PLATFORM=generic PLATFORM_RISCV_XLEN=32`) and pass `-bios`.
 - Every inline `nccall` asm block is `options(nostack)`, so the compiler
   keeps using the red zone around it, except i386's, which pushes its
   arguments onto the stack.
@@ -134,7 +149,7 @@ Bare metal embeds `assets/nanochronometer_logo_dark.png` itself:
 raw RGBA in `OUT_DIR`, and `src/logo.rs` includes those bytes — no image
 decoder in the kernel.
 
-The bare-metal GUI follows the desktop GUI's design (`nanochrono-gui`):
+The bare-metal classic interface (`gui_frame.rs`) follows the desktop GUI's design (`nanochrono-gui`):
 `Palette::APP` in `draw.rs` is `style.rs` colour for colour, tabs are
 desktop tab buttons, the readout sits in an inset box, and the BENCH tab is
 the desktop benchmark panel (modes, feature rows, log) driven by

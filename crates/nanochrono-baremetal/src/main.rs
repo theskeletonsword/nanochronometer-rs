@@ -561,14 +561,20 @@ pub unsafe extern "C" fn kmain(fdt: usize, opal_base: u64, opal_entry: u64, r6: 
             if let Some(hz) = tree.timebase_frequency() {
                 nanochrono_core::arch::powerpc::set_timebase_hz(hz);
             }
+            // The command line petitboot (or QEMU's -append) put in /chosen.
+            if let Some(args) = tree.bootargs() {
+                println!("command line: {args}");
+                nanochrono_baremetal::boot::record_command_line(args);
+            }
         }
         None => println!("warning: r3 does not hold a valid device tree"),
     }
 
     // SAFETY: hypervisor state, which the PMU programming needs.
     unsafe { selftest::run() };
-    // SAFETY: as above; the console owns the machine from here on.
-    unsafe { nanochrono_baremetal::console::run() }
+    // No framebuffer driver here: the session is the CLI, over the console.
+    // SAFETY: as above; the session owns the machine from here on.
+    unsafe { nanochrono_baremetal::session::start(None, nanochrono_baremetal::multiboot::Memory::default()) }
 }
 
 /// OPAL's base and entry from the `ibm,opal` node: `opal-base-address` and
@@ -602,6 +608,9 @@ pub unsafe extern "C" fn kmain(fdt: usize, of_entry: usize) -> ! {
         // SAFETY: forwarded from this function's contract.
         unsafe { kmain_open_firmware(of_entry) }
     }
+    // ePAPR means an e500, whose IVORs the entry stub installed: nccall's
+    // `sc` has its handler (IVOR8).
+    nanochrono_baremetal::nccall::hal::set_trap_ready();
     // SAFETY: ePAPR passes the flattened tree in r3, inside the loader's
     // initial mapping.
     let tree = unsafe { nanochrono_baremetal::fdt::Fdt::from_ptr(fdt as *const u8) };
@@ -647,11 +656,16 @@ pub unsafe extern "C" fn kmain(fdt: usize, of_entry: usize) -> ! {
         (true, None) => println!("booted by: ePAPR loader, no ns16550 in the device tree"),
         (false, _) => println!("booted by: unknown; r3 does not hold a valid device tree"),
     }
+    if let Some(args) = tree.and_then(|t| t.bootargs()) {
+        println!("command line: {args}");
+        nanochrono_baremetal::boot::record_command_line(args);
+    }
 
     // SAFETY: supervisor state.
     unsafe { selftest::run() };
-    // SAFETY: as above; the console owns the machine from here on.
-    unsafe { nanochrono_baremetal::console::run() }
+    // No framebuffer driver here: the session is the CLI, over the UART.
+    // SAFETY: as above; the session owns the machine from here on.
+    unsafe { nanochrono_baremetal::session::start(None, nanochrono_baremetal::multiboot::Memory::default()) }
 }
 
 // 32-bit ARM entry (ARMv7-A, QEMU `virt` with a Cortex-A7/A15).
@@ -890,16 +904,17 @@ unsafe fn kmain_open_firmware(of_entry: usize) -> ! {
             // SAFETY: once, before any drawing.
             unsafe { fb.attach_back_buffer() };
             // SAFETY: supervisor state, a framebuffer the firmware described.
-            unsafe { nanochrono_baremetal::gui::run(&fb, nanochrono_baremetal::multiboot::Memory::default()) }
+            unsafe { nanochrono_baremetal::session::start(Some(&fb), nanochrono_baremetal::multiboot::Memory::default()) }
         }
         Some((_, w, h, _, depth)) => {
             println!("screen is {w}x{h} at {depth} bpp; the interface needs 32 (QEMU: -g 1024x768x32)");
-            // SAFETY: as above; the console owns the machine from here on.
-            unsafe { nanochrono_baremetal::console::run() }
+            // SAFETY: as above; the session (the CLI, with no screen) owns the
+            // machine from here on.
+            unsafe { nanochrono_baremetal::session::start(None, nanochrono_baremetal::multiboot::Memory::default()) }
         }
         None => {
             // SAFETY: as above.
-            unsafe { nanochrono_baremetal::console::run() }
+            unsafe { nanochrono_baremetal::session::start(None, nanochrono_baremetal::multiboot::Memory::default()) }
         }
     }
 }

@@ -2,7 +2,9 @@
 //! 32-bit ARM exception vectors.
 //!
 //! The entry stub in `main.rs` points VBAR at [`nanochrono_arm32_vectors`]
-//! before any Rust runs. Every vector is fatal: there are no interrupts to
+//! before any Rust runs. One vector returns: the supervisor call, which is
+//! `nccall` — answered by the dispatcher through `nanochrono_nccall_arm`
+//! (src/nccall/hal.rs). Every other one is fatal: there are no interrupts to
 //! take (they stay masked for the whole run) and no fault this kernel
 //! expects, so each one reports what happened over the UART — the faulting
 //! instruction, and for an abort the fault status and address — and stops.
@@ -59,7 +61,26 @@ nc_arm32_reset:    NC_ARM32_FATAL 0, 0, 0, 0
 @ LR_und points past the undefined instruction: 4 bytes in ARM state. (In
 @ Thumb state it is 2, which the report notes from the SPSR's T bit.)
 nc_arm32_undef:    NC_ARM32_FATAL 1, 4, 0, 0
-nc_arm32_svc:      NC_ARM32_FATAL 2, 4, 0, 0
+@ nccall. SVC mode's stack is the kernel's: from user mode the CPU switched
+@ to it, from SVC mode (the self-test) it is the caller's own, and AAPCS
+@ keeps nothing below the stack pointer. The frame: r0..r12, the return
+@ address, the SPSR, a pad word — 64 bytes. The glue writes r0, r1 and the
+@ C flag (SPSR bit 29); every other register comes back as it went in.
+nc_arm32_svc:
+    sub sp, sp, #8
+    stmfd sp!, {{r0-r12, lr}}
+    mrs r0, spsr
+    str r0, [sp, #56]
+    mov r0, sp
+    mov r4, sp                      @ the frame, across the call (callee-saved)
+    bic sp, sp, #7                  @ AAPCS: 8-byte aligned at a call
+    bl nanochrono_nccall_arm
+    mov sp, r4
+    ldr r0, [sp, #56]
+    msr spsr_cxsf, r0
+    ldmfd sp!, {{r0-r12, lr}}
+    add sp, sp, #8
+    movs pc, lr                     @ back past the svc, CPSR from SPSR
 nc_arm32_prefetch: NC_ARM32_FATAL 3, 4, 2, 0
 @ LR_abt is 8 past the instruction that made a data abort.
 nc_arm32_data:     NC_ARM32_FATAL 4, 8, 1, 0

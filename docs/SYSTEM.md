@@ -87,7 +87,7 @@ firmware ⇒ GRUB (multiboot2) ⇒ nckernel entry (boot32.S / arch entry)
   ⇒ framebuffer, serial, input, counters, PMU, NC_RNG
   ⇒ vfs::init: built-in files, /proc, /dev, loader modules,
        ncinitramdisk (seal judged, files BLAKE3-checked)
-  ⇒ session::start(mode=)   [classic | desktop | cli]
+  ⇒ session::start(mode=)   [gui (default) | cli | classic]
   → (planned) init.ncapp: mount NCFS root, spawn the session in Ring 3
 ```
 
@@ -209,8 +209,13 @@ and errno values. **Done** on x86-64 (`ring3.rs`, `kstack.rs`): the
 program's red zone survives every call — proven at boot, in the selftest —
 the exceptions run on their own IST stacks, and the POSIX-class subset
 (`write`, `mmap`, `munmap`, `clock_gettime`, `getrandom`, …) is served
-beside the plugin API's calls. Rust reaches it through `nanochrono-sys`, C
-through `sdk/include/nccall.h`. The full surface is modelled on the POSIX
+beside the plugin API's calls. On **every** ISA the trap — `syscall`,
+`int $0x80`, `svc`, `sc`, `ecall` — ends in one dispatcher
+(`nanochrono-core::nccall`, host-tested) through a per-ISA glue that reads
+the frame by the convention's register map (`src/nccall/hal.rs`); each of the
+nine kernels proves it at boot through its own trap (NCCALL.md §9.5). Rust
+reaches it through `nanochrono-sys`, C and C++ through
+`sdk/include/nccall.h`, assembly through the same header's numbers. The full surface is modelled on the POSIX
 subset FreeBSD (569 calls) and OpenBSD (349) expose — `open`, `read`,
 `write`, `mmap`, `socket`, … — so adapted BSD code and ported Unix programs
 find what they expect, with `pledge`-style restriction over the top. The
@@ -298,11 +303,13 @@ overhead), each explained. Packages are laid down with the host's
 
 ## 10. The user environment — partial
 
-Three sessions, one kernel, chosen by `mode=` (ECOSYSTEM.md §1): the
-instrument (`classic`), the **Desktop Experience** (`desktop` — windows, a
-taskbar, apps), and the **CLI** (`cli` — a plain-text Unix-like shell, no
-colour unless asked). The taskbar clock reads `hh:mm:ss:mmm:uuu:nnn`; the
-stopwatch is essential and unremovable. **Done:** all three sessions, the
+Two sessions in the boot menu, one kernel, chosen by `mode=` (ECOSYSTEM.md
+§1): the **NanoChronometer GUI** (`gui`, the default — windows, a taskbar,
+apps) and the **CLI** (`cli` — a plain-text Unix-like shell, never in
+colour). The classic full-screen instrument (`classic`) is off the menu but
+kept, for its BENCH tab and as the test harness. The taskbar clock reads
+`hh:mm:ss:mmm:uuu:nnn`; the stopwatch is essential and unremovable. **Done:**
+the sessions, the
 built-in apps (Stopwatch, Terminal, Task Manager, Settings, Files, Gallery
 — JPEG/PNG, Player — WAV/MP3/MP4, Benchmark), the `top` and `lspmc`
 commands. **Planned:** refresh-rate adaptation (Settings › Display),

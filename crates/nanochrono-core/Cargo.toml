@@ -28,6 +28,9 @@ std = ["alloc"]
 alloc = []
 
 [dependencies]
+# nccall's numbers, errno and per-ISA convention (`nccall`): no dependencies
+# of its own, `no_std`, the same crate every ring-3 program links.
+nanochrono-sys = { path = "../nanochrono-sys" }
 
 # libc and windows-sys are only reachable from the `std` modules, but Cargo
 # resolves target dependencies before features, so they are pulled in either

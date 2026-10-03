@@ -66,8 +66,32 @@ pub unsafe fn run() {
         report_kernel_stacks()
     };
 
+    report_nccall();
     report_rng();
     report_integrity();
+}
+
+/// nccall's HAL (docs/NCCALL.md §4.2): five calls — echo, getpid, an
+/// unserved POSIX number, write(1), a class-0 service — made through this
+/// ISA's own trap instruction wherever the kernel owns the vectors, and
+/// answered by the one dispatcher every ISA shares.
+fn report_nccall() {
+    let ok = |b: bool| if b { "ok" } else { "FAILED" };
+    println!("== nccall: one system call, this ISA's trap ==");
+    let hz = counters::declared_counter_hz().unwrap_or(0);
+    let p = crate::nccall::hal::selftest(hz);
+    println!("  path           : {}", p.path);
+    println!("  echo           : {} (six argument words in, two results out)", ok(p.echo));
+    println!("  getpid         : {}", ok(p.getpid));
+    println!("  unserved call  : {} (ENOSYS, error flag set)", ok(p.enosys));
+    println!("  write(1)       : {}", ok(p.write));
+    if p.timer_hz != 0 {
+        println!("  class 0        : {} (timer rate {} Hz)", ok(p.timer), p.timer_hz);
+    } else {
+        println!("  class 0        : {} (timer service; rate not declared)", ok(p.timer));
+    }
+    println!("  nccall HAL     : {}", if p.ok() { "ok" } else { "FAILED" });
+    println!();
 }
 
 /// The ring 3 / ring 0 boundary (docs/NCCALL.md): which stack each kernel

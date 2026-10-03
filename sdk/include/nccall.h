@@ -25,49 +25,65 @@
  *
  * Not for kernel code: .ncdri drivers reach the kernel through ncdri_api.h,
  * never through a trap.
+ *
+ * C, C++ (extern "C"; C++20 for NCCALL's variadic form) and assembly: a .S
+ * file that includes this header gets every number, errno and flag below
+ * as a plain constant (no C suffixes under __ASSEMBLER__) and writes the
+ * trap itself with the registers in the table above. NC_SYS_echo checks a
+ * binding: all six argument registers in, both result registers out.
  */
 #ifndef NCCALL_H
 #define NCCALL_H
 
+/* Unsigned in C and C++; bare in assembly, which takes no suffix. */
+#ifdef __ASSEMBLER__
+#define NCCALL_U_(x) x
+#else
+#define NCCALL_U_(x) x##u
+#endif
+
+#ifndef __ASSEMBLER__
 #include <stddef.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
 #endif
+#endif /* !__ASSEMBLER__ */
 
 /* ---- Call numbers (crates/nanochrono-sys/src/nr.rs) --------------------- */
 #define NCCALL_CLASS_SHIFT 16
-#define NCCALL_CLASS_NC    0u   /* NanoChronometer services */
-#define NCCALL_CLASS_POSIX 1u   /* POSIX/BSD, indexed by FreeBSD's syscalls.master */
-#define NCCALL_MAKE(cls, idx) (((cls) << NCCALL_CLASS_SHIFT) | ((idx) & 0xFFFFu))
+#define NCCALL_CLASS_NC    NCCALL_U_(0)   /* NanoChronometer services */
+#define NCCALL_CLASS_POSIX NCCALL_U_(1)   /* POSIX/BSD, indexed by FreeBSD's syscalls.master */
+#define NCCALL_CLASS_DIAG  NCCALL_U_(2)   /* the ABI's self-check */
+#define NCCALL_MAKE(cls, idx) (((cls) << NCCALL_CLASS_SHIFT) | ((idx) & NCCALL_U_(0xFFFF)))
 #define NCCALL_FREEBSD(idx)   NCCALL_MAKE(NCCALL_CLASS_POSIX, idx)
-#define NCCALL_NR_ANY      0xFFFFFFFFu
+#define NCCALL_NR_ANY      NCCALL_U_(0xFFFFFFFF)
 #define NCCALL_MAX_ARGS    6
 
 /* Class 0: the services behind the plugin's nc_api_t (ncplu.h). */
-#define NC_SYS_EXIT              0u
-#define NC_SYS_FILL_RECT         1u
-#define NC_SYS_CLEAR             2u
-#define NC_SYS_PRESENT           3u
-#define NC_SYS_POLL_EVENT        4u
-#define NC_SYS_TICKS             5u
-#define NC_SYS_LOG               6u
-#define NC_SYS_TIMER_NOW         7u
-#define NC_SYS_TIMER_NOW_END     8u
-#define NC_SYS_TIMER_HZ          9u
-#define NC_SYS_TIMER_SOURCE      10u
-#define NC_SYS_TIMER_TICKS_TO_NS 11u
-#define NC_SYS_PMU_CAPS          12u
-#define NC_SYS_PMU_OPEN          13u
-#define NC_SYS_PMU_READ          14u
-#define NC_SYS_PMU_CLOSE         15u
-#define NC_SYS_RNG_FILL          16u
-#define NC_SYS_RNG_STATUS        17u
-#define NC_SYS_RNG_STIR          18u
-#define NC_SYS_RNG_SELFTEST      19u
-#define NC_SYS_STACK_CHK_FAIL    20u
-#define NC_SYS_SPAWN             32u  /* reserved: NetBSD posix_spawn(2) model; ENOSYS today */
+#define NC_SYS_EXIT              NCCALL_U_(0)
+#define NC_SYS_FILL_RECT         NCCALL_U_(1)
+#define NC_SYS_CLEAR             NCCALL_U_(2)
+#define NC_SYS_PRESENT           NCCALL_U_(3)
+#define NC_SYS_POLL_EVENT        NCCALL_U_(4)
+#define NC_SYS_TICKS             NCCALL_U_(5)
+#define NC_SYS_LOG               NCCALL_U_(6)
+#define NC_SYS_TIMER_NOW         NCCALL_U_(7)
+#define NC_SYS_TIMER_NOW_END     NCCALL_U_(8)
+#define NC_SYS_TIMER_HZ          NCCALL_U_(9)
+#define NC_SYS_TIMER_SOURCE      NCCALL_U_(10)
+#define NC_SYS_TIMER_TICKS_TO_NS NCCALL_U_(11)
+#define NC_SYS_PMU_CAPS          NCCALL_U_(12)
+#define NC_SYS_PMU_OPEN          NCCALL_U_(13)
+#define NC_SYS_PMU_READ          NCCALL_U_(14)
+#define NC_SYS_PMU_CLOSE         NCCALL_U_(15)
+#define NC_SYS_RNG_FILL          NCCALL_U_(16)
+#define NC_SYS_RNG_STATUS        NCCALL_U_(17)
+#define NC_SYS_RNG_STIR          NCCALL_U_(18)
+#define NC_SYS_RNG_SELFTEST      NCCALL_U_(19)
+#define NC_SYS_STACK_CHK_FAIL    NCCALL_U_(20)
+#define NC_SYS_SPAWN             NCCALL_U_(32)  /* reserved: NetBSD posix_spawn(2) model; ENOSYS today */
 
 /* Class 1: FreeBSD's numbers plus the class bit. */
 #define NC_SYS_exit          NCCALL_FREEBSD(1)
@@ -83,6 +99,9 @@ extern "C" {
 #define NC_SYS_nanosleep     NCCALL_FREEBSD(240)
 #define NC_SYS_mmap          NCCALL_FREEBSD(477) /* offset in 4 KiB units */
 #define NC_SYS_getrandom     NCCALL_FREEBSD(563)
+
+/* Class 2: echo(a0..a5) returns { Σ (i+1)·aᵢ (wrapping), a5 } and never fails. */
+#define NC_SYS_echo          NCCALL_MAKE(NCCALL_CLASS_DIAG, 0)
 
 /* errno values (FreeBSD sys/sys/errno.h) the kernel returns today. */
 #define NC_EPERM        1
@@ -113,6 +132,7 @@ extern "C" {
 #define NC_GRND_NONBLOCK 0x1
 #define NC_GRND_RANDOM   0x2
 
+#ifndef __ASSEMBLER__
 /* What clock_gettime fills: 64-bit fields on every architecture. */
 typedef struct nc_timespec {
     int64_t tv_sec;
@@ -372,8 +392,20 @@ static inline __attribute__((noreturn)) void nc_exit(int status) {
     }
 }
 
+/* The ABI's self-check: what NC_SYS_echo must return for these arguments. */
+static inline nccall_ret_t nc_echo(uintptr_t a0, uintptr_t a1, uintptr_t a2, uintptr_t a3, uintptr_t a4,
+                                   uintptr_t a5) {
+    return NCCALL(NC_SYS_echo, a0, a1, a2, a3, a4, a5);
+}
+
+static inline uintptr_t nc_echo_expect(uintptr_t a0, uintptr_t a1, uintptr_t a2, uintptr_t a3, uintptr_t a4,
+                                       uintptr_t a5) {
+    return a0 + 2 * a1 + 3 * a2 + 4 * a3 + 5 * a4 + 6 * a5;
+}
+
 #ifdef __cplusplus
 }
 #endif
+#endif /* !__ASSEMBLER__ */
 
 #endif /* NCCALL_H */

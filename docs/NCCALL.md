@@ -8,7 +8,11 @@ without anything of the kernel's reaching the program on the way back.
 This is the specification. Its executable halves are
 [`crates/nanochrono-sys`](../crates/nanochrono-sys) (the convention as data,
 checked by tests, and `nccall!` for Rust), [`sdk/include/nccall.h`](../sdk/include/nccall.h)
-(the same for C), and the x86-64 kernel's
+(the same for C), the dispatcher every ISA's trap ends in —
+[`nanochrono-core::nccall`](../crates/nanochrono-core/src/nccall) (what a call
+means, and each ISA's register map; host-tested) and the kernel's
+[`src/nccall/`](../crates/nanochrono-baremetal/src/nccall) (the frames, the
+glue, the boot proof; §9.5) — and the x86-64 kernel's
 [`ring3.rs`](../crates/nanochrono-baremetal/src/ring3.rs) and
 [`kstack.rs`](../crates/nanochrono-baremetal/src/kstack.rs). The driver side
 of ring 0 is [NCDRI.md](NCDRI.md); the toolchain that builds for both sides
@@ -20,6 +24,8 @@ QEMU), **partial**, **planned**.
 | | x86-64 | i386 | AArch64 | ARM32 | PowerPC | PPC64 (BE/LE) | RISC-V 32/64 |
 |---|---|---|---|---|---|---|---|
 | Convention fixed (§4), `nccall!` + `nccall.h` | done | done | done | done | done | done | done |
+| Trap entry → one dispatcher (§9.5) | **done** | **done** | **done** | **done** | **done** (e500); glue only on Open Firmware | glue only (skiboot owns the vectors) | **done** |
+| Proven at boot through the trap | `syscall`, from ring 3 | `int $0x80`, from ring 0 | `svc`, from EL1 | `svc`, from SVC mode | `sc`, supervisor (e500) | — | `ecall`, from U-mode |
 | Ring 3 in the kernel | **done** | planned | planned | planned | planned | planned | planned |
 | Entry stack switch (§3) | **done**, proven at boot | spec | spec | spec | spec | spec | spec |
 | Kernel-mode entry skip (§2.3) | n/a (no kernel red zone) | n/a | 128 B, spec | n/a | n/a | **512 B, required**, spec | n/a |
@@ -328,6 +334,15 @@ ring 3.
   is 0x1_0004, `mmap` 0x1_01DD. A C library adapted from FreeBSD's finds
   every call at the number it was generated for, plus the class bit. An
   unserved class-1 number fails with `ENOSYS`, so a library can probe.
+* **Class 2 — the ABI's self-check.** `ECHO` (0x2_0000) takes all six
+  argument registers and returns `Σ (i + 1)·aᵢ` (wrapping) and `a5`: a
+  binding that swaps, drops or truncates an argument, or loses the second
+  result register, gets the wrong answer. Pure, never fails, needs no
+  capability and no pin — any caller, any language, any ISA can run it
+  (`nc_echo` / `nc_echo_expect` in C, `nr::diag::echo` in Rust). Another
+  class-2 index is `ENOSYS`.
+
+A number with any other class, or wider than 32 bits, ends the caller.
 
 ---
 
@@ -456,6 +471,65 @@ its canary (`__stack_chk_fail` reaches the kernel through a pinned stub),
 `faulter` and `peek` by contained page faults, `poke`'s kernel pointers are
 refused (`-1`) and the kernel stays up, `rng_demo` and Snake run.
 
+### 9.5 One dispatcher, every ISA — done
+
+```text
+ trap instruction (syscall · int $0x80 · svc #0 · sc · ecall)
+  → the ISA's entry (assembly beside its vectors): registers into a frame,
+    on a kernel stack
+  → the ISA's glue (src/nccall/hal.rs): number and six arguments read out
+    of the frame through the ISA's Map
+  → nanochrono_core::nccall::dispatch(call, caller): classes, capabilities,
+    pins, the stack-pivot check, the POSIX subset — one copy, host-tested
+  → back through the Map: two results and the error flag (CF, PSTATE.C,
+    CPSR.C, CR0[SO], t0), or the caller is ended
+```
+
+| ISA | Entry | Frame |
+|---|---|---|
+| x86-64 | `ring3.rs`, the `SYSCALL` path | `SyscallFrame` |
+| i386 | `boot/boot_i386.S`, IDT gate 0x80 (DPL 3) | `pusha` + the CPU's EIP/CS/EFLAGS; arguments read from the caller's stack |
+| AArch64 | `arch/arm.rs`, `nc_sync_el*` on EC 0x15 | x0–x30, ELR, SPSR, 128 bytes below the interrupted SP skipped |
+| ARM32 | `arch/arm32.rs`, the SVC vector | r0–r12, LR, SPSR |
+| PowerPC (e500) | `arch/ppc.rs`, IVOR8 | r0–r31, LR, CR, CTR, XER, SRR0/1 |
+| RISC-V | `arch/riscv.rs`, `scause` 8 | x1–x31 and `sepc`, on a stack of its own |
+
+The **caller** is a trait (`Caller`): what it owns, what it was granted, its
+stack, which sites are pinned, and how its console and NC_RNG are reached.
+A ring-3 app (`ring3::Ring3`) is one; the boot self-test (`hal::Boot`) is
+another. `serve(caller, f)` installs it for the traps `f` makes.
+
+The selftest makes five calls through each ISA's real trap — `echo`,
+`getpid`, an unserved POSIX call (`ENOSYS`, error flag set), `write(1)` and
+the class-0 timer rate — with the same `nanochrono_sys::raw::dynamic` a
+program's `nccall!` compiles to:
+
+```
+== nccall: one system call, this ISA's trap ==
+  nccall         : write(1) through the HAL
+  path           : ecall, from U-mode
+  echo           : ok (six argument words in, two results out)
+  getpid         : ok
+  unserved call  : ok (ENOSYS, error flag set)
+  write(1)       : ok
+  class 0        : ok (timer rate 10000000 Hz)
+  nccall HAL     : ok
+```
+
+All nine kernels print `nccall HAL : ok` under QEMU at -O2, -O0 and -Og.
+Where the trap is taken from:
+
+* **RISC-V** — an `ecall` from S-mode goes to the SBI, so the proof is a
+  short U-mode run (`nc_rv_user_run`): `satp` Bare for its length (the
+  identity map has no U pages), `exit` ends it, any other U-mode trap ends it
+  too and the kernel carries on.
+* **i386, AArch64, ARM32, e500** — the kernel traps itself. A caller that
+  cannot be ended (the kernel) gets `ENOSYS` where an app would be ended.
+* **x86-64** — the glue with a frame here; the trap itself is §9.1's probe,
+  from ring 3.
+* **PPC64 and Open Firmware PowerPC** — the glue with a frame: the firmware
+  owns the `sc` vector until those kernels install their own (§12).
+
 ---
 
 ## 10. The layers above
@@ -466,7 +540,21 @@ refused (`-1`) and the kernel stays up, `rng_demo` and Snake run.
   `libc` ([NCTOOLCHAIN.md](NCTOOLCHAIN.md) §4).
 * **C:** `nccall.h` — `NCCALL(nr, …)`, `nccall_dyn`, `nc_write`, `nc_mmap`, …
   It is what `nclibc`'s generated system-call layer expands to.
-* **Assembly:** the convention table of §4; nothing else is needed.
+* **C++:** the same header — it is `extern "C"` and C++17-clean; nothing
+  else is needed.
+* **Assembly:** the convention table of §4, and `nccall.h`'s numbers
+  (`NC_SYS_*` and `NCCALL_MAKE` work in a `.S` file). On RISC-V:
+
+  ```asm
+  #include <nccall.h>
+      li   t0, NC_SYS_echo
+      li   a0, 1          # a0..a5: the arguments
+      ...
+      ecall               # a0, a1: the results; t0 != 0: a0 is the errno
+  ```
+
+Whatever the language, the call is the same trap with the same registers,
+and the kernel answers it with the same dispatcher.
 
 ---
 
@@ -580,10 +668,12 @@ IRQ / abort vectors: their mode's SP is a few words of scratch only; switch to
 ## 12. Next
 
 1. The loader hands `nccall_pins` to the kernel; class-1 calls pinned too.
-2. A module-header flag for "built for a ring-3 target" (§2.4); such modules
+2. PPC64 and Open Firmware PowerPC install their own `sc` vector, so their
+   proof goes through the trap as the others' does (§9.5).
+3. A module-header flag for "built for a ring-3 target" (§2.4); such modules
    never run at ring 0.
-3. User mode on AArch64 and RISC-V-64 per §11, with the §9.1 probe as each
+4. User mode on AArch64 and RISC-V-64 per §11, with the §9.1 probe as each
    one's acceptance test; then ARM32, i386 and PowerPC.
-4. `#PF` off the IST when kernel page faults become recoverable (§3.2).
-5. XSAVE of the user state on every asynchronous entry, when preemption
+5. `#PF` off the IST when kernel page faults become recoverable (§3.2).
+6. XSAVE of the user state on every asynchronous entry, when preemption
    arrives.

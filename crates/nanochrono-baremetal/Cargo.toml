@@ -25,6 +25,10 @@ force-usb = []
 plugin-verify = ["dep:ml-dsa", "dep:p521", "dep:sha512"]
 
 [dependencies]
+# The nccall ABI as data: the call numbers, errno values and per-ISA register
+# convention the dispatcher (src/nccall/) serves on every architecture are
+# the ones every stub and SDK header uses.
+nanochrono-sys = { path = "../nanochrono-sys" }
 # The same crate the hosted build uses, with the OS-dependent half switched
 # off. The inline assembly is shared rather than reimplemented, which is the
 # whole point: a bare-metal kernel executes the same instruction sequences.
@@ -46,11 +50,6 @@ sha512 = { package = "sha2", version = "0.11", default-features = false, optiona
 # which path they took. Only where the crates use it (x86, AArch64).
 [target.'cfg(any(target_arch = "x86_64", target_arch = "x86", target_arch = "aarch64"))'.dependencies]
 cpufeatures = { version = "0.2", optional = true }
-# The nccall ABI as data: the call numbers and errno values the ring-3
-# dispatcher matches on are the ones every stub and SDK header loads. Ring 3
-# exists on x86-64 so far (docs/NCCALL.md); the others take it with theirs.
-[target.'cfg(target_arch = "x86_64")'.dependencies]
-nanochrono-sys = { path = "../nanochrono-sys" }
 
 [lib]
 name = "nanochrono_baremetal"

@@ -2,7 +2,7 @@
 //! Call numbers: what the number register holds when `nccall` traps.
 //!
 //! A number is 32 bits: a **class** in bits 31..16 and an index in bits
-//! 15..0. Two classes exist.
+//! 15..0. Three classes exist.
 //!
 //! * [`nc`] (class 0) — NanoChronometer's own services: the screen, input,
 //!   the instrument's timer and PMU, NC_RNG. These are the calls behind the
@@ -15,6 +15,11 @@
 //!   was generated for, plus the class bit. A class-1 number the kernel does
 //!   not serve fails with `ENOSYS` instead of ending the caller, so a library
 //!   can probe and fall back.
+//! * [`diag`] (class 2) — the ABI checking itself: [`diag::ECHO`] takes all
+//!   six argument words and returns two results computed from them, so a
+//!   binding in any language — and the kernel's own entry on each ISA —
+//!   proves every register of the convention in one call. Pure, never
+//!   pinned, never refused.
 //!
 //! # Arguments
 //!
@@ -33,6 +38,8 @@ pub const INDEX_MASK: u32 = 0xFFFF;
 pub const CLASS_NC: u32 = 0;
 /// POSIX/BSD calls, indexed by FreeBSD's `syscalls.master`.
 pub const CLASS_POSIX: u32 = 1;
+/// The ABI's self-check ([`diag`]).
+pub const CLASS_DIAG: u32 = 2;
 
 /// The most argument words any call takes, on every architecture.
 pub const MAX_ARGS: usize = 6;
@@ -128,6 +135,28 @@ pub mod posix {
     pub const GETRANDOM: u32 = freebsd(563);
 }
 
+/// The ABI's self-check (class 2).
+pub mod diag {
+    use super::{make, CLASS_DIAG};
+
+    /// `echo(a0, a1, a2, a3, a4, a5)` → ([`echo`]`(a)`): every argument
+    /// register in, both result registers out. Never fails.
+    pub const ECHO: u32 = make(CLASS_DIAG, 0);
+
+    /// What [`ECHO`] returns for `a`: the weighted sum `Σ (i + 1)·aᵢ`
+    /// (wrapping), which changes if any two arguments trade places, and the
+    /// last argument, which proves the second result register.
+    pub const fn echo(a: [usize; 6]) -> (usize, usize) {
+        let mut sum = 0usize;
+        let mut i = 0;
+        while i < 6 {
+            sum = sum.wrapping_add(a[i].wrapping_mul(i + 1));
+            i += 1;
+        }
+        (sum, a[5])
+    }
+}
+
 /// One known call: its number, its name, how many argument words it takes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Call {
@@ -173,6 +202,7 @@ pub const CALLS: &[Call] = &[
     Call { nr: posix::NANOSLEEP, name: "nanosleep", args: 2 },
     Call { nr: posix::MMAP, name: "mmap", args: 6 },
     Call { nr: posix::GETRANDOM, name: "getrandom", args: 3 },
+    Call { nr: diag::ECHO, name: "echo", args: 6 },
 ];
 
 /// The entry for `nr`, if this crate names it.
@@ -285,6 +315,21 @@ mod tests {
         assert_eq!(nc::LOG, 6);
         assert_eq!(nc::RNG_SELFTEST, 19);
         assert_eq!(nc::STACK_CHK_FAIL, 20);
+    }
+
+    #[test]
+    fn echo_sees_every_argument_in_its_place() {
+        let a = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66];
+        assert_eq!(diag::echo(a), (0x60B, 0x66));
+        // Any two arguments swapped give another sum.
+        for i in 0..6 {
+            for j in i + 1..6 {
+                let mut b = a;
+                b.swap(i, j);
+                assert_ne!(diag::echo(b).0, diag::echo(a).0, "swapping {i} and {j}");
+            }
+        }
+        assert_eq!(class(diag::ECHO), CLASS_DIAG);
     }
 
     #[test]

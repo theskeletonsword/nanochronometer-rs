@@ -183,8 +183,9 @@ enable_sse:
  * counterpart of x86_64's IST1. The state at the fault is then in the
  * kernel's TSS, where the switch saved it.
  *
- * Vectors 32-255 are left outside the IDT limit. Interrupts stay masked for
- * the whole run; one that arrives anyway raises #GP, which is reported.
+ * Vector 0x80 is nccall's gate (below). The others from 32 up are not
+ * present: interrupts stay masked for the whole run, and one that arrives
+ * anyway raises #NP, which is reported.
  * ------------------------------------------------------------------------ */
 setup_descriptors:
     mov $tss_main, %eax
@@ -244,6 +245,17 @@ setup_descriptors:
     inc %ebx
     cmp $32, %ebx
     jb 2b
+
+    /* 0x80: nccall. DPL 3, so ring 3 may raise it; an interrupt gate, so IF
+     * stays clear inside. */
+    mov $nc_i386_int80, %eax
+    mov %eax, %ecx
+    and $0xFFFF, %eax
+    or $(0x08 << 16), %eax          /* selector: code; offset[15:0]     */
+    mov %eax, idt32 + 0x80 * 8
+    and $0xFFFF0000, %ecx
+    or $0xEE00, %ecx                /* present, DPL 3, interrupt gate   */
+    mov %ecx, idt32 + 0x80 * 8 + 4
 
     lidt idt32_pointer
     ret
@@ -354,6 +366,23 @@ exception_frame32:
     hlt
     jmp 1b
 
+/* nccall: `int $0x80`, the number in EAX and the arguments on the caller's
+ * stack, past a return-address slot (FreeBSD's layout). The frame is pusha's
+ * eight words over what the CPU pushed; the glue (src/nccall/hal.rs) writes
+ * EAX, EDX and EFLAGS.CF into it, and every other register comes back as it
+ * went in. */
+nc_i386_int80:
+    cld
+    pusha
+    mov %esp, %ebx
+    and $~15, %esp
+    sub $12, %esp
+    push %ebx
+    call nanochrono_nccall_i386
+    mov %ebx, %esp
+    popa
+    iret
+
 /* The double-fault task. The switch saved the interrupted state in tss_main
  * and pushed #DF's error code (zero) on this task's stack; the frame
  * isr_common32 would have built is rebuilt from that state. */
@@ -397,7 +426,7 @@ gdt32_pointer:
     .long gdt32
 .align 4
 idt32_pointer:
-    .short 32 * 8 - 1
+    .short 256 * 8 - 1
     .long idt32
 
 .section .bss
@@ -406,7 +435,7 @@ page_directory:
     .skip 4096
 .align 16
 idt32:
-    .skip 32 * 8
+    .skip 256 * 8
 tss_main:
     .skip 104
 .align 16

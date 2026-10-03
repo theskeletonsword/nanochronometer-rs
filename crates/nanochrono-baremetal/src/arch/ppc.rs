@@ -552,7 +552,8 @@ _start:
     mtspr 406, 3
     li 3, nc_ivor_7 - nc_ivor_table
     mtspr 407, 3
-    li 3, nc_ivor_8 - nc_ivor_table
+    // IVOR8, the system call: nccall's entry, below the table.
+    li 3, nc_ppc32_sc - nc_ivor_table
     mtspr 408, 3
     li 3, nc_ivor_9 - nc_ivor_table
     mtspr 409, 3
@@ -578,7 +579,8 @@ _start:
 // The table: IVPR supplies bits 0:47 of each handler's address, so it sits
 // on a 64 KiB boundary, and each IVOR offset is 16-byte aligned. Every
 // handler saves r3 in SPRG0, loads its vector number and joins the common
-// path; all of them are fatal.
+// path; all of them are fatal but the system call's, which IVOR8 points at
+// `nc_ppc32_sc` instead.
 .section .text.nc_ivors, \"ax\"
 .balign 65536
 nc_ivor_table:
@@ -589,6 +591,54 @@ nc_ivor_\\v:
     li 3, \\v
     b nc_ppc32_fatal
 .endr
+
+// nccall: `sc`. The 32-bit SysV ABI keeps nothing below r1, so the frame
+// goes on the caller's stack: an 8-byte header for the glue's own frame
+// link, then r0..r31 (r1's slot the caller's stack pointer), LR, CR, CTR,
+// XER, SRR0 and SRR1 — the glue (src/nccall/hal.rs) writes r3, r4 and
+// CR0[SO], and every other register comes back as it went in.
+    .balign 16
+nc_ppc32_sc:
+    stwu 1, -160(1)
+    stw 0, 8(1)
+    stmw 2, 16(1)
+    addi 3, 1, 160
+    stw 3, 12(1)
+    mflr 3
+    stw 3, 136(1)
+    mfcr 3
+    stw 3, 140(1)
+    mfctr 3
+    stw 3, 144(1)
+    mfxer 3
+    stw 3, 148(1)
+    mfspr 3, 26
+    stw 3, 152(1)
+    mfspr 3, 27
+    stw 3, 156(1)
+    // Interrupt entry clears MSR[FP]; the glue is Rust.
+    mfmsr 3
+    ori 3, 3, 0x2000
+    mtmsr 3
+    isync
+    addi 3, 1, 8
+    bl nanochrono_nccall_ppc
+    lwz 3, 156(1)
+    mtspr 27, 3
+    lwz 3, 152(1)
+    mtspr 26, 3
+    lwz 3, 148(1)
+    mtxer 3
+    lwz 3, 144(1)
+    mtctr 3
+    lwz 3, 140(1)
+    mtcr 3
+    lwz 3, 136(1)
+    mtlr 3
+    lwz 0, 8(1)
+    lmw 2, 16(1)
+    addi 1, 1, 160
+    rfi
 
 nc_ppc32_fatal:
     // A private stack: the fault may have been a stack overflow. Found

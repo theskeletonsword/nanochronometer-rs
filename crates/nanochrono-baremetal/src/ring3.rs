@@ -73,7 +73,6 @@
 
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 
-use nanochrono_sys::nr;
 use nanochrono_sys::Errno;
 
 use crate::crashdump::TrapFrame;
@@ -512,7 +511,7 @@ pub struct SyscallRet {
 const _: () = assert!(core::mem::size_of::<SyscallFrame>() == 80);
 
 // ---------------------------------------------------------------------------
-// The dispatcher and pointer checks
+// The SYSCALL glue: this ISA's half of nccall (crate::nccall)
 // ---------------------------------------------------------------------------
 
 static R3_ARENA_BASE: AtomicUsize = AtomicUsize::new(0);
@@ -539,25 +538,6 @@ pub fn user_owns(ptr: usize, len: usize) -> bool {
     in_region(abase, alen) || in_region(sbase, slen) || in_region(hbase, hlen)
 }
 
-/// The capability a class-0 `nccall` needs, or 0 for one always allowed.
-fn cap_of(num: u32) -> u32 {
-    use crate::ncplu::{CAP_INPUT, CAP_LOG, CAP_PMU, CAP_RNG, CAP_SCREEN, CAP_TIMER};
-    match num {
-        sys::FILL_RECT | sys::CLEAR | sys::PRESENT => CAP_SCREEN,
-        sys::POLL_EVENT => CAP_INPUT,
-        sys::LOG => CAP_LOG,
-        sys::TICKS
-        | sys::TIMER_NOW
-        | sys::TIMER_NOW_END
-        | sys::TIMER_HZ
-        | sys::TIMER_SOURCE
-        | sys::TIMER_TICKS_TO_NS => CAP_TIMER,
-        sys::PMU_CAPS | sys::PMU_OPEN | sys::PMU_READ | sys::PMU_CLOSE => CAP_PMU,
-        sys::RNG_FILL | sys::RNG_STATUS | sys::RNG_STIR | sys::RNG_SELFTEST => CAP_RNG,
-        _ => 0,
-    }
-}
-
 /// The `nccall` a plugin was killed for making without the capability, if any
 /// (the number plus one; 0 means none).
 static R3_DENIED_CALL: AtomicU64 = AtomicU64::new(0);
@@ -569,28 +549,8 @@ static R3_STACK_SMASHED: AtomicBool = AtomicBool::new(false);
 /// [`Violation`] as a byte, 0 for none.
 static R3_VIOLATION: AtomicU8 = AtomicU8::new(0);
 
-/// A rule of the `nccall` boundary a plugin broke.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u8)]
-pub enum Violation {
-    /// The stack pointer was outside the plugin's stack: a stack pivot.
-    StackPointer = 1,
-    /// A NanoChronometer-service call from outside the kernel's stubs.
-    UnpinnedSite = 2,
-    /// A return address `SYSRET` could not take (non-canonical, or in the
-    /// kernel's half).
-    ReturnAddress = 3,
-}
-
-impl Violation {
-    pub const fn describe(self) -> &'static str {
-        match self {
-            Violation::StackPointer => "nccall with the stack pointer outside its stack (a stack pivot)",
-            Violation::UnpinnedSite => "a NanoChronometer-service nccall from outside the kernel's stubs",
-            Violation::ReturnAddress => "a nccall whose return address SYSRET cannot take",
-        }
-    }
-}
+/// A rule of the `nccall` boundary a plugin broke (the dispatcher's).
+pub use crate::nccall::Violation;
 
 /// Whether the last ring-3 run was stopped by its stack canary.
 pub fn stack_smashed() -> bool {
@@ -636,69 +596,90 @@ fn violate(v: Violation) -> SyscallRet {
 /// belt to that brace.
 const USER_LIMIT: u64 = 0x0000_8000_0000_0000;
 
+/// `nc_ring3_syscall`'s call: the frame's registers through the x86-64 map
+/// to the dispatcher, and its answer back into RAX, RDX and RFLAGS.CF.
 extern "C" fn dispatch(frame: &mut SyscallFrame) -> SyscallRet {
+    use crate::nccall::{hal, Ending};
     R3_CALLS.fetch_add(1, Ordering::Relaxed);
+    // SYSRET's own hazard: nothing the dispatcher could know about.
     if frame.rip >= USER_LIMIT {
         return violate(Violation::ReturnAddress);
     }
-    // OpenBSD's rule: a system call is made on the program's own stack, or
-    // the program is not what it was.
-    let (sbase, slen) = user_stack();
-    if !(sbase as u64..=(sbase + slen) as u64).contains(&frame.rsp) {
-        return violate(Violation::StackPointer);
-    }
-    let nr = frame.nr as u32;
-    if frame.nr > u32::MAX as u64 {
-        return unwind(u64::MAX);
-    }
-    match nr::class(nr) {
-        nr::CLASS_NC => {
-            // The plugin cannot write the shared page while it runs, so a
-            // `syscall` there is one the kernel wrote.
-            let site = frame.rip.wrapping_sub(2) as usize;
-            let (hbase, hlen) = user_shared();
-            if !(hbase..hbase + hlen).contains(&site) {
-                return violate(Violation::UnpinnedSite);
-            }
-            let value = nc_service(nr, &frame.args);
-            frame.rflags &= !RFLAGS_CF;
-            SyscallRet { rax: value, rdx: 0 }
+    let map = &hal::X86_64;
+    let mut regs = [frame.nr, frame.args[0], frame.args[1], frame.args[2], frame.args[3], frame.args[4], frame.args[5]]
+        .map(|w| w as usize);
+    // The `syscall` is the two bytes before the return address.
+    let call = hal::read(map, &regs, frame.rip.wrapping_sub(2) as usize, frame.rsp as usize);
+    let mut rflags = frame.rflags as usize;
+    match hal::answer(map, crate::nccall::dispatch_current(&call), &mut regs, &mut rflags) {
+        None => {
+            frame.rflags = rflags as u64;
+            SyscallRet { rax: regs[map.ret[0]] as u64, rdx: regs[map.ret[1]] as u64 }
         }
-        nr::CLASS_POSIX => match posix(nr, &frame.args) {
-            Ok((rax, rdx)) => {
-                frame.rflags &= !RFLAGS_CF;
-                SyscallRet { rax, rdx }
-            }
-            Err(e) => {
-                frame.rflags |= RFLAGS_CF;
-                SyscallRet { rax: e.get() as u64, rdx: 0 }
-            }
-        },
-        _ => unwind(u64::MAX),
+        Some(Ending::Exit(code)) => unwind(code),
+        // Recorded by `Ring3::ended`.
+        Some(_) => unwind(u64::MAX),
     }
 }
 
-/// A class-0 call: one `NcApi` service. Unknown numbers end the plugin (the
-/// default FreeBSD gives `SIGSYS`); so does a service it did not declare.
-fn nc_service(num: u32, a: &[u64; 6]) -> u64 {
+/// A ring-3 plugin as a caller: its arena, stack and heap are its memory,
+/// its stack is checked at every call, class-0 calls come from the stubs in
+/// the shared page, and the services are `NcApi`'s.
+struct Ring3;
+
+impl crate::nccall::Caller for Ring3 {
+    fn caps(&self) -> u32 {
+        crate::ncplu::granted_caps()
+    }
+    fn console(&mut self, bytes: &[u8]) -> Result<(), nanochrono_sys::Errno> {
+        crate::nccall::console(bytes);
+        Ok(())
+    }
+    fn random(&mut self, out: &mut [u8], mode: nanochrono_core::rng::Mode) -> Option<usize> {
+        crate::nccall::random(out, mode)
+    }
+    fn owns(&self, ptr: usize, len: usize) -> bool {
+        user_owns(ptr, len)
+    }
+    fn stack(&self) -> Option<(usize, usize)> {
+        Some(user_stack())
+    }
+    fn pinned(&self, site: usize) -> bool {
+        // The plugin cannot write the shared page while it runs, so a
+        // `syscall` there is one the kernel wrote.
+        let (base, len) = user_shared();
+        (base..base + len).contains(&site)
+    }
+    fn service(&mut self, num: u32, a: &[usize; 6]) -> Option<usize> {
+        nc_service(num, a)
+    }
+    fn now_ns(&self) -> Option<u64> {
+        Some(crate::ncplu::nc_timer_ticks_to_ns(crate::ncplu::nc_timer_now()))
+    }
+    fn map_anon(&mut self, len: usize) -> Result<usize, Errno> {
+        heap_alloc(len)
+    }
+    fn unmap(&mut self, addr: usize, len: usize) -> Result<(), Errno> {
+        heap_munmap(addr, len)
+    }
+    fn ended(&mut self, why: crate::nccall::Ending) {
+        use crate::nccall::Ending;
+        match why {
+            Ending::StackSmashed => R3_STACK_SMASHED.store(true, Ordering::Relaxed),
+            Ending::Denied(num) => R3_DENIED_CALL.store(num as u64 + 1, Ordering::Relaxed),
+            Ending::Violation(v) => R3_VIOLATION.store(v as u8, Ordering::Relaxed),
+            Ending::Exit(_) | Ending::Unknown(_) => {}
+        }
+    }
+}
+
+/// A class-0 service, once the dispatcher has checked the site, the canary
+/// and the capability: one `NcApi` function. `None` for a number there is no
+/// service behind.
+fn nc_service(num: u32, a: &[usize; 6]) -> Option<usize> {
     use crate::ncplu;
-    // Its canary changed: the plugin's stack is corrupt, so it is ended here,
-    // before its return address is ever used. No capability: always allowed.
-    if num == sys::STACK_CHK_FAIL {
-        R3_STACK_SMASHED.store(true, Ordering::Relaxed);
-        return unwind(u64::MAX).rax;
-    }
-    // A call to a service the plugin did not declare ends it: an unsigned
-    // plugin reaching past what it asked for is misbehaving, and this is the
-    // capability wall the plugin cannot talk its way around.
-    let cap = cap_of(num);
-    if cap != 0 && !ncplu::cap_granted(cap) {
-        R3_DENIED_CALL.store(num as u64 + 1, Ordering::Relaxed);
-        return unwind(u64::MAX).rax;
-    }
-    let [a1, a2, a3, a4, a5, _] = *a;
-    match num {
-        sys::EXIT => unwind(a1).rax,
+    let [a1, a2, a3, a4, a5, _] = a.map(|w| w as u64);
+    let value = match num {
         sys::FILL_RECT => {
             ncplu::nc_fill_rect(a1 as i32, a2 as i32, a3 as i32, a4 as i32, a5 as u32);
             0
@@ -740,84 +721,27 @@ fn nc_service(num: u32, a: &[u64; 6]) -> u64 {
             0
         }
         sys::RNG_SELFTEST => crate::rng::nc_rng_selftest() as u32 as u64,
-        _ => unwind(u64::MAX).rax,
-    }
+        _ => return None,
+    };
+    Some(value as usize)
 }
 
-/// A class-1 call. What exists is served; the rest is `ENOSYS`, so a library
-/// can probe. A call outside the capability groups the plugin declared is
-/// refused with `ENOTCAPABLE` — Capsicum's answer, where a class-0 service
-/// ends the plugin instead.
-fn posix(num: u32, a: &[u64; 6]) -> Result<(u64, u64), Errno> {
-    use crate::ncplu::{self, CAP_LOG, CAP_RNG, CAP_TIMER};
-    use nr::posix;
-    let need = |cap: u32| if ncplu::cap_granted(cap) { Ok(()) } else { Err(Errno::ENOTCAPABLE) };
-    match num {
-        posix::EXIT => Ok((unwind(a[0] as i32 as i64 as u64).rax, 0)),
-        // The plugin is the only process there is.
-        posix::GETPID => Ok((1, 0)),
-        posix::WRITE => {
-            let (fd, buf, len) = (a[0] as i32, a[1] as usize, a[2] as usize);
-            if fd != 1 && fd != 2 {
-                return Err(Errno::EBADF);
-            }
-            need(CAP_LOG)?;
-            if len == 0 {
-                return Ok((0, 0));
-            }
-            // A short write is a write: at most 4 KiB per call, as the
-            // console takes them.
-            let len = len.min(4096);
-            if !user_owns(buf, len) {
-                return Err(Errno::EFAULT);
-            }
-            // SAFETY: the range is the plugin's own memory (checked above).
-            let bytes = unsafe { core::slice::from_raw_parts(buf as *const u8, len) };
-            crate::serial::write_uart_only(bytes);
-            Ok((len as u64, 0))
-        }
-        posix::MMAP => heap_mmap(a).map(|p| (p as u64, 0)),
-        posix::MUNMAP => heap_munmap(a[0] as usize, a[1] as usize).map(|()| (0, 0)),
-        posix::CLOCK_GETTIME => {
-            need(CAP_TIMER)?;
-            let (clock, out) = (a[0] as u32, a[1] as usize);
-            if clock != nr::clock::MONOTONIC && clock != nr::clock::UPTIME {
-                // No wall clock until the RTC is read: CLOCK_REALTIME is not
-                // one this kernel has.
-                return Err(Errno::EINVAL);
-            }
-            if !user_owns(out, core::mem::size_of::<nr::Timespec>()) {
-                return Err(Errno::EFAULT);
-            }
-            let ns = ncplu::nc_timer_ticks_to_ns(ncplu::nc_timer_now());
-            let ts = nr::Timespec { tv_sec: (ns / 1_000_000_000) as i64, tv_nsec: (ns % 1_000_000_000) as i64 };
-            // SAFETY: the plugin's own memory, sized for one Timespec.
-            unsafe { core::ptr::write_unaligned(out as *mut nr::Timespec, ts) };
-            Ok((0, 0))
-        }
-        posix::GETRANDOM => {
-            need(CAP_RNG)?;
-            let (buf, len, flags) = (a[0] as usize, a[1] as usize, a[2] as u32);
-            if flags & !(nr::grnd::NONBLOCK | nr::grnd::RANDOM | nr::grnd::INSECURE) != 0 {
-                return Err(Errno::EINVAL);
-            }
-            let len = len.min(crate::rng::NC_RNG_MAX_FILL);
-            if len == 0 {
-                return Ok((0, 0));
-            }
-            if !user_owns(buf, len) {
-                return Err(Errno::EFAULT);
-            }
-            // GRND_RANDOM asks for NC_RNG's TRUE mode, a fresh seed per block.
-            let mode = (flags & nr::grnd::RANDOM != 0) as u32;
-            let n = crate::rng::nc_rng_fill(buf as *mut u8, len, mode);
-            if n < 0 {
-                return Err(if flags & nr::grnd::NONBLOCK != 0 { Errno::EAGAIN } else { Errno::EIO });
-            }
-            Ok((n as u64, 0))
-        }
-        _ => Err(Errno::ENOSYS),
-    }
+/// One call through the SYSCALL glue with a frame built here, answered for
+/// whoever is being served: the boot-time proof of the glue (`nccall::hal`).
+/// The trap itself is proven from ring 3 by [`prove_red_zone`].
+pub fn glue_once(num: u32, a: [usize; 6]) -> (usize, usize, bool) {
+    let (sbase, slen) = user_stack();
+    let mut frame = SyscallFrame {
+        nr: num as u64,
+        args: a.map(|w| w as u64),
+        rflags: 2,
+        rip: 0x1000,
+        rsp: (sbase + slen / 2) as u64,
+    };
+    let ret = dispatch(&mut frame);
+    // Nothing ran to be ended; a stray ending must not reach the next run.
+    NC_R3_UNWIND.store(0, Ordering::Relaxed);
+    (ret.rax as usize, ret.rdx as usize, frame.rflags & RFLAGS_CF != 0)
 }
 
 // ---------------------------------------------------------------------------
@@ -841,30 +765,11 @@ fn heap_set(page: usize, on: bool) {
     }
 }
 
-/// `mmap(addr, len, prot, flags, fd, pgoff)`: anonymous, private, readable
-/// and writable memory, zeroed. Everything else is refused with the errno
-/// FreeBSD gives it. The pages stay mapped user in 2 MiB granularity until
-/// the run ends; `munmap` returns them to the pool, it does not unmap them.
-fn heap_mmap(a: &[u64; 6]) -> Result<usize, Errno> {
-    use nr::{map, prot};
-    let (len, prot_bits, flags, fd, pgoff) = (a[1] as usize, a[2] as u32, a[3] as u32, a[4] as i32, a[5]);
-    if len == 0 || flags & map::FIXED != 0 {
-        return Err(Errno::EINVAL);
-    }
-    if flags & map::ANON == 0 || fd != -1 || pgoff != 0 {
-        // No file can be mapped: there is no file descriptor table yet.
-        return Err(Errno::ENOTSUP);
-    }
-    if flags & (map::SHARED | map::PRIVATE) == 0 {
-        return Err(Errno::EINVAL);
-    }
-    if prot_bits & prot::EXEC != 0 {
-        // The pool is data: W^X for everything a plugin maps.
-        return Err(Errno::EACCES);
-    }
-    if prot_bits & !(prot::READ | prot::WRITE) != 0 {
-        return Err(Errno::EINVAL);
-    }
+/// `mmap`'s memory, once the dispatcher has checked the request (anonymous,
+/// private, readable and writable, never executable): `len` bytes from the
+/// pool, zeroed. The pages stay mapped user in 2 MiB granularity until the
+/// run ends; `munmap` returns them to the pool, it does not unmap them.
+fn heap_alloc(len: usize) -> Result<usize, Errno> {
     let pages = len.div_ceil(HEAP_PAGE);
     if pages > HEAP_PAGES {
         return Err(Errno::ENOMEM);
@@ -1151,7 +1056,8 @@ pub unsafe fn run(entry: usize, api_user: usize) -> Outcome {
 
     // SAFETY: entry, stack and api are all user-mapped; nc_ring3_enter drops to
     // ring 3 and returns via nc_ring3_return when the plugin exits or faults.
-    let code = unsafe { nc_ring3_enter(entry, rsp, api_user) } as i32;
+    // Every nccall the plugin makes is answered for it (crate::nccall).
+    let code = crate::nccall::serve(&mut Ring3, || unsafe { nc_ring3_enter(entry, rsp, api_user) }) as i32;
 
     // SAFETY: single core.
     let fault = unsafe { *core::ptr::addr_of!(R3_FAULT) };

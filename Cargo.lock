@@ -2159,6 +2159,7 @@ name = "nanochrono-core"
 version = "4.0.0"
 dependencies = [
  "libc",
+ "nanochrono-sys",
  "windows-sys 0.61.2",
 ]
 

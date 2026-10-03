@@ -24,9 +24,13 @@
 use core::arch::asm;
 
 macro_rules! entry_asm {
-    ($store:literal, $stride:literal, $fcsr:literal) => {
+    ($store:literal, $load:literal, $stride:literal, $fcsr:literal) => {
         concat!(
             r#"
+.equ NC_REG, "#, $stride, r#"
+.equ NC_FRAME, ((33 * NC_REG) + 15) & ~15
+.equ NC_LAUNCH, ((14 * NC_REG) + 15) & ~15
+
 .section .text.boot, "ax"
 .global _start
 _start:
@@ -63,15 +67,21 @@ _start:
 // ---------------------------------------------------------------------------
 // The trap vector (direct mode: every trap lands here).
 //
-// Every trap is fatal except one: an illegal instruction at one of the
-// counter probe sites below, which is how the PMU driver learns whether
-// firmware let S-mode read `cycle` and `instret`. There the handler steps
-// over the 4-byte `csrr`, reports failure in a1, and returns.
+// Two traps return. An `ecall` from U-mode is nccall: answered by the
+// dispatcher through `nanochrono_nccall_riscv` (src/nccall/hal.rs). An
+// illegal instruction at one of the counter probe sites below is how the
+// PMU driver learns whether firmware let S-mode read `cycle` and `instret`:
+// the handler steps over the 4-byte `csrr`, reports failure in a1, and
+// returns. Any other trap from U-mode ends that U-mode run; any other trap
+// from S-mode is fatal.
 // ---------------------------------------------------------------------------
 .section .text.nc_trap, "ax"
 .balign 4
 nc_trap_entry:
     csrw sscratch, t0
+    csrr t0, scause
+    addi t0, t0, -8
+    beqz t0, nc_rv_ecall
     csrr t0, scause
     xori t0, t0, 2
     bnez t0, 9f
@@ -89,7 +99,11 @@ nc_trap_entry:
     csrr t0, sscratch
     sret
 
-9:  // Fatal: a private stack (the fault may have been a stack overflow).
+9:  // From U-mode (sstatus.SPP clear): that run ends, the kernel goes on.
+    csrr t0, sstatus
+    andi t0, t0, 0x100
+    beqz t0, nc_rv_user_fault
+    // Fatal: a private stack (the fault may have been a stack overflow).
     la sp, nc_exc_stack_top
     csrr a0, scause
     csrr a1, sepc
@@ -97,6 +111,104 @@ nc_trap_entry:
     call nanochrono_riscv_exception
 4:  wfi
     j 4b
+
+// nccall from U-mode. Onto the kernel's own stack before anything is
+// stored — the caller's stack is never written — then the frame the glue
+// reads: x0..x31 (x2 the caller's stack pointer, x5 from sscratch) and
+// sepc. The glue writes a0, a1 and t0 and moves sepc past the ecall, or
+// asks for the run to end.
+nc_rv_ecall:
+    la t0, nc_rv_user_sp
+    "#, $store, r#" sp, 0(t0)
+    la sp, nc_rv_nccall_stack_top
+    addi sp, sp, -NC_FRAME
+    .irp r, 1,3,4,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31
+    "#, $store, r#" x\r, (\r*NC_REG)(sp)
+    .endr
+    csrr t0, sscratch
+    "#, $store, r#" t0, (5*NC_REG)(sp)
+    la t0, nc_rv_user_sp
+    "#, $load, r#" t0, 0(t0)
+    "#, $store, r#" t0, (2*NC_REG)(sp)
+    csrr t0, sepc
+    "#, $store, r#" t0, (32*NC_REG)(sp)
+    mv a0, sp
+    call nanochrono_nccall_riscv
+    bnez a0, nc_rv_end_run
+    "#, $load, r#" t0, (32*NC_REG)(sp)
+    csrw sepc, t0
+    .irp r, 1,3,4,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31
+    "#, $load, r#" x\r, (\r*NC_REG)(sp)
+    .endr
+    "#, $load, r#" t0, (5*NC_REG)(sp)
+    "#, $load, r#" sp, (2*NC_REG)(sp)
+    sret
+
+// The U-mode run ends: back to whoever called nc_rv_user_run, with a0 = 0
+// after an exit the glue answered, 1 after any other trap from U-mode.
+nc_rv_user_fault:
+    li a0, 1
+    j 7f
+nc_rv_end_run:
+    li a0, 0
+7:  la t0, nc_rv_kernel_sp
+    "#, $load, r#" sp, 0(t0)
+    "#, $load, r#" ra, (0*NC_REG)(sp)
+    "#, $load, r#" s0, (1*NC_REG)(sp)
+    "#, $load, r#" s1, (2*NC_REG)(sp)
+    "#, $load, r#" s2, (3*NC_REG)(sp)
+    "#, $load, r#" s3, (4*NC_REG)(sp)
+    "#, $load, r#" s4, (5*NC_REG)(sp)
+    "#, $load, r#" s5, (6*NC_REG)(sp)
+    "#, $load, r#" s6, (7*NC_REG)(sp)
+    "#, $load, r#" s7, (8*NC_REG)(sp)
+    "#, $load, r#" s8, (9*NC_REG)(sp)
+    "#, $load, r#" s9, (10*NC_REG)(sp)
+    "#, $load, r#" s10, (11*NC_REG)(sp)
+    "#, $load, r#" s11, (12*NC_REG)(sp)
+    "#, $load, r#" t0, (13*NC_REG)(sp)
+    csrw satp, t0
+    sfence.vma
+    addi sp, sp, NC_LAUNCH
+    ret
+
+// nc_rv_user_run(entry, stack_top, arg): the self-test's way into U-mode.
+// The kernel's callee-saved registers and stack pointer are kept for the
+// way back; sret then enters `entry(arg)` in U-mode on `stack_top`, with
+// interrupts off (sie is all clear). It returns when the run ends.
+// Translation is off for the run: the identity map's pages are S-mode's (no
+// U bit), and Bare gives U-mode the same addresses with only the firmware's
+// PMP over them. satp is put back on the way out.
+.global nc_rv_user_run
+nc_rv_user_run:
+    addi sp, sp, -NC_LAUNCH
+    "#, $store, r#" ra, (0*NC_REG)(sp)
+    "#, $store, r#" s0, (1*NC_REG)(sp)
+    "#, $store, r#" s1, (2*NC_REG)(sp)
+    "#, $store, r#" s2, (3*NC_REG)(sp)
+    "#, $store, r#" s3, (4*NC_REG)(sp)
+    "#, $store, r#" s4, (5*NC_REG)(sp)
+    "#, $store, r#" s5, (6*NC_REG)(sp)
+    "#, $store, r#" s6, (7*NC_REG)(sp)
+    "#, $store, r#" s7, (8*NC_REG)(sp)
+    "#, $store, r#" s8, (9*NC_REG)(sp)
+    "#, $store, r#" s9, (10*NC_REG)(sp)
+    "#, $store, r#" s10, (11*NC_REG)(sp)
+    "#, $store, r#" s11, (12*NC_REG)(sp)
+    csrr t0, satp
+    "#, $store, r#" t0, (13*NC_REG)(sp)
+    csrw satp, zero
+    sfence.vma
+    la t0, nc_rv_kernel_sp
+    "#, $store, r#" sp, 0(t0)
+    csrw sepc, a0
+    // sstatus.SPP (bit 8) and SPIE (bit 5) clear: sret enters U-mode with
+    // interrupts off.
+    li t0, 0x120
+    csrc sstatus, t0
+    mv sp, a1
+    mv a0, a2
+    sret
 
 // Probes: a0 = the counter's low word, a1 = 1 if it was readable.
 .section .text.nc_probe, "ax"
@@ -131,18 +243,27 @@ nc_stack_top:
 nc_exc_stack_bottom:
     .skip 16384
 nc_exc_stack_top:
+.balign 16
+nc_rv_nccall_stack_bottom:
+    .skip 16384
+nc_rv_nccall_stack_top:
+.balign 8
+nc_rv_user_sp:
+    .skip 8
+nc_rv_kernel_sp:
+    .skip 8
 "#
         )
     };
 }
 
 #[cfg(target_arch = "riscv64")]
-core::arch::global_asm!(entry_asm!("sd", "8", "csrw fcsr, zero"));
+core::arch::global_asm!(entry_asm!("sd", "ld", "8", "csrw fcsr, zero"));
 
 // RV32 is built as `imac` here: no F, so no `fcsr` to clear (writing it
 // would be an illegal instruction), and 4-byte stores.
 #[cfg(target_arch = "riscv32")]
-core::arch::global_asm!(entry_asm!("sw", "4", ""));
+core::arch::global_asm!(entry_asm!("sw", "lw", "4", ""));
 
 extern "C" {
     fn nc_rv_try_cycle() -> ProbeResult;

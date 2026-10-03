@@ -56,7 +56,7 @@ pub mod boot;
 pub mod cli;
 /// The system's settings (NCVBS, ring-0 community code, the wallpaper).
 pub mod config;
-/// The NanoChronometer Desktop Experience (`mode=desktop`).
+/// The NanoChronometer GUI (`mode=gui`, the default session).
 pub mod desktop;
 /// The terminal's monospaced face.
 pub mod fonts;
@@ -191,6 +191,9 @@ pub mod ncplu;
 /// its signature tier (✅ Official / 🌳 Community), or why it was refused.
 #[cfg(target_arch = "x86_64")]
 pub mod plugin_card;
+/// `nccall`, the kernel's one system call: the dispatcher every
+/// architecture's trap reaches, and each one's glue (`nccall::hal`).
+pub mod nccall;
 /// x86_64 only: ring 3 for community plugins — the GDT user segments, the
 /// user page mapping, SYSCALL/SYSRET (`nccall`) and fault containment.
 #[cfg(target_arch = "x86_64")]
