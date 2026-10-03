@@ -133,6 +133,20 @@ rules the code relies on:
   RISC-V proves it from U-mode (`nc_rv_user_run`, `satp` Bare for the run);
   QEMU's RV32 OpenSBI is not in every distribution — build one
   (`make LLVM=1 PLATFORM=generic PLATFORM_RISCV_XLEN=32`) and pass `-bios`.
+- Physical pages: `nanochrono-core::frames` (host-tested) under the
+  kernel's `src/palloc.rs`, fed the multiboot memory map with the image, the
+  loader's tables and the modules reserved; x86 only so far, below the
+  cached first GiB on x86_64. What uses it: back buffers and desktop
+  surfaces past the static 1920×1200 pools, and driver modules.
+- Drivers (`.ncdri`, docs/NCDRI.md): loaded at boot on x86_64 by
+  `src/ncdri.rs` from `/boot/drivers/` — signed for ring 0, or unsigned with
+  `ncdri.community=on`. `make -C sdk drivers` builds and packs them;
+  `NCDRI_EXTRA=sdk/build/<mode>/drivers/QEMU_STDVGA.NCDRI build.sh boot
+  x86_64 ncdri.community=on` boots one. The display driver's test is a
+  monitor with an EDID: `-vga none -device VGA,edid=on,xres=3840,yres=2160,vgamem_mb=64`
+  (`nanochrono-core::edid` parses it, DisplayID included). A driver links
+  nothing: an initializer that zeroes a struct is a `memset` call the
+  packer refuses — use `ncdri_k->memset`.
 - Every inline `nccall` asm block is `options(nostack)`, so the compiler
   keeps using the red zone around it, except i386's, which pushes its
   arguments onto the stack.

@@ -6,16 +6,20 @@ loads on every kernel of the same major version, and a kernel update never
 breaks a driver it has not changed the meaning of.
 
 The interface is one public header, [`sdk/include/ncdri_api.h`](../sdk/include/ncdri_api.h);
-the example is [`sdk/drivers/hello_ncdri.c`](../sdk/drivers/hello_ncdri.c);
-`make -C sdk drivers` builds it for every architecture. Ring-0 code shares
-the red-zone rules of [NCCALL.md](NCCALL.md) §2.
+the drivers are [`sdk/drivers/hello_ncdri.c`](../sdk/drivers/hello_ncdri.c)
+(the example) and [`sdk/drivers/qemu_stdvga.c`](../sdk/drivers/qemu_stdvga.c)
+(the first display driver); `make -C sdk drivers` builds them for every
+architecture. The kernel's side is [`src/ncdri.rs`](../crates/nanochrono-baremetal/src/ncdri.rs).
+Ring-0 code shares the red-zone rules of [NCCALL.md](NCCALL.md) §2.
 
 | Piece | Status |
 |---|---|
-| `ncdri_api.h`: the tables, handles, versioning, layout pins | **done** (compiles for all nine architectures, `-Wall -Wextra -Werror`) |
+| `ncdri_api.h`: the tables, handles, versioning, layout pins | **done** (compiles for all nine architectures, `-Wall -Wextra -Werror`); minor 1 adds the display services (§9) |
 | Build rules, `tools/check-redzone.py` on every object | **done** |
 | Packing (`tools/ncplu.py pack --kind driver --entry ncdri_main`) | **done** for x86-64 (the packer's relocations are x86-64's) |
-| The kernel side: `nckernel_api_t` implemented, `.ncdri` loaded at boot | planned — waits on the physical page allocator (SYSTEM.md §4) |
+| The kernel side: `nckernel_api_t`, the trust gate, `.ncdri` loaded at boot, PCI probe/attach | **done** on x86-64 (`src/ncdri.rs`, on the page allocator `src/palloc.rs`) |
+| Interrupts for drivers, a saved FPU context, unloading, newbus beyond PCI | planned (§7) |
+| `qemu_stdvga.c`: EDID → the monitor's native mode, the scanout to the kernel | **done** (§9) |
 
 ---
 
@@ -157,28 +161,62 @@ which saves whatever context those registers belonged to and restores it
 afterwards (`fpu_kern_enter`/`fpu_kern_leave`). `NCDRI_FPU_NOCTX` skips the
 save and disables preemption instead, for short sections.
 
-## 7. Loading — planned
+## 7. Loading — done on x86-64
 
-What the loader will do, in the order the kernel's module loader already does
-it for apps (`ncplu.rs`):
+The kernel's loader (`src/ncdri.rs`) takes every module the boot loader
+placed under `/boot/drivers/` (`NCDRI_EXTRA=` puts SDK-built ones on the ISO,
+`packaging/baremetal/build.sh`), in the order the app launcher already uses:
 
-1. **Read and verify.** `.ncdri` is `Kind::Driver` in the module format
-   (NCPKG.md §1). Ring 0 is signed work: the creator-ring0 or verify-ring0
-   role, or the owner's community switch (ECOSYSTEM.md §3). An unsigned
-   driver is refused by default.
-2. **Inspect.** Imports must be exactly the canary pair — anything else is a
-   kernel symbol, which this ABI does not have. The module's flag says it was
-   built for ring 0 (no red zone); a module built for a ring-3 target is
-   refused (NCCALL.md §2.4).
-3. **Relocate** into memory from the page allocator, text read-only and
-   executable, data non-executable.
-4. **Call `ncdri_main(&nckernel_api, sizeof nckernel_api)`.**
-5. **Match**: for every device a bus enumerates (PCI, ACPI, FDT, USB), each
-   registered driver's `probe` is offered an `ncdri_devinfo_t`; the best
-   offer (`NCDRI_PROBE_*`) wins and gets `attach` with a zeroed softc of
-   `softc_size`.
-6. **Unload** (if `ncdri_fini` exists): `detach` on every device, then
-   `ncdri_fini`, then the memory goes.
+1. **Read and verify** with the launcher's checks (`ncplu::inspect`): the
+   format, the architecture, the digest, the hybrid signature.
+2. **Trust.** Ring 0 is signed work. A module signed by a root the kernel
+   trusts for ring 0 loads; an unsigned or untrusted one is refused, unless
+   the machine's owner has turned on *Enable Ring0 Community Modules and
+   Drivers* (ECOSYSTEM.md §3) — for one boot, `ncdri.community=on` on the
+   kernel command line. Off by default:
+
+   ```
+   ncdri: /boot/drivers/QEMU_STDVGA.NCDRI: community (not signed)
+   ncdri: /boot/drivers/QEMU_STDVGA.NCDRI: refused: a ring-0 driver must be signed for ring 0; ncdri.community=on allows an unsigned one for this boot
+   ```
+
+   `NCPLU_SIGN_KEYS` signs the drivers on the ISO with the apps, and a
+   kernel built with the matching `NCPLU_ROOT_CREATOR` loads them as
+   `creator` without the switch.
+3. **Inspect.** It must be `Kind::Driver`, and its only imports the stack
+   canary pair (resolved to a driver-wide random guard and a
+   `__stack_chk_fail` that stops the kernel: a corrupt ring-0 stack has
+   nothing to unwind to).
+4. **Place** in pages from the allocator, relocated with the launcher's own
+   code (`ncplu::copy_and_relocate`). The boot page tables map all RAM
+   writable and executable with 1 GiB and 2 MiB pages, so the module's text
+   is not made read-only nor its data non-executable yet; per-page W^X for
+   modules comes with 4 KiB mappings.
+5. **`ncdri_main(&table, sizeof table)`**, with a table of the module's own
+   (its `self`). An error unloads it again.
+6. **Match**: every PCI device the kernel does not drive itself (bridges and
+   USB host controllers are its own) is offered to each registered driver's
+   `probe` with its `ncdri_devinfo_t`; the best offer gets `attach` with a
+   zeroed softc. A failed attach gets everything back — windows, DMA memory,
+   softc — even what the driver forgot to undo.
+
+Every handle a driver holds is a pointer into one of the kernel's fixed
+pools; each call checks that it names a live entry before using it, and
+every register access is bounds- and alignment-checked against the window
+the kernel sized. A driver is ring-0 code and could ignore all of this with
+its own instructions; the checks are there so a *buggy* driver fails
+loudly instead of corrupting memory quietly.
+
+What is not there yet, and what a driver gets instead:
+
+| Service | Today |
+|---|---|
+| `irq_establish` | `NCDRI_ENOTSUP`: the kernel runs with interrupts masked; a driver polls |
+| `fpu_alloc` | `NCDRI_ENOTSUP`; `fpu_begin(NULL, NCDRI_FPU_NOCTX)` works (it saves MXCSR and the x87 control word) |
+| DMA | memory below 1 GiB, coherent; the bus address is the physical one (no IOMMU programmed) |
+| Unloading (`ncdri_fini`) | not done: a boot driver stays |
+| Buses | PCI; ACPI, FDT and USB devices are not offered yet |
+| Architectures | x86-64; the others need the packer's relocations and big-endian accessors (PCI is little-endian) |
 
 ## 8. The example
 
@@ -187,5 +225,48 @@ it for apps (`ncplu.rs`):
 inverse of what is written), allocates a coherent DMA buffer below 4 GiB,
 establishes its interrupt, turns bus mastering on, and undoes every step in
 `detach`. It shows a newer service used only when `NCDRI_HAS` says the
-kernel has it. When the loader exists, `qemu-system-x86_64 -device edu` is
-its test.
+kernel has it. Under `qemu-system-x86_64 -device edu` it maps the window,
+passes the liveness check, takes its DMA buffer — and stops at
+`irq_establish`, which says `ENOTSUP` today, so the attach fails and the
+kernel takes the rest back:
+
+```
+ncdri: edu0: attach failed (ENOTSUP, 45) at PCI 00:04.0 (1234:11e8)
+```
+
+## 9. Display drivers (minor 1)
+
+Two services, from `reserved[]` slots — the table keeps its size, and a
+minor-0 driver never sees them:
+
+* `display_scanout(dev, &scanout, edid, edid_len)`: a driver that has set a
+  mode says where the picture is — which memory window of its device (a
+  BAR, by `resource_map` index), where in it, its width, height, pitch and
+  format (`NCDRI_FORMAT_XRGB8888` today). The kernel maps the window itself,
+  checks the surface lies inside it, gives it a back buffer of its size, and
+  the session draws there instead of on the firmware's framebuffer. The
+  EDID, when given, names the monitor in the log.
+* `edid_preferred(edid, len, &w, &h, &refresh_mhz)`: the monitor's native
+  mode, through the kernel's parser (`nanochrono_core::edid`, host-tested):
+  the base block's first detailed timing, or a DisplayID extension's
+  preferred timing when the mode's pixel clock does not fit a descriptor
+  (4K above 60 Hz, 5K, 8K).
+
+`qemu_stdvga.c` is the first user: QEMU's and Bochs' standard VGA (PCI
+1234:1111). It reads the EDID out of BAR 2, asks the kernel for the native
+mode, checks it against the VRAM and the largest mode the device reports,
+sets it through the Bochs "dispi" registers, and hands over BAR 0 as the
+scanout — written from QEMU's own description of the device
+(`docs/specs/standard-vga.rst` in QEMU), not from another driver.
+
+```
+ncdri: stdvga0: EDID native mode 2560x1440 at 74 Hz; 32 MiB of VRAM, at most 16000x12000
+ncdri: stdvga0: native mode set; scanout handed to the kernel
+ncdri: stdvga0: attached at PCI 00:03.0 (1234:1111)
+display: monitor QEMU Monitor (RHT), native 2560x1440 at 74.998 Hz
+display: 2560x1440 from stdvga0, composited
+```
+
+A native driver for real hardware — Intel, AMD, NVIDIA — is the same shape
+with a larger middle: its own EDID over DDC (GMBUS, the DisplayPort AUX
+channel), its own modeset, and the same two calls at the ends.

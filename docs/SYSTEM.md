@@ -84,7 +84,10 @@ The sequence (⇒ = done today):
 ```
 firmware ⇒ GRUB (multiboot2) ⇒ nckernel entry (boot32.S / arch entry)
   ⇒ cpu_control: enable the features the ISA actually has (§6)
-  ⇒ framebuffer, serial, input, counters, PMU, NC_RNG
+  ⇒ palloc: physical pages from the loader's memory map
+  ⇒ framebuffer (its back buffer), serial, input, counters, PMU, NC_RNG
+  ⇒ ncdri: /boot/drivers/*.ncdri checked, loaded, attached (x86-64);
+       a display driver's screen replaces the firmware's
   ⇒ vfs::init: built-in files, /proc, /dev, loader modules,
        ncinitramdisk (seal judged, files BLAKE3-checked)
   ⇒ session::start(mode=)   [gui (default) | cli | classic]
@@ -124,22 +127,38 @@ state with only these, so they are never modules:
 * **Low-latency input:** USB and PS/2 keyboards, mice, touchpads, I2C-HID
   — **done** (BAREMETAL_DRIVERS.md), the USB HID path adapted from
   OpenBSD `uhidev.c`/`ums.c`/`ukbd.c`.
-* **Display:** the firmware framebuffer (VBE/GOP) — **done**; no vendor GPU
-  driver, by design.
+* **Display:** the firmware framebuffer (VBE/GOP) — **done**. It is what a
+  tower's external monitor runs on, through whichever connector it uses
+  (HDMI, DisplayPort, DVI, VGA): the firmware lights the one with a monitor
+  at power-on and the loader hands the kernel that framebuffer, on any card.
+  A mode past the static back buffer (a 4K monitor) composites from the
+  page allocator — **done**; with no framebuffer at all, the VGA text console
+  (BIOS) and the CLI. No vendor GPU driver here, by design: the firmware's
+  mode is the generic path (BAREMETAL_DRIVERS.md). One trap is the
+  machine's, not the kernel's: with a graphics card installed, firmware
+  usually switches the motherboard's own outputs off, so the cable goes in
+  the card.
 * **Network:** a generic low-latency WiFi path and common wired NICs, for
   the installer and updates.
 
 **Non-essential — `.ncdri` modules, loadable into Ring 0.** Everything a
 particular machine may want but need not boot with: Intel ME/HECI, Android
-MTP, Wiimotes, Blu-ray, and read/write drivers for foreign filesystems
-(ext4, btrfs, NTFS). An `.ncdri` is the flat module format (NCPKG.md §1):
-no `MODULE_LICENSE` header is required, and a module without one is
-proprietary, never "tainted". Its binary interface is **done**:
+MTP, Wiimotes, Blu-ray, read/write drivers for foreign filesystems (ext4,
+btrfs, NTFS) — and **native display drivers**, one per GPU family (Intel,
+AMD, NVIDIA; virtio-gpu and VMware's for virtual machines). What a native
+display driver adds over the firmware's mode is the monitor's own: its
+native resolution from its EDID, a mode change after boot, hotplug, several
+monitors. The first, for the standard VGA of QEMU and Bochs
+(`sdk/drivers/qemu_stdvga.c`), is **done**: it reads the EDID, sets the
+native mode and hands the kernel the scanout. An `.ncdri` is the flat
+module format (NCPKG.md §1): no `MODULE_LICENSE` header is required, and a
+module without one is proprietary, never "tainted". Its binary interface:
 [`sdk/include/ncdri_api.h`](../sdk/include/ncdri_api.h) — one versioned
 table of kernel services and opaque handles, no kernel header and no kernel
-symbol, built for all nine ISAs without a red zone (NCDRI.md). Loading an
-`.ncdri` at boot is signed, ring-0 work (trust, below); it is **planned**,
-waiting on the physical page allocator the hypervisor also needs.
+symbol, built for all nine ISAs without a red zone (NCDRI.md). Loading at
+boot is **done on x86-64** (`src/ncdri.rs`), on the physical page
+allocator (`src/palloc.rs`): signed for ring 0, or unsigned with the
+owner's community switch (`ncdri.community=on`), off by default.
 
 ### The driver model — planned, after FreeBSD newbus
 
@@ -335,7 +354,10 @@ stays small.
 | `.ncdri` binary interface (`ncdri_api.h`), red-zone checker | done |
 | `nclibc`, `std` port, `nctoolchain.ncpkg`, OpenSSL/AWS-LC crypto plugins | planned (NCTOOLCHAIN.md) |
 | Codecs: BLAKE3, LZ4, ZSTD, QOI, PNG, DEFLATE | done |
-| Driver loading (`.ncdri` at boot), newbus model | planned |
+| Physical page allocator (x86); back buffers and desktop surfaces past 1920×1200 | done |
+| Driver loading (`.ncdri` at boot, x86-64): trust gate, `nckernel_api_t`, PCI probe/attach | done |
+| Display drivers: QEMU/Bochs standard VGA (EDID → native mode, DisplayID for 4K) | done |
+| Display drivers: Intel, AMD, NVIDIA, virtio-gpu; interrupts for drivers; newbus beyond PCI | planned |
 | Network (TCP/IP, 802.11, pf), zero-click hardening | planned |
 | NCHV, NCVBS, NCTEE | planned |
 | `init.ncapp`, kernel NCFS writer, installer, users | planned |

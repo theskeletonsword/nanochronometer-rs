@@ -11,36 +11,85 @@ side by side.
 
 ---
 
-## Display — generic, and deliberately so
+## Display — generic first, native as a module
 
 **Status: working.** Verified under QEMU with KVM at 1920×1200×32 booted from
-the ISO, and at 800×600×32 on a machine that offers nothing better.
+the ISO, and at 800×600×32 on a machine that offers nothing better; through
+the QEMU/Bochs display driver at the monitor's native 1280×800, 2560×1440
+and 3840×2160 from a BIOS boot, and 2560×1440 from a UEFI one (OVMF).
 
-There is no vendor driver here and there should not be one. The kernel asks
-the loader for a linear framebuffer through the multiboot2 header, and the
-loader gets it from the firmware — VBE on a BIOS machine, GOP on a UEFI one.
-The firmware talks to the card; the kernel gets an address, a pitch, a size
-and a pixel format, and writes pixels.
+The kernel builds in no vendor driver, and should not. It asks the loader
+for a linear framebuffer through the multiboot2 header, and the loader gets
+it from the firmware — VBE on a BIOS machine, GOP on a UEFI one. The
+firmware talks to the card; the kernel gets an address, a pitch, a size and
+a pixel format, and writes pixels.
 
 That **is** the generic path, and it is generic in the way that matters:
 
-| | Firmware framebuffer | Native driver |
+| | Firmware framebuffer (built in) | Native driver (`.ncdri`, docs/NCDRI.md) |
 |---|---|---|
-| Intel integrated | works | needs an i915 driver |
-| AMD integrated / discrete | works | needs an amdgpu driver |
-| NVIDIA discrete | works | needs nouveau or the blob |
-| A card released next year | works | needs a new driver |
+| QEMU / Bochs standard VGA | works | `qemu_stdvga.ncdri` — **done** |
+| Intel integrated | works | an i915-class module — planned |
+| AMD integrated / discrete | works | an amdgpu-class module — planned |
+| NVIDIA discrete | works | nouveau-class, or the vendor's own — planned |
+| A card released next year | works | needs a new module |
 
 A "generic driver for integrated and dedicated cards" that talks to hardware
-directly does not exist, because there is no common register interface to talk
-to. What exists is the firmware's mode-setting interface, which is what this
-uses. The cost is that the mode is fixed at boot and there is no acceleration
-— neither of which matters for drawing a static readout.
+directly does not exist, because there is no common register interface to
+talk to. What exists is the firmware's mode-setting interface, which is what
+the built-in path uses — so it is essential (docs/SYSTEM.md §4), and a native
+driver is not: the machine boots and is usable without one. What a native
+driver adds is the monitor's own: its native resolution from its EDID, a
+mode change after boot, hotplug, more than one monitor.
 
 The one hardware-specific thing the kernel does is map the framebuffer:
 firmware commonly places it high in MMIO space (QEMU's standard VGA lands near
 `0xFD000000`), so `boot32.S` identity-maps the address space the framebuffer
 can appear in, with everything above the first gigabyte marked uncached.
+
+### Towers and external monitors
+
+A tower's monitor works through whichever connector it uses — HDMI,
+DisplayPort, DVI or VGA are all the same to the kernel: the firmware lights
+the output that has a monitor at power-on, and that is the framebuffer the
+loader hands over. What the firmware path cannot do, and the three ways it
+shows on a tower:
+
+* **The card or the board.** With a graphics card installed, firmware usually
+  switches the motherboard's own outputs off. A monitor on those is black
+  from power-on, in every operating system; the cable goes in the card.
+* **A monitor off at power-on.** Nothing re-lights an output after boot
+  without a native driver; DisplayPort in particular is trained once, by the
+  firmware. Turn the monitor on (or select its input) before the machine.
+* **One monitor.** The firmware lights one output; the others stay dark.
+
+### The monitor's native resolution
+
+Only the monitor knows it — its EDID, read over DDC. Two places could read it:
+
+* **The loader.** GRUB's `gfxmode=auto` was tried and is worse here: under
+  UEFI it keeps whatever mode the firmware left (OVMF's is 800×600) rather
+  than reading the EDID, and under SeaBIOS it fell to 800×600 as well. So
+  `grub.cfg` keeps its explicit list (1920×1200 first); on real UEFI hardware
+  the GOP's own mode list is usually filtered by the monitor's EDID, so the
+  first entry the monitor accepts is the one set.
+* **A display driver**, which is how the native mode is reached: the driver
+  reads the EDID from its device, the kernel parses it
+  (`nanochrono_core::edid`: the base block's first detailed timing, and a
+  DisplayID extension's preferred timing for modes whose pixel clock does
+  not fit a descriptor — 4K above 60 Hz, 5K, 8K), the driver sets the mode
+  and hands the kernel the scanout, and the session draws there:
+
+```
+ncdri: stdvga0: EDID native mode 3840x2160 at 75 Hz; 64 MiB of VRAM, at most 16000x12000
+display: monitor QEMU Monitor (RHT), native 3840x2160 at 75.000 Hz
+display: 3840x2160 from stdvga0, composited
+```
+
+Under QEMU: `-vga none -device VGA,edid=on,xres=3840,yres=2160,vgamem_mb=64`,
+with `NCDRI_EXTRA=…/QEMU_STDVGA.NCDRI` on the ISO and `ncdri.community=on` for
+an unsigned build (docs/NCDRI.md §7). The interface draws at 1:1 on every
+mode: at 4K it is small, until a scale setting exists.
 
 ### Getting a mode out of the loader at all
 
@@ -61,9 +110,6 @@ which on a BIOS machine is 800×600 regardless of what the panel can do. The
 mode is not programmed until `boot`, so the `grub.cfg` sets `gfxpayload=keep`
 **after** the `multiboot2` line, which is what sticks.
 
-`gfxmode` carries a preference list rather than `auto` alone, stopping at
-1920×1200 deliberately — see below.
-
 ### The back buffer
 
 Firmware framebuffers are mapped uncached, because MMIO that is cached is MMIO
@@ -78,11 +124,12 @@ That is what makes an animated interface possible here: a full-screen uncached
 redraw on a 1080p panel is tens of milliseconds, and a frame rate in single
 digits is not an animation.
 
-A mode larger than the buffer is not an error. The interface falls back to
-drawing straight onto the device, which works and flickers, and the machine
-card says which of the two is in use. The `gfxmode` list stops at 1920×1200 so
-this fallback is not taken on a laptop that could have composited at a
-slightly smaller mode.
+A larger mode — 2560×1440, 3840×2160 — takes a back buffer of its own size
+from the page allocator (`palloc.rs`: physical pages from the loader's memory
+map, below the cached first gigabyte), and so do the desktop's full-screen
+surfaces that its static pool cannot hold. Only when the allocator has no run
+large enough does the interface draw straight onto the device, which works and
+flickers; the machine card and `/proc/meminfo` say which is in use.
 
 ---
 

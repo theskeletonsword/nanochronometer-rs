@@ -118,7 +118,9 @@ schemes (XMSS, LMS), DSA and anything over SHA-1 or MD5 are refused by name,
 with the reason (docs/NCPKG.md §4).
 
 **Enable Ring0 Community Modules and Drivers**: off by default; without it an
-unsigned or self-signed ring-0 plugin or driver is refused.
+unsigned or self-signed ring-0 plugin or driver is refused. The kernel's
+driver loader reads it, for one boot, from `ncdri.community=on` on the
+command line (docs/NCDRI.md §7); `ncpkg` has its own, for installing.
 
 **No private key is ever in the repository** — not hard-coded, not
 committed: `.gitignore` keeps key files out, the build reads only public
