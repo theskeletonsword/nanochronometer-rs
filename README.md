@@ -1037,8 +1037,11 @@ dishonest. The third slot now measures something the old build could not.
 | 6 — Crypto RAW speed (4 off Linux) | The bare instructions: AES round, SHA-256 round, carry-less multiply, VAES, VPCLMULQDQ | How fast is the silicon, with no cipher around it? |
 
 Crypto RAW is **speed only**: no key schedule, no mode, no authentication. It
-is not a cipher and says nothing about security; Mode 2 is the number for
-real crypto. `nanochrono bench --mode crypto-raw` on the CLI, key `6` (or the
+is not a cipher and says nothing about security — **on purpose**: it exists
+to measure how fast the instructions run, and nothing else. Never use it, or
+code copied from it, to protect real data; for that use proven, reviewed
+libraries — `ring`/rustls (what Mode 2 measures), the RustCrypto crates,
+AWS-LC or OpenSSL. Mode 2 is the number for real crypto. `nanochrono bench --mode crypto-raw` on the CLI, key `6` (or the
 mode's number) in the GUI. The bare-metal BENCH tab keeps the two apart as
 well: *CRYPTO RAW SPEED* next to *RUSTCRYPTO*.
 
@@ -1693,8 +1696,9 @@ declare and the migration had dropped.
 
 Report vulnerabilities privately on Signal to **`@theskeletonsword.46`** (or, if
 there is no answer, through a GitHub private security advisory), with a
-reproducible proof of concept and demonstrable impact. Not on Instagram,
-Telegram or TikTok, and not in public issues. [`SECURITY.md`](SECURITY.md) has
+reproducible proof of concept and demonstrable impact, scored with CVSS 4.0.
+Those two channels only — no other service — and not in public issues.
+Low, informational and cosmetic findings are welcome too. [`SECURITY.md`](SECURITY.md) has
 the details, the rules and the safe harbor for good-faith research.
 
 ---

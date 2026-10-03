@@ -36,12 +36,23 @@ send the same report to both.
 
 ### Signal or GitHub, and nothing else, for vulnerabilities
 
-I talk to friends and other contributors on Telegram, Instagram and TikTok —
-to send memes and have fun, not to receive vulnerability reports. Those are
-personal spaces, and a report does not belong in them: Telegram's ordinary
-chats are not end-to-end encrypted, and neither are Instagram's or TikTok's
-messages. A vulnerability sent through any of them **will not be handled**;
-you will be asked to send it again on Signal or through GitHub. Memes are still welcome there.
+The two channels above are a **closed list**. Every other service is
+excluded, whether or not it is named here, whether or not it claims
+end-to-end encryption, and whether or not I have an account on it. That
+includes, without being limited to: Telegram, Instagram, TikTok, Discord,
+WhatsApp, Snapchat, Threads, X/Twitter, Facebook/Messenger, Reddit, e-mail,
+SMS and phone calls, and any service that appears after this was written.
+
+Why: I talk to friends and other contributors on Telegram, Instagram and
+TikTok — to send memes and have fun, not to receive vulnerability reports.
+Those are personal spaces, and a report does not belong in them. Telegram's
+ordinary chats are not end-to-end encrypted, and neither are Instagram's,
+TikTok's, Discord's or Snapchat's messages. WhatsApp says it is end-to-end
+encrypted, but I do not trust it with this either. A vulnerability sent
+through any channel other than the two above **will not be handled** and
+does not count as reported — not for the disclosure clock, not for credit,
+not for the safe harbor. You will at most be asked to send it again on Signal
+or through GitHub. Memes are still welcome on the others.
 
 Do not put vulnerability details in a public issue, pull request or
 discussion either. If you can use neither channel, open an issue that says only
@@ -57,7 +68,8 @@ A report is handled when it comes with:
 2. **Demonstrable impact** — what an attacker controls and what they
    actually gain, shown rather than asserted: code running in ring 0, an
    escape from ring 3, a signature check bypassed, another module's memory
-   read, a crash with the dump that proves it.
+   read, a crash with the dump that proves it. For a low or informational
+   finding (see below), show what is wrong and where.
 
 Also tell me:
 
@@ -69,6 +81,29 @@ Also tell me:
 Attachments are welcome to complement the report: **`.zip`** (a PoC project,
 images, logs), **`.pdf`**, **`.md`** and **images** (screenshots of the stop
 screen, the serial log). Crash dumps can be read with `tools/nanodump.py`.
+
+## Severity: CVSS 4.0
+
+Every report is scored with **CVSS v4.0** (FIRST's Common Vulnerability
+Scoring System, version 4.0): the base metrics, plus threat and environmental
+metrics where they apply. Include the vector you think fits
+(`CVSS:4.0/AV:…/AC:…/AT:…/PR:…/UI:…/VC:…/VI:…/VA:…/SC:…/SI:…/SA:…`); the
+final score is the maintainer's, and the reasoning is shared with you. The
+score sets the order in which fixes are made, not whether a report is
+accepted:
+
+| CVSS 4.0 | Rating | |
+|---|---|---|
+| 9.0–10.0 | Critical | |
+| 7.0–8.9 | High | |
+| 4.0–6.9 | Medium | |
+| 0.1–3.9 | Low | |
+| 0.0 | None / informational | **accepted too** — see below |
+
+**Low, informational and cosmetic findings are welcome.** A wrong message,
+a misleading log line or error, a misdrawn screen, a document that promises
+more than the code does, a hardening gap with no exploit yet: report them
+the same way. They are fixed and credited like the rest.
 
 ## What happens next
 
@@ -87,27 +122,49 @@ bounty, but every report gets a real answer.
 
 ## Scope
 
-In scope — anything in this repository and the release assets built from it:
+In scope — **everything that is NanoChronometer**: the code in this
+repository and the release assets built from it. In particular:
 
+- **inline assembly** — every `asm!` / `global_asm!` block and the boot
+  files (`boot32.S`, `boot_i386.S`, the EFI loaders): trap entries, register
+  save and restore, stack switches, the red zone;
+- **memory-safety bugs — buffer overflows included.** The project is
+  written in Rust, but nothing is 100% safe: `unsafe` blocks, FFI, inline
+  assembly, raw pointers, DMA and MMIO, and logic errors that index past the
+  end all count, as do out-of-bounds reads, use-after-free, double free,
+  integer overflow leading to any of those, and uninitialised memory;
 - the bare-metal kernel (`crates/nanochrono-baremetal`): the nccall boundary
-  and its per-ISA trap entries, ring 3 isolation, the red-zone and stack
-  rules, the `.ncapp` / `.ncplu` / `.ncdri` loaders and the community-driver
-  switch, signature verification (ML-DSA-87 + P-521), NCFS and
-  ncinitramdisk, the EDID / DisplayID parser, the physical page allocator,
-  the shell and the boot command line;
+  and its per-ISA trap entries, ring 3 isolation, the stack rules, the
+  `.ncapp` / `.ncplu` / `.ncdri` loaders and the community-driver switch,
+  signature verification (ML-DSA-87 + P-521), NCFS and ncinitramdisk, the
+  EDID / DisplayID parser, the physical page allocator, the shell and the
+  boot command line;
+- **drivers**: the kernel's own bare-metal drivers, the `.ncdri` drivers in
+  `sdk/drivers/`, and the optional kernel drivers in `kernel/linux/` and
+  `kernel/windows/`;
+- **the benchmarks, Crypto RAW included.** Crypto RAW (`--mode crypto-raw`,
+  *CRYPTO RAW SPEED* on bare metal) is deliberately not a cipher — bare AES
+  and SHA-256 rounds and carry-less multiplies, with no key schedule, mode or
+  authentication, to measure the silicon's speed and nothing else. That it
+  does not protect data is the design, not a finding. A memory-safety bug,
+  a crash, wrong code reached at ring 0, or a way to make anything treat
+  Crypto RAW's output as real cryptography *is* a finding;
 - the shared core (`crates/nanochrono-core`): the `.ncpkg` format, manifest,
   database and transaction engine, and every other parser;
 - the hosted libraries, CLI, GUI, C SDK and Android app;
-- the optional kernel drivers in `kernel/linux/` and `kernel/windows/`;
 - the host tools (`tools/`), the signing tools, and the build and packaging
   scripts — including anything that would let a published artifact differ
-  from what its source and `SHA256SUMS` say.
+  from what its source and `SHA256SUMS` say;
+- cosmetic and informational issues (see *Severity* above).
 
 Out of scope:
 
-- vulnerabilities in third-party dependencies or toolchains that are not
-  caused by how NanoChronometer uses them — report those upstream (a note
-  here is still welcome if we ship an affected version);
+- **third-party dependencies** — the Cargo crates the project uses (for
+  example the RustCrypto crates, `ring`, `rustls`), the C libraries, the
+  toolchains and their runtimes, GRUB, QEMU, the firmware. Report those to
+  their own maintainers. What *is* in scope is NanoChronometer's own use of
+  them: calling one wrongly, or shipping a version with a published fix
+  missing;
 - findings that need an already-compromised ring 0, or physical access beyond
   what the threat model of the affected component assumes (say which you
   think applies — when in doubt, report it);
@@ -153,8 +210,8 @@ The rules:
 7. **No social engineering** — no phishing, pretexting, impersonation or
    pressure — against the maintainer, the maintainer's personal friends, or
    the project's contributors.
-8. **Report on Signal or through a GitHub private advisory only.** Not on
-   Instagram, Telegram or TikTok (see above).
+8. **Report on Signal or through a GitHub private advisory only** — no other
+   service, named or not (see the closed list above).
 
 This safe harbor covers only the NanoChronometer project and what the
 maintainer controls. It cannot bind third parties — the owners of hardware,
