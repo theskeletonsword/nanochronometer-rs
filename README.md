@@ -315,6 +315,14 @@ certificate and a Mac — this project cannot do it for you.
 
 ### Bare metal (no operating system)
 
+Beyond the instrument, the freestanding build is growing into an operating
+system: a sealed NCFS filesystem ([docs/NCFS.md](docs/NCFS.md)), a signed
+package ecosystem ([docs/NCPKG.md](docs/NCPKG.md)), an `ncinitramdisk` the
+kernel mounts and verifies at boot, and — adapting FreeBSD and OpenBSD for
+the network stack, USB, the VFS, the driver model and the hypervisor, their
+licences kept — drivers, networking and virtualization. The whole design,
+and what of it is built today, is [docs/SYSTEM.md](docs/SYSTEM.md).
+
 ```sh
 ./packaging/baremetal/build.sh              # every architecture below (release)
 ./packaging/baremetal/build.sh run aarch64  # build and boot under QEMU
