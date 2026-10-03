@@ -1,0 +1,35 @@
+[package]
+name = "ncfs"
+version = "4.0.0"
+edition = "2021"
+rust-version = "1.89"
+license = "Apache-2.0"
+description = "Makes, inspects, fills, checks, seals and mounts NCFS volumes (host tool)."
+
+# Outside the workspace, like tools/ncpkg: the FUSE and zstd bindings stay out
+# of the libraries' dependency graph. The filesystem itself — format, reader,
+# copy-on-write engine, fsck — is nanochrono-core's; this is the command line,
+# the host's block devices, ZSTD compression and the FUSE mount around it.
+
+[[bin]]
+name = "ncfs"
+path = "src/main.rs"
+
+[features]
+default = ["fuse"]
+# `ncfs mount`: NCFS through FUSE (ring 3), the recommended way to reach a
+# volume from Linux. Needs libfuse3 (pkg-config fuse3) to build.
+fuse = ["dep:fuser", "dep:libc"]
+
+[dependencies]
+nanochrono-core = { path = "../../crates/nanochrono-core" }
+clap = { version = "4.6", features = ["derive", "env"] }
+# Compression for images built here; decompression is nanochrono-core's own
+# decoder, the one the kernel runs.
+zstd = "0.13"
+getrandom = "0.4"
+fuser = { version = "0.18", optional = true }
+libc = { version = "0.2", optional = true }
+
+[profile.release]
+strip = "none"

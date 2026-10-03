@@ -323,8 +323,18 @@ impl<D: BlockDev> Volume<D> {
 
     /// The inode an absolute path names. Symbolic links in the middle of
     /// the path are followed (at most 16 of them); the last component is
-    /// not.
+    /// not (`lstat`).
     pub fn resolve(&mut self, path: &[u8], s: &mut Scratch) -> Result<u64, Error> {
+        self.walk_path(path, s, false)
+    }
+
+    /// The same, following a symbolic link in the last component too
+    /// (`stat`, `open`).
+    pub fn resolve_follow(&mut self, path: &[u8], s: &mut Scratch) -> Result<u64, Error> {
+        self.walk_path(path, s, true)
+    }
+
+    fn walk_path(&mut self, path: &[u8], s: &mut Scratch, follow_last: bool) -> Result<u64, Error> {
         let mut link = [0u8; 1024];
         let mut stack = [0u8; 4096];
         if path.len() > stack.len() {
@@ -360,7 +370,7 @@ impl<D: BlockDev> Volume<D> {
                 continue;
             }
             let (child, dtype) = self.lookup(dir, name, &mut s.node)?.ok_or(Error::NotFound)?;
-            if dtype == DT_LNK && !last {
+            if dtype == DT_LNK && (!last || follow_last) {
                 hops += 1;
                 if hops > 16 {
                     return Err(Error::Loop);

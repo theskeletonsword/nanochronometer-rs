@@ -14,7 +14,7 @@ members = [
 # `main`, and links through its own script. `cargo build --workspace` would try
 # to build it for the host and fail, so it is its own root and is built by
 # packaging/baremetal/build.sh.
-exclude = ["crates/nanochrono-baremetal", "crates/nanochrono-plugins", "tools/ncplu-sign", "tools/ncpkg"]
+exclude = ["crates/nanochrono-baremetal", "crates/nanochrono-plugins", "tools/ncplu-sign", "tools/ncpkg", "tools/ncfs"]
 
 [workspace.package]
 version = "4.0.0"

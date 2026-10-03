@@ -665,6 +665,33 @@ impl<D: BlockDevMut> Writer<D> {
         Ok(s)
     }
 
+    /// The block after the last one in use: where an image could end.
+    pub fn high_water(&self) -> u64 {
+        self.refs.iter().next_back().map_or(FIRST_FREE, |(b, r)| b + u64::from(r.blocks))
+    }
+
+    /// Shrinks the volume to `blocks` blocks, when nothing in use lies
+    /// beyond them: what makes a boot image only as large as what it holds.
+    /// The caller then cuts the device (an image file) to that size.
+    pub fn shrink(&mut self, blocks: u64) -> Result<(), Error> {
+        self.commit()?;
+        // Room for the commit that records the new size.
+        if blocks < MIN_BLOCKS || blocks < self.high_water() + 16 || blocks > self.sb.total_blocks {
+            return Err(Error::NoSpace);
+        }
+        let tail: Vec<(u64, u64)> = self.free.iter().filter(|(s, l)| *s + *l > blocks).map(|(s, l)| (*s, *l)).collect();
+        for (s, _) in tail {
+            self.free.remove(&s);
+            if s < blocks {
+                self.free.insert(s, blocks - s);
+            }
+        }
+        self.sb.total_blocks = blocks;
+        self.cursor = FIRST_FREE;
+        self.mem_root(ROOT_TREE)?;
+        self.commit()
+    }
+
     /// Blocks in use, free, and in all.
     pub fn space(&self) -> Space {
         let free: u64 = self.free.values().sum();
